@@ -56,21 +56,23 @@ async fn reads_proceed_while_the_entity_is_leased_and_do_not_commit() {
 
 #[tokio::test]
 #[serial]
-async fn captured_reads_stay_consistent_when_a_write_commits_before_the_callback() {
+async fn captured_reads_stay_consistent_when_a_write_commits_after_they_begin() {
     let service = deploy_read_worker(
         r#"
 await memory.atomic(tx => { tx.put("a", 1); tx.put("b", 1); });
-const begin = __dd_internals.core.ops.op_memory_read_begin;
+// memory.read's snapshot is a read handle; this one stays open across a write.
+const { core, dd } = __dd_internals;
+const read = await core.ops.op_memory_read_begin(dd.runtimeRequestContextHandle(), "STATE", "entity");
 let captured;
 try {
-  __dd_internals.core.ops.op_memory_read_begin = async (...args) => {
-    const snapshot = await begin(...args);
-    await memory.atomic(tx => { tx.put("a", 2); tx.put("b", 2); tx.put("c", 2); });
-    return snapshot;
-  };
-  captured = await memory.read(snapshot => [snapshot.get("a"), snapshot.get("b"), snapshot.list()]);
+  await memory.atomic(tx => { tx.put("a", 2); tx.put("b", 2); tx.put("c", 2); });
+  const value = key => core.deserialize(
+    core.ops.op_memory_read_get(read.handle, key).record.value, { forStorage: true },
+  );
+  const keys = core.ops.op_memory_read_keys(read.handle, "").keys;
+  captured = [value("a"), value("b"), keys.map(key => ({ key, value: value(key) }))];
 } finally {
-  __dd_internals.core.ops.op_memory_read_begin = begin;
+  core.ops.op_memory_read_close(read.handle);
 }
 const committed = await memory.read(snapshot => snapshot.list());
 return Response.json({ captured, committed });
@@ -250,23 +252,13 @@ async fn request_completion_and_cancellation_release_unclosed_read_handles() {
 let captured = 0;
 export default { async fetch(request, env) {
   const path = new URL(request.url).pathname;
+  const { core, dd } = __dd_internals;
   if (path === "/probe") {
-    return Response.json(__dd_internals.core.ops.op_memory_read_get(captured, "missing").ok);
+    return Response.json(core.ops.op_memory_read_get(captured, "missing").ok);
   }
-  const begin = __dd_internals.core.ops.op_memory_read_begin;
-  const close = __dd_internals.core.ops.op_memory_read_close;
-  try {
-    __dd_internals.core.ops.op_memory_read_begin = async (...args) => {
-      const result = await begin(...args);
-      captured = result.handle;
-      return result;
-    };
-    __dd_internals.core.ops.op_memory_read_close = () => {};
-    await env.STATE.get("entity").read(snapshot => snapshot.get("missing"));
-  } finally {
-    __dd_internals.core.ops.op_memory_read_begin = begin;
-    __dd_internals.core.ops.op_memory_read_close = close;
-  }
+  // A read handle, as memory.read opens, that the request never closes.
+  const read = await core.ops.op_memory_read_begin(dd.runtimeRequestContextHandle(), "STATE", "entity");
+  captured = read.handle;
   if (path === "/stream") {
     return new Response(new ReadableStream({ start(controller) { controller.enqueue("ready"); } }));
   }

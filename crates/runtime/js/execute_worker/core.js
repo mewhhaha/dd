@@ -4,18 +4,28 @@
 // object, and leaves its entrypoints on `__bootstrap.dd`, which only the
 // host reaches.
 //
+// Each unit defines its helpers once, at the top level of the bundle; a unit
+// may use what the units before it define, and any unit's helpers once a
+// request runs. Per-request state lives in the request's RequestContext,
+// which asyncContext carries through everything the request does, so
+// helpers read it from there (currentRequestContext) or take what they need
+// as arguments. dd.executeWorkerHandle (bindings.js) is the only per-request
+// entrypoint: it builds the request's context and runs the worker under it.
+//
 // Worker code runs in this same context, so the bundle reads nothing worker
 // code can change after startup. Built-ins come from primordials, web
-// classes from dd.web and their methods from dd.webPrimordials, the clock,
-// timers and console from what bootstrap.js left on dd, all captured below
-// while the snapshot is built; scripts/check-worker-js.mjs rejects any
-// global the bundle names. Index loops and SafeArrayIterator stand in for
-// spread, for...of and array destructuring; header lists go into Requests
-// and Responses through appendHeaderPairs; the records and option
-// dictionaries the bundle builds never reach Object.prototype (see RECORD
-// below). Promises are awaited, never returned from an async function or a
-// `then` callback, since resolving one promise with another looks up the
-// replaceable Promise.prototype.then.
+// classes from dd.web and their methods from dd.webPrimordials, ops from
+// core.ops, and the clock, timers, console and record constructors from what
+// bootstrap.js left on dd, all captured below while the snapshot is built
+// (an op function survives into every runtime restored from the snapshot);
+// scripts/check-worker-js.mjs rejects any global the bundle names. Index
+// loops and SafeArrayIterator stand in for spread, for...of and array
+// destructuring; header lists go into Requests and Responses through
+// appendHeaderPairs; the records and option dictionaries the bundle builds
+// never reach Object.prototype (see RECORD in bootstrap.js). Promises are
+// awaited, never returned from an async function or a `then` callback,
+// since resolving one promise with another looks up the replaceable
+// Promise.prototype.then.
 //
 // What stays open, by the nature of sharing a context with worker code:
 // - Species. `then` and `await` on a native promise read its `constructor`;
@@ -42,7 +52,6 @@ const {
   ArrayIsArray,
   ArrayPrototypePush,
   ArrayPrototypeSort,
-  Boolean,
   DataViewPrototypeGetBuffer,
   DataViewPrototypeGetByteLength,
   DataViewPrototypeGetByteOffset,
@@ -142,14 +151,73 @@ const {
   URLPrototypeGetProtocol,
 } = dd.webPrimordials;
 const {
+  RECORD,
+  ResponseInit,
+  STREAM_PULL_ON_READ,
   appendHeaderPairs,
+  asyncContext,
   clearTimeout,
   consoleWarn,
   frozenPerfNow,
   headerPairs,
   hostFetchResponse,
+  record,
+  setTime,
   setTimeout,
+  syncTimeBoundary: syncFrozenTime,
+  syncTimeBoundaryNow: syncFrozenTimeNow,
 } = dd;
+const {
+  op_emit_completion_error,
+  op_emit_completion_ok,
+  op_emit_response_chunk,
+  op_emit_response_start,
+  op_emit_wait_until_done,
+  op_http_check_url,
+  op_http_fetch,
+  op_http_prepare,
+  op_http_response_close,
+  op_http_store_prepared_body,
+  op_http_store_prepared_headers,
+  op_http_take_prepared_body,
+  op_http_take_prepared_headers,
+  op_kv_delete,
+  op_kv_get_value,
+  op_kv_list,
+  op_kv_put,
+  op_kv_put_value_bytes,
+  op_memory_batch_accept,
+  op_memory_batch_apply,
+  op_memory_batch_close,
+  op_memory_batch_command_result,
+  op_memory_batch_effect,
+  op_memory_batch_get,
+  op_memory_batch_keys,
+  op_memory_batch_mutation,
+  op_memory_bytes_take,
+  op_memory_command_begin,
+  op_memory_command_close,
+  op_memory_lease_acquire,
+  op_memory_profile_record_js,
+  op_memory_read_begin,
+  op_memory_read_close,
+  op_memory_read_get,
+  op_memory_read_keys,
+  op_memory_request_scope_close,
+  op_memory_socket_close,
+  op_memory_socket_list,
+  op_request_body_cancel,
+  op_request_body_read,
+  op_request_context_cancel,
+  op_request_context_close,
+  op_request_control_take,
+  op_request_invocation_descriptor,
+  op_request_reply_cancel,
+  op_request_wait_until_register,
+  op_service_binding_fetch_start,
+  op_sleep,
+  op_take_worker_deployment_config,
+} = core.ops;
 
 const noop = () => undefined;
 const ignoreRejection = (promise) => {
@@ -157,34 +225,14 @@ const ignoreRejection = (promise) => {
 };
 const ONCE = ObjectFreeze({ __proto__: null, once: true });
 const FOR_STORAGE = ObjectFreeze({ __proto__: null, forStorage: true });
-const STREAM_PULL_ON_READ = ObjectFreeze({ __proto__: null, highWaterMark: 0 });
 
 /** A handle number from an op result or descriptor: a non-negative integer. */
 const toHandle = (value) => MathMax(0, MathTrunc(Number(value ?? 0) || 0));
 
-// The records and option dictionaries built per request. Each constructor's
-// prototype is RECORD, an empty object with a null prototype, so nothing
-// worker code adds to Object.prototype reads through into them. A
-// `{ __proto__: null }` literal would do the same, but V8 builds those as
-// dictionary-mode objects, several times slower to create and to read.
-// They are declared here, outside dd.executeWorker, so that every request
-// shares one constructor, and so one shape, per kind of record.
-const RECORD = ObjectFreeze(ObjectCreate(null));
-const record = (constructor) => {
-  constructor.prototype = RECORD;
-  return constructor;
-};
-const TimeBoundary = record(function TimeBoundary(nowMs, perfMs) {
-  this.nowMs = nowMs;
-  this.perfMs = perfMs;
-});
-const RequestInput = record(function RequestInput(method, url, headers, body, requestId) {
-  this.method = method;
-  this.url = url;
-  this.headers = headers;
-  this.body = body;
-  this.request_id = requestId;
-});
+// The records and option dictionaries built per request, from `record` (see
+// RECORD in bootstrap.js), so that every request shares one constructor, and
+// so one shape, per kind of record.
+
 // What dd.executeWorkerHandle reads from a request's invocation descriptor.
 const WorkerInvocation = record(function WorkerInvocation(descriptor, headers, body) {
   this.request_id = String(descriptor.request_id ?? "");
@@ -194,16 +242,17 @@ const WorkerInvocation = record(function WorkerInvocation(descriptor, headers, b
   this.memory_call = descriptor.memory_call ?? null;
   this.request_body_stream_handle = toHandle(descriptor.request_body_stream_handle);
   this.stream_response = descriptor.stream_response === true;
-  this.max_response_body_bytes = descriptor.max_response_body_bytes;
-  this.max_request_body_bytes = descriptor.max_request_body_bytes;
+  this.max_response_body_bytes = Number(descriptor.max_response_body_bytes ?? 0);
+  this.max_request_body_bytes = Number(descriptor.max_request_body_bytes ?? 0);
   this.method = String(descriptor.method ?? "GET");
   this.url = String(descriptor.url ?? "");
   this.headers = ArrayIsArray(headers) ? headers : [];
   this.input_request_id = String(descriptor.input_request_id ?? "");
-  this.body = body;
+  this.body = isUint8Array(body) ? body : new Uint8Array();
 });
 // The store asyncContext carries for a request. memory.js runs each memory
-// call under a copy with its own memory scope.
+// call under a copy with its own memory scope. The request's handles here
+// are also what dd.abortWorkerRequestHandle releases.
 const RequestContext = record(function RequestContext(
   requestId,
   controller,
@@ -211,6 +260,7 @@ const RequestContext = record(function RequestContext(
   completionHandle,
   memoryRequestScopeHandle,
   requestBodyStreamHandle,
+  maxRequestBodyBytes,
   cacheBypassStale,
 ) {
   this.requestId = requestId;
@@ -220,6 +270,7 @@ const RequestContext = record(function RequestContext(
   this.completionHandle = completionHandle;
   this.memoryRequestScopeHandle = memoryRequestScopeHandle;
   this.requestBodyStreamHandle = requestBodyStreamHandle;
+  this.maxRequestBodyBytes = maxRequestBodyBytes;
   this.memoryEntry = null;
   this.memoryTxnScope = null;
   this.socketRuntimeProvider = null;
@@ -233,6 +284,7 @@ const copyRequestContext = (context) => {
     context.completionHandle,
     context.memoryRequestScopeHandle,
     context.requestBodyStreamHandle,
+    context.maxRequestBodyBytes,
     context.cacheBypassStale,
   );
   copy.waitUntilPromises = context.waitUntilPromises;
@@ -241,33 +293,18 @@ const copyRequestContext = (context) => {
   copy.socketRuntimeProvider = context.socketRuntimeProvider;
   return copy;
 };
-const InflightRequest = record(function InflightRequest(
-  controller,
-  requestContextHandle,
-  memoryRequestScopeHandle,
-  requestBodyStreamHandle,
-) {
-  this.controller = controller;
-  this.requestContextHandle = requestContextHandle;
-  this.memoryRequestScopeHandle = memoryRequestScopeHandle;
-  this.requestBodyStreamHandle = requestBodyStreamHandle;
-});
 // What the request's fetch handler settled with, as stored host handles.
 const WorkerResult = record(function WorkerResult(status, headersHandle, bodyHandle) {
   this.status = status;
   this.headersHandle = headersHandle;
   this.bodyHandle = bodyHandle;
 });
-// Init dictionaries for the Requests and Responses the runtime makes. An
-// undefined member reads as absent.
+// Init dictionaries for the Requests the runtime makes. An undefined member
+// reads as absent.
 const RequestInit = record(function RequestInit(method, body, signal) {
   this.method = method;
   this.body = body;
   this.signal = signal;
-});
-const ResponseInit = record(function ResponseInit(status, statusText) {
-  this.status = status;
-  this.statusText = statusText;
 });
 const ReplyWaitOptions = record(function ReplyWaitOptions(syncTime, signal) {
   this.syncTime = syncTime;
@@ -335,60 +372,77 @@ const DataProperty = record(function DataProperty(value) {
   this.configurable = true;
 });
 
-const callOp = (name, ...args) => {
-  const op = core.ops[name];
-  if (typeof op !== "function") {
-    return undefined;
-  }
-  return ReflectApply(op, undefined, args);
-};
-
 const recordMemoryProfile = (metric, durationMs, items = 1) => {
-  const op = core.ops.op_memory_profile_record_js;
-  if (typeof op !== "function") {
-    return;
-  }
-  op(
+  op_memory_profile_record_js(
     String(metric),
     MathMax(0, MathRound(Number(durationMs ?? 0) * 1000)),
     MathMax(1, MathTrunc(Number(items ?? 1) || 1)),
   );
 };
 
-const sleep = (millis) => callOp("op_sleep", Number(millis) || 0);
+/** The current request's context, or null (an error when `required`) outside one. */
+const currentRequestContext = (required = true) => {
+  const current = asyncContext.getStore();
+  if (!current && required) {
+    throw new Error("request scope is unavailable");
+  }
+  return current;
+};
 
-const normalizeBoundaryValue = (value) => {
-  if (value == null) {
+const activeRequestContextHandle = () => {
+  const handle = toHandle(currentRequestContext().requestContextHandle);
+  if (handle <= 0) {
+    throw new Error("request context handle is unavailable");
+  }
+  return handle;
+};
+
+// What bootstrap.js reads of the current request: the id console lines are
+// tagged with and whether the cache should bypass stale entries. Both read
+// as empty outside a request.
+dd.runtimeRequestId = () => currentRequestContext(false)?.requestId ?? "";
+dd.runtimeRequestContextHandle = activeRequestContextHandle;
+dd.cacheBypassStale = () => currentRequestContext(false)?.cacheBypassStale === true;
+
+const memoryScopedScopeHandle = (entry) => {
+  const current = currentRequestContext(false);
+  if (current?.memoryEntry === entry) {
+    return toHandle(current.memoryRequestScopeHandle);
+  }
+  return 0;
+};
+
+const withMemoryTxnScope = (scope, callback) => {
+  const current = currentRequestContext();
+  const previousScope = current.memoryTxnScope;
+  current.memoryTxnScope = scope;
+  try {
+    return callback();
+  } finally {
+    current.memoryTxnScope = previousScope;
+  }
+};
+
+const currentLocalSocketRuntime = (binding, memoryKey) => {
+  const current = currentRequestContext(false);
+  if (!current?.memoryEntry) {
     return null;
   }
-  if (typeof value === "number") {
-    return new TimeBoundary(value, value);
+  if (
+    current.memoryEntry.binding !== binding
+    || current.memoryEntry.memoryKey !== memoryKey
+  ) {
+    return null;
   }
-  if (ArrayIsArray(value)) {
-    const nowMs = value[0];
-    return new TimeBoundary(nowMs, value[1] === undefined ? nowMs : value[1]);
+  const provider = current.socketRuntimeProvider;
+  if (typeof provider !== "function") {
+    throw new Error(`memory same-lane socket runtime is unavailable`);
   }
-  if (typeof value === "object") {
-    const nowMs =
-      value.nowMs ?? value.now_ms ?? value.now ?? value.wallMs ?? value.wall_ms;
-    const perfMs =
-      value.perfMs ?? value.perf_ms ?? value.perf ?? value.monotonicMs ?? value.monotonic_ms ?? nowMs;
-    return new TimeBoundary(nowMs, perfMs);
+  const runtime = provider();
+  if (!runtime || typeof runtime.listOpenHandles !== "function") {
+    throw new Error(`memory same-lane socket runtime is unavailable`);
   }
-  return null;
-};
-
-const applyBoundary = (value) => {
-  const boundary = normalizeBoundaryValue(value);
-  if (boundary && typeof dd.setTime === "function") {
-    dd.setTime(boundary.nowMs, boundary.perfMs);
-  }
-};
-const syncFrozenTime = async () => {
-  applyBoundary(await callOp("op_time_boundary_now"));
-};
-const syncFrozenTimeNow = () => {
-  applyBoundary(callOp("op_time_boundary_now"));
+  return runtime;
 };
 
 const isUint8Array = (value) => TypedArrayPrototypeGetSymbolToStringTag(value) === "Uint8Array";
@@ -447,7 +501,7 @@ const concatByteChunks = (chunks, totalLength) => {
 const isBinaryLike = (value) => core.isArrayBuffer(value) || ArrayBufferIsView(value);
 
 const decodeStoredValue = (encoding, valueHandle, context) => {
-  const bytes = callOp("op_http_take_prepared_body", toHandle(valueHandle));
+  const bytes = op_http_take_prepared_body(toHandle(valueHandle));
   if (encoding === "utf8") {
     return core.decode(bytes);
   }
@@ -463,7 +517,7 @@ const decodeStoredValue = (encoding, valueHandle, context) => {
 
 const createKvBinding = (bindingName) => ObjectFreeze({
   async get(key) {
-    const result = await callOp("op_kv_get_value", bindingName, String(key));
+    const result = await op_kv_get_value(bindingName, String(key));
     syncFrozenTimeNow();
     if (!result.ok) throw new Error(`kv get ${key}: ${result.error}`);
     return result.found ? decodeStoredValue(result.encoding, result.value_handle, "kv get") : null;
@@ -471,14 +525,14 @@ const createKvBinding = (bindingName) => ObjectFreeze({
   async put(key, value) {
     const normalizedKey = String(key);
     const result = typeof value === "string"
-      ? await callOp("op_kv_put", bindingName, normalizedKey, value)
-      : await callOp("op_kv_put_value_bytes", bindingName, normalizedKey,
+      ? await op_kv_put(bindingName, normalizedKey, value)
+      : await op_kv_put_value_bytes(bindingName, normalizedKey,
         "v8sc", new Uint8Array(core.serialize(value, FOR_STORAGE)));
     syncFrozenTimeNow();
     if (!result.ok) throw new Error(`kv put ${normalizedKey}: ${result.error}`);
   },
   async delete(key) {
-    const result = await callOp("op_kv_delete", bindingName, String(key));
+    const result = await op_kv_delete(bindingName, String(key));
     syncFrozenTimeNow();
     if (!result.ok) throw new Error(`kv delete ${key}: ${result.error}`);
   },
@@ -488,7 +542,7 @@ const createKvBinding = (bindingName) => ObjectFreeze({
     if (!NumberIsInteger(limit) || limit < 1 || limit > 1000) {
       throw new Error(`kv list limit must be an integer between 1 and 1000: ${limit}`);
     }
-    const result = await callOp("op_kv_list", bindingName, prefix, limit);
+    const result = await op_kv_list(bindingName, prefix, limit);
     syncFrozenTimeNow();
     if (!result.ok) throw new Error(`kv list ${prefix}: ${result.error}`);
     const entries = result.entries;
@@ -518,161 +572,31 @@ const hasCacheBypassStaleHeader = (headers) => {
   return false;
 };
 
-dd.executeWorker = (payload) => {
-  const requestId = String(payload?.request_id ?? "");
-  const deploymentConfig = dd.workerDeployment ?? null;
-  if (!deploymentConfig || typeof deploymentConfig !== "object") {
-    throw new Error("Worker deployment config is not installed");
-  }
-  const workerName = String(deploymentConfig?.worker_name ?? "");
-  const kvBindingsConfig = deploymentConfig?.kv_bindings ?? [];
-  const memoryBindingsConfig = deploymentConfig?.memory_bindings ?? [];
-  const serviceBindingsConfig = deploymentConfig?.service_bindings ?? [];
-  const memoryCallConfig = payload?.memory_call ?? null;
-  const requestBodyStreamHandle = toHandle(payload?.request_body_stream_handle);
-  const requestContextHandle = toHandle(payload?.request_context_handle);
-  const completionHandle = toHandle(payload?.completion_handle);
-  const memoryRequestScopeHandle = toHandle(payload?.memory_request_scope_handle);
-  const hasRequestBodyStream = requestBodyStreamHandle > 0;
-  const streamResponse = payload?.stream_response === true;
-  const maxResponseBodyBytes = Number(payload?.max_response_body_bytes ?? 0);
-  const maxRequestBodyBytes = Number(payload?.max_request_body_bytes ?? 0);
-  const worker = dd.worker;
-
-  if (worker === undefined) {
-    throw new Error("Worker is not installed");
-  }
-
-  const inflightRequests = dd.inflightRequests ??= new SafeMap();
-  const inflightRequestsByContextHandle =
-    dd.inflightRequestsByContextHandle ??= new SafeMap();
-  const input = new RequestInput(
-    String(payload?.method ?? "GET"),
-    String(payload?.url ?? ""),
-    ArrayIsArray(payload?.headers) ? payload.headers : [],
-    isUint8Array(payload?.body) ? payload.body : new Uint8Array(),
-    String(payload?.input_request_id ?? ""),
-  );
-  const cacheBypassStale = hasCacheBypassStaleHeader(input.headers);
-  const controller = new AbortController();
-  const asyncContext = dd.asyncContext;
-  const requestContext = new RequestContext(
-    requestId,
-    controller,
-    requestContextHandle,
-    completionHandle,
-    memoryRequestScopeHandle,
-    requestBodyStreamHandle,
-    cacheBypassStale,
-  );
-
-  const currentRequestContext = (required = true) => {
-    const current = asyncContext?.getStore?.() ?? null;
-    if (!current && required) {
-      throw new Error("request scope is unavailable");
+// The worker's request body, read from the host stream `handle` as the
+// worker reads it.
+const createRequestBodyStream = (handle) => new ReadableStream({
+  __proto__: null,
+  async pull(controller) {
+    const payload = await op_request_body_read(handle);
+    await syncFrozenTime();
+    if (!payload || typeof payload !== "object") {
+      ReadableStreamDefaultControllerPrototypeClose(controller);
+      return;
     }
-    return current;
-  };
-
-  const inflightRequest = new InflightRequest(
-    controller,
-    requestContextHandle,
-    memoryRequestScopeHandle,
-    requestBodyStreamHandle,
-  );
-  inflightRequests.set(requestId, inflightRequest);
-  if (requestContextHandle > 0) {
-    inflightRequestsByContextHandle.set(requestContextHandle, inflightRequest);
-  }
-
-  const activeRequestId = () => {
-    const scoped = StringPrototypeTrim(String(currentRequestContext().requestId ?? ""));
-    if (!scoped) {
-      throw new Error("worker request scope is unavailable");
+    if (payload.ok === false) {
+      throw new Error(String(payload.error ?? "request body stream failed"));
     }
-    return scoped;
-  };
-  dd.runtimeRequestId ??= activeRequestId;
-  const activeRequestContextHandle = () => {
-    const handle = toHandle(currentRequestContext().requestContextHandle);
-    if (handle <= 0) {
-      throw new Error("request context handle is unavailable");
+    if (payload.done === true) {
+      ReadableStreamDefaultControllerPrototypeClose(controller);
+      return;
     }
-    return handle;
-  };
-  dd.runtimeRequestContextHandle ??= activeRequestContextHandle;
-  const activeCacheBypassStale = () => Boolean(
-    currentRequestContext(false)?.cacheBypassStale,
-  );
-  dd.cacheBypassStale ??= activeCacheBypassStale;
-
-  const memoryScopedScopeHandle = (entry) => {
-    const current = currentRequestContext(false);
-    if (current?.memoryEntry === entry) {
-      return toHandle(current.memoryRequestScopeHandle);
-    }
-    return 0;
-  };
-
-  const withMemoryTxnScope = (scope, callback) => {
-    const current = currentRequestContext();
-    const previousScope = current.memoryTxnScope;
-    current.memoryTxnScope = scope;
-    try {
-      return callback();
-    } finally {
-      current.memoryTxnScope = previousScope;
-    }
-  };
-
-  const currentLocalSocketRuntime = (binding, memoryKey) => {
-    const current = currentRequestContext(false);
-    if (!current?.memoryEntry) {
-      return null;
-    }
-    if (
-      current.memoryEntry.binding !== binding
-      || current.memoryEntry.memoryKey !== memoryKey
-    ) {
-      return null;
-    }
-    const provider = current.socketRuntimeProvider;
-    if (typeof provider !== "function") {
-      throw new Error(`memory same-lane socket runtime is unavailable`);
-    }
-    const runtime = provider();
-    if (!runtime || typeof runtime.listOpenHandles !== "function") {
-      throw new Error(`memory same-lane socket runtime is unavailable`);
-    }
-    return runtime;
-  };
-
-  dd.syncTimeBoundary ??= syncFrozenTime;
-
-  // The worker's request body, read from the host as the worker reads it.
-  const createRequestBodyStream = () => new ReadableStream({
-    __proto__: null,
-    async pull(controller) {
-      const payload = await callOp("op_request_body_read", requestBodyStreamHandle);
-      await syncFrozenTime();
-      if (!payload || typeof payload !== "object") {
-        ReadableStreamDefaultControllerPrototypeClose(controller);
-        return;
-      }
-      if (payload.ok === false) {
-        throw new Error(String(payload.error ?? "request body stream failed"));
-      }
-      if (payload.done === true) {
-        ReadableStreamDefaultControllerPrototypeClose(controller);
-        return;
-      }
-      ReadableStreamDefaultControllerPrototypeEnqueue(
-        controller,
-        callOp("op_http_take_prepared_body", toHandle(payload.body_handle)),
-      );
-    },
-    async cancel() {
-      await callOp("op_request_body_cancel", requestBodyStreamHandle);
-      await syncFrozenTime();
-    },
-  }, STREAM_PULL_ON_READ);
+    ReadableStreamDefaultControllerPrototypeEnqueue(
+      controller,
+      op_http_take_prepared_body(toHandle(payload.body_handle)),
+    );
+  },
+  async cancel() {
+    await op_request_body_cancel(handle);
+    await syncFrozenTime();
+  },
+}, STREAM_PULL_ON_READ);

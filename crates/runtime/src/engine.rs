@@ -1020,7 +1020,7 @@ mod tests {
               dd: typeof dd,
               primordials: typeof primordials,
               internals: typeof internals,
-              runtimeOp: typeof runtimeOp,
+              RECORD: typeof RECORD,
               define: typeof define,
             };
             const leaked = Object.keys(probes).filter((name) => probes[name] !== "undefined");
@@ -1101,9 +1101,10 @@ mod tests {
         );
     }
 
-    /// The runtime's scripts take built-ins from primordials and web methods
-    /// from `dd.webPrimordials` by name; a misspelt name would stay undefined
-    /// until the code path using it runs.
+    /// The runtime's scripts take built-ins from primordials, web methods
+    /// from `dd.webPrimordials`, ops from `core.ops` and each other's helpers
+    /// from `dd` by name; a misspelt name would stay undefined until the code
+    /// path using it runs.
     #[test]
     #[serial]
     fn runtime_scripts_capture_only_names_that_exist() {
@@ -1127,13 +1128,19 @@ mod tests {
             &mut js_runtime,
             &format!(
                 r#"
-                const {{ dd, primordials }} = __bootstrap;
-                const capture = /const \{{([^}}]*)\}} = (primordials|dd\.webPrimordials);/g;
+                const {{ core, dd, primordials }} = __bootstrap;
+                const capture = /const \{{([^}}]*)\}} = (primordials|dd\.webPrimordials|core\.ops|dd);/g;
+                const targets = {{
+                  primordials,
+                  "dd.webPrimordials": dd.webPrimordials,
+                  "core.ops": core.ops,
+                  dd,
+                }};
                 const missing = [];
                 let checked = 0;
                 for (const source of {sources}) {{
                   for (const [, list, from] of source.matchAll(capture)) {{
-                    const target = from === "primordials" ? primordials : dd.webPrimordials;
+                    const target = targets[from];
                     for (const entry of list.split(",")) {{
                       const name = entry.split(":")[0].trim();
                       if (!name) continue;

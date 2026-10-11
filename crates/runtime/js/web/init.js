@@ -13,7 +13,6 @@ const {
   ObjectFreeze,
   ObjectGetOwnPropertySymbols,
   ObjectPrototypeIsPrototypeOf,
-  PromiseReject,
   ReflectGetOwnPropertyDescriptor,
   ReflectOwnKeys,
   String,
@@ -194,6 +193,8 @@ function appendHeaderPairs(headers, pairs) {
   return headers;
 }
 
+// The queuing strategy of the streams the runtime fills from the host: each
+// pull reads one chunk when the reader asks for it, so nothing is read ahead.
 const STREAM_PULL_ON_READ = ObjectFreeze({ __proto__: null, highWaterMark: 0 });
 
 // A Response for a host fetch result, its body read from Rust as it arrives.
@@ -293,15 +294,11 @@ op_set_wasm_streaming_handler(async (source, id) => {
   }
 });
 
-// Each request installs dd's host fetch (execute_worker/fetch.js), which
-// enforces the worker's egress rules; outside a request there is nothing to
-// fetch under.
+// dd's host fetch (execute_worker/fetch.js), which the execute-worker bundle
+// installs after this script runs. It enforces the worker's egress rules and
+// rejects a fetch made outside a request.
 function fetch(input, init = undefined) {
-  const hostFetch = dd.hostFetch;
-  if (typeof hostFetch !== "function") {
-    return PromiseReject(new TypeError("fetch is only available while handling a request"));
-  }
-  return hostFetch(input, init);
+  return dd.hostFetch(input, init);
 }
 
 const ddRuntime = {
@@ -363,3 +360,4 @@ dd.headerPairs = headerPairs;
 dd.appendHeaderPairs = appendHeaderPairs;
 dd.hostFetchResponse = hostFetchResponse;
 dd.unscopedFetch = unscopedFetch;
+dd.STREAM_PULL_ON_READ = STREAM_PULL_ON_READ;

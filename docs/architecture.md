@@ -230,12 +230,14 @@ Worker code still shares the context, and may replace any global or
 built-in method, so the runtime's scripts use only what they captured while
 the snapshot was built: built-ins from `primordials`, the web classes from
 `dd.web` and their uncurried methods from `dd.webPrimordials` (named like
-primordials: `ResponsePrototypeGetHeaders`), and the frozen clock, timers and
-console through closures `bootstrap.js` leaves on `dd`. They iterate with index
-loops or `SafeArrayIterator`, never through `Array.prototype[Symbol.iterator]`,
-and give their own records and option dictionaries null prototypes.
-`just check-js` fails if `bootstrap.js`, `web/init.js` or the execute-worker
-bundle names a global. What this cannot cover (species lookups, properties
+primordials: `ResponsePrototypeGetHeaders`), the op functions from `core.ops`,
+and the frozen clock, timers, console and record constructors that
+`bootstrap.js` leaves on `dd`. They iterate with index loops or
+`SafeArrayIterator`, never through `Array.prototype[Symbol.iterator]`, and give
+their own records and option dictionaries null prototypes. The execute-worker
+bundle defines its helpers once; each request runs under a request context
+record that `asyncContext` carries. `just check-js` fails if `bootstrap.js`,
+`web/init.js`, `web/console.js` or the execute-worker bundle names a global. What this cannot cover (species lookups, properties
 added to `Object.prototype`, values the worker hands over) is listed at the top
 of `execute_worker/core.js`.
 

@@ -24,7 +24,8 @@ for (const [name, prototype] of [["Headers", Headers.prototype], ["Request", Req
     if (typeof value === "function") scope[`${name}Prototype${suffix}`] = primordials.uncurryThis(value);
   }
 }
-// The record constructors execute_worker/core.js defines for the bundle.
+// The records the bundle builds: RECORD and ResponseInit come from
+// bootstrap.js, the others from execute_worker/core.js.
 scope.RECORD = Object.freeze(Object.create(null));
 scope.RequestInit = function RequestInit(method, body, signal) {
   Object.assign(this, { method, body, signal });

@@ -105,11 +105,31 @@ const {
   ResponsePrototypeGetStatus,
 } = dd.webPrimordials;
 const { appendHeaderPairs, headerPairs } = dd;
+const {
+  op_base64_decode,
+  op_base64_encode_from_buffer,
+  op_cache_delete,
+  op_cache_match,
+  op_cache_put,
+  op_call_console,
+  op_console_write,
+  op_emit_cache_revalidate,
+  op_http_store_prepared_body,
+  op_http_store_prepared_headers,
+  op_http_take_prepared_body,
+  op_http_take_prepared_headers,
+  op_sleep,
+  op_time_boundary_now,
+} = core.ops;
 
-// Records built per call. Each constructor's prototype is RECORD, an empty
+// The records and option dictionaries the runtime builds per call, here and
+// in the execute-worker bundle, which takes RECORD, `record` and the shared
+// constructors from dd. Each constructor's prototype is RECORD, an empty
 // object with a null prototype, so nothing worker code adds to
-// Object.prototype reads through into them; a `{ __proto__: null }` literal
-// would do the same, but V8 builds those as slow dictionary-mode objects.
+// Object.prototype reads through into them. A `{ __proto__: null }` literal
+// would do the same, but V8 builds those as dictionary-mode objects, several
+// times slower to create and to read. One constructor per kind of record
+// gives every record of that kind one shape.
 const RECORD = ObjectFreeze(ObjectCreate(null));
 const record = (constructor) => {
   constructor.prototype = RECORD;
@@ -120,17 +140,16 @@ const TimerState = record(function TimerState(delay, repeat) {
   this.delay = delay;
   this.repeat = repeat;
 });
-const TimeBoundary = record(function TimeBoundary(nowMs, perfMs) {
-  this.nowMs = nowMs;
-  this.perfMs = perfMs;
-});
 const CachedResponseParts = record(function CachedResponseParts(bytes, headers, status) {
   this.bytes = bytes;
   this.headers = headers;
   this.status = status;
 });
-const ResponseInit = record(function ResponseInit(status) {
+// The init dictionary of the Responses the runtime makes. An undefined
+// member reads as absent.
+const ResponseInit = record(function ResponseInit(status, statusText) {
   this.status = status;
+  this.statusText = statusText;
 });
 
 const define = (name, value, enumerable = false) => {
@@ -183,8 +202,8 @@ function setFrozenTime(nowMs, perfMs = nowMs) {
 }
 
 // Workers see the clock frozen between I/O boundaries through Date.now and
-// performance.now. The runtime reads the same clock through dd.frozenNow and
-// dd.frozenPerfNow, never through those globals.
+// performance.now. The runtime reads the same clock through dd.frozenPerfNow,
+// never through those globals.
 function ensureFrozenTimeGlobals() {
   Date.now = () => frozenNowMs;
 
@@ -202,12 +221,18 @@ function ensureFrozenTimeGlobals() {
   }
 }
 
-function runtimeOp(name, ...args) {
-  const op = core.ops[name];
-  if (typeof op !== "function") {
-    return undefined;
-  }
-  return ReflectApply(op, undefined, args);
+// Moves the frozen clock to the host's, as op_time_boundary_now reads it at
+// an I/O boundary. The execute-worker bundle syncs through these too.
+function applyTimeBoundary(boundary) {
+  setFrozenTime(boundary.now_ms, boundary.perf_ms);
+}
+
+async function syncFrozenTimeBoundary() {
+  applyTimeBoundary(await op_time_boundary_now());
+}
+
+function syncFrozenTimeBoundaryNow() {
+  applyTimeBoundary(op_time_boundary_now());
 }
 
 function ensureTimerGlobals() {
@@ -239,7 +264,7 @@ function ensureTimerGlobals() {
     let remaining = delayMs;
     while (remaining > 0) {
       const step = MathMin(remaining, 0x7fffffff);
-      await runtimeOp("op_sleep", step);
+      await op_sleep(step);
       await syncFrozenTimeBoundary();
       remaining -= step;
     }
@@ -313,7 +338,7 @@ function ensureEncodingGlobals() {
       }
       bytes[i] = code;
     }
-    return core.ops.op_base64_encode_from_buffer(bytes, 0, bytes.length);
+    return op_base64_encode_from_buffer(bytes, 0, bytes.length);
   });
   define("atob", function atob(data) {
     if (arguments.length === 0) {
@@ -321,7 +346,7 @@ function ensureEncodingGlobals() {
     }
     let bytes;
     try {
-      bytes = core.ops.op_base64_decode(String(data));
+      bytes = op_base64_decode(String(data));
     } catch {
       throw new DOMException("atob input is not valid base64", "InvalidCharacterError");
     }
@@ -431,7 +456,8 @@ function ensureAsyncContextGlobal() {
 }
 
 // Each console call is formatted here and handed to the host as one line,
-// tagged with the request it ran under; console.time reads the same frozen
+// tagged with the request it ran under (dd.runtimeRequestId, which the
+// execute-worker bundle installs); console.time reads the same frozen
 // clock as performance.now. Each method is op_call_console bound to V8's
 // method of the same name and dd's: while a DevTools session is attached it
 // hands the call to V8's console too, so DevTools shows inspectable values
@@ -441,7 +467,7 @@ function ensureAsyncContextGlobal() {
 function ensureConsoleGlobal() {
   const { createConsole } = core.loadExtScript("ext:deno_web/01_console.js");
   const console = createConsole(
-    (level, message) => core.ops.op_console_write(level, message, activeRuntimeRequestId()),
+    (level, message) => op_console_write(level, message, dd.runtimeRequestId()),
     () => frozenPerfMs,
   );
   if (inspectorConsole !== null && typeof inspectorConsole === "object") {
@@ -453,7 +479,7 @@ function ensureConsoleGlobal() {
         continue;
       }
       const method = FunctionPrototypeBind(
-        core.ops.op_call_console,
+        op_call_console,
         console,
         inspectorMethod,
         console[name],
@@ -478,52 +504,6 @@ function ensureCryptoGlobals() {
     enumerable: false,
     configurable: true,
   });
-}
-
-function normalizeTimeBoundaryValue(value) {
-  if (value == null) {
-    return null;
-  }
-  if (typeof value === "number") {
-    return new TimeBoundary(value, value);
-  }
-  if (ArrayIsArray(value)) {
-    const nowMs = value[0];
-    return new TimeBoundary(nowMs, value[1] === undefined ? nowMs : value[1]);
-  }
-  if (typeof value === "object") {
-    const nowMs =
-      value.nowMs ?? value.now_ms ?? value.now ?? value.wallMs ?? value.wall_ms;
-    const perfMs =
-      value.perfMs ?? value.perf_ms ?? value.perf ?? value.monotonicMs ?? value.monotonic_ms ?? nowMs;
-    return new TimeBoundary(nowMs, perfMs);
-  }
-  return null;
-}
-
-async function syncFrozenTimeBoundary() {
-  if (typeof dd.syncTimeBoundary === "function") {
-    await dd.syncTimeBoundary();
-    return;
-  }
-
-  const boundaryRaw = await runtimeOp("op_time_boundary_now");
-  const boundary = normalizeTimeBoundaryValue(boundaryRaw);
-  if (boundary) {
-    setFrozenTime(boundary.nowMs, boundary.perfMs);
-  }
-}
-
-function activeRuntimeRequestId() {
-  return typeof dd.runtimeRequestId === "function"
-    ? String(dd.runtimeRequestId() ?? "")
-    : "";
-}
-
-function activeCacheBypassStale() {
-  return typeof dd.cacheBypassStale === "function"
-    ? Boolean(dd.cacheBypassStale())
-    : false;
 }
 
 const toRequest = (request) => ObjectPrototypeIsPrototypeOf(RequestPrototype, request)
@@ -560,17 +540,12 @@ class Cache {
     const method = RequestPrototypeGetMethod(normalizedRequest);
     const url = RequestPrototypeGetUrl(normalizedRequest);
     const requestHeaders = headerPairs(RequestPrototypeGetHeaders(normalizedRequest));
-    const requestHeadersHandle = runtimeOp(
-      "op_http_store_prepared_headers",
-      requestHeaders,
-    );
-    const result = await runtimeOp(
-      "op_cache_match",
+    const result = await op_cache_match(
       this.name,
       method,
       url,
-      Number(requestHeadersHandle ?? 0),
-      activeCacheBypassStale(),
+      op_http_store_prepared_headers(requestHeaders),
+      dd.cacheBypassStale(),
     );
     await syncFrozenTimeBoundary();
 
@@ -582,29 +557,21 @@ class Cache {
     }
 
     if (result.should_revalidate === true) {
-      const revalidateHeadersHandle = runtimeOp(
-        "op_http_store_prepared_headers",
-        requestHeaders,
-      );
-      runtimeOp(
-        "op_emit_cache_revalidate",
+      op_emit_cache_revalidate(
         this.name,
         method,
         url,
-        Number(revalidateHeadersHandle ?? 0),
+        op_http_store_prepared_headers(requestHeaders),
       );
       await syncFrozenTimeBoundary();
     }
 
-    const body = runtimeOp(
-      "op_http_take_prepared_body",
-      Number(result.body_handle ?? 0),
+    const body = op_http_take_prepared_body(Number(result.body_handle ?? 0));
+    const headers = op_http_take_prepared_headers(Number(result.headers_handle ?? 0));
+    const response = new RuntimeResponse(
+      body,
+      new ResponseInit(Number(result.status ?? 200), undefined),
     );
-    const headers = runtimeOp(
-      "op_http_take_prepared_headers",
-      Number(result.headers_handle ?? 0),
-    );
-    const response = new RuntimeResponse(body, new ResponseInit(Number(result.status ?? 200)));
     appendHeaderPairs(ResponsePrototypeGetHeaders(response), ArrayIsArray(headers) ? headers : []);
     return response;
   }
@@ -612,21 +579,19 @@ class Cache {
   async put(request, response) {
     const normalizedRequest = toRequest(request);
     const parts = await cachedResponseParts(response);
-    const bodyHandle = runtimeOp("op_http_store_prepared_body", parts.bytes);
-    const requestHeadersHandle = runtimeOp(
-      "op_http_store_prepared_headers",
+    const bodyHandle = op_http_store_prepared_body(parts.bytes);
+    const requestHeadersHandle = op_http_store_prepared_headers(
       headerPairs(RequestPrototypeGetHeaders(normalizedRequest)),
     );
-    const responseHeadersHandle = runtimeOp("op_http_store_prepared_headers", parts.headers);
-    const result = await runtimeOp(
-      "op_cache_put",
+    const responseHeadersHandle = op_http_store_prepared_headers(parts.headers);
+    const result = await op_cache_put(
       this.name,
       RequestPrototypeGetMethod(normalizedRequest),
       RequestPrototypeGetUrl(normalizedRequest),
-      Number(requestHeadersHandle ?? 0),
+      requestHeadersHandle,
       Number(parts.status ?? 200),
-      Number(responseHeadersHandle ?? 0),
-      Number(bodyHandle ?? 0),
+      responseHeadersHandle,
+      bodyHandle,
     );
     await syncFrozenTimeBoundary();
     if (result && typeof result === "object" && result.ok === false) {
@@ -636,16 +601,11 @@ class Cache {
 
   async delete(request, _options = undefined) {
     const normalizedRequest = toRequest(request);
-    const headersHandle = runtimeOp(
-      "op_http_store_prepared_headers",
-      headerPairs(RequestPrototypeGetHeaders(normalizedRequest)),
-    );
-    const result = await runtimeOp(
-      "op_cache_delete",
+    const result = await op_cache_delete(
       this.name,
       RequestPrototypeGetMethod(normalizedRequest),
       RequestPrototypeGetUrl(normalizedRequest),
-      Number(headersHandle ?? 0),
+      op_http_store_prepared_headers(headerPairs(RequestPrototypeGetHeaders(normalizedRequest))),
     );
     await syncFrozenTimeBoundary();
     if (result && typeof result === "object" && result.ok === false) {
@@ -723,10 +683,12 @@ define("WritableStreamDefaultController", WritableStreamDefaultController);
 define("TransformStreamDefaultController", TransformStreamDefaultController);
 define("ByteLengthQueuingStrategy", ByteLengthQueuingStrategy);
 define("CountQueuingStrategy", CountQueuingStrategy);
-if (typeof denoFetch === "function") {
-  define("fetch", denoFetch);
-}
+define("fetch", denoFetch);
 define("caches", new CacheStorage());
 dd.setTime = setFrozenTime;
-dd.frozenNow = () => frozenNowMs;
 dd.frozenPerfNow = () => frozenPerfMs;
+dd.syncTimeBoundary = syncFrozenTimeBoundary;
+dd.syncTimeBoundaryNow = syncFrozenTimeBoundaryNow;
+dd.RECORD = RECORD;
+dd.record = record;
+dd.ResponseInit = ResponseInit;

@@ -628,7 +628,7 @@ async fn host_fetch_is_single_permanent_request_scoped_wrapper() {
             "fetch-wrapper".to_string(),
             r#"
 let firstFetch;
-let firstInstaller;
+let firstHostFetch;
 let firstRequestIdGetter;
 let firstRequestContextHandleGetter;
 let firstSyncBoundary;
@@ -637,7 +637,7 @@ let firstCacheBypassGetter;
 export default {
   async fetch() {
     const current = globalThis.fetch;
-    const installer = __dd_internals.dd.installHostFetch;
+    const hostFetch = __dd_internals.dd.hostFetch;
     const requestIdGetter = __dd_internals.dd.runtimeRequestId;
     const requestContextHandleGetter = __dd_internals.dd.runtimeRequestContextHandle;
     const syncBoundary = __dd_internals.dd.syncTimeBoundary;
@@ -645,7 +645,7 @@ export default {
     const first = firstFetch === undefined;
     if (first) {
       firstFetch = current;
-      firstInstaller = installer;
+      firstHostFetch = hostFetch;
       firstRequestIdGetter = requestIdGetter;
       firstRequestContextHandleGetter = requestContextHandleGetter;
       firstSyncBoundary = syncBoundary;
@@ -654,8 +654,7 @@ export default {
     return Response.json({
       first,
       sameAsFirst: current === firstFetch,
-      installerAvailable: typeof installer === "function",
-      installerSameAsFirst: installer === firstInstaller,
+      hostFetchSameAsFirst: hostFetch === firstHostFetch,
       requestIdGetterSameAsFirst: requestIdGetter === firstRequestIdGetter,
       requestContextHandleGetterSameAsFirst: requestContextHandleGetter === firstRequestContextHandleGetter,
       syncBoundarySameAsFirst: syncBoundary === firstSyncBoundary,
@@ -667,7 +666,7 @@ export default {
       // The global stays the web layer's fetch, which calls the request-scoped
       // host fetch; the runtime writes no worker-visible global per request.
       wrapperInstalled: current === __dd_internals.dd.web.fetch
-        && typeof __dd_internals.dd.hostFetch === "function",
+        && typeof hostFetch === "function",
     });
   },
 };
@@ -697,8 +696,7 @@ export default {
 
     assert_eq!(first["first"], true);
     assert_eq!(first["sameAsFirst"], true);
-    assert_eq!(first["installerAvailable"], true);
-    assert_eq!(first["installerSameAsFirst"], true);
+    assert_eq!(first["hostFetchSameAsFirst"], true);
     assert_eq!(first["requestIdGetterSameAsFirst"], true);
     assert_eq!(first["requestContextHandleGetterSameAsFirst"], true);
     assert_eq!(first["syncBoundarySameAsFirst"], true);
@@ -710,8 +708,7 @@ export default {
     assert_eq!(first["wrapperInstalled"], true);
     assert_eq!(second["first"], false);
     assert_eq!(second["sameAsFirst"], true);
-    assert_eq!(second["installerAvailable"], true);
-    assert_eq!(second["installerSameAsFirst"], true);
+    assert_eq!(second["hostFetchSameAsFirst"], true);
     assert_eq!(second["requestIdGetterSameAsFirst"], true);
     assert_eq!(second["requestContextHandleGetterSameAsFirst"], true);
     assert_eq!(second["syncBoundarySameAsFirst"], true);
