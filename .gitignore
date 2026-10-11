@@ -1,6 +1,7 @@
 COMMENTS.md
 target
 .agents
+.codex
 store/
 dd-kv.db
 dd-kv.db-wal
@@ -11,6 +12,7 @@ dist/
 **/dd-env.d.ts
 .react-router/
 **/.react-router/
+.vitest-attachments/
 tmp/
 packages/dd-runtime-*/bin/dd_dev_runtime
 packages/dd-runtime-*/bin/dd_dev_runtime.exe
