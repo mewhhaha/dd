@@ -29,7 +29,7 @@ regex = "1.13.1"
 encoding_rs = "0.8.35"
 rustls = "0.23.45"
 url = { workspace = true, features = ["expose_internals"] }
-urlpattern = "=0.4.2"
+urlpattern = "=0.6.0"
 # WebCrypto, ported from deno_crypto 0.253, on one major of the RustCrypto crates.
 aes = "0.9.3"
 aes-gcm = "0.11.1"
