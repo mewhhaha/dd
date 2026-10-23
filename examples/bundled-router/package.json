@@ -7,7 +7,7 @@
     "watch": "tsdown src/worker.ts --format esm --target esnext --out-dir dist --watch"
   },
   "devDependencies": {
-    "tsdown": "^0.23.0",
+    "tsdown": "^0.23.1",
     "typescript": "^7.0.2"
   }
 }
