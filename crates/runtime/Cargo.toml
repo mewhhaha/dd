@@ -29,7 +29,7 @@ regex = "1.13.1"
 encoding_rs = "0.8.35"
 rustls = "0.23.45"
 url = { workspace = true, features = ["expose_internals"] }
-urlpattern = "=0.4.2"
+urlpattern = "=0.6.0"
 # WebCrypto, ported from deno_crypto 0.253, on one major of the RustCrypto crates.
 aes = "0.9.3"
 aes-gcm = "0.11.1"
@@ -49,7 +49,7 @@ p521 = { version = "0.14.0", features = ["ecdh"] }
 rand = "0.10.3"
 # rsa 0.9 would pull the previous RustCrypto major back in, and 0.10 has only
 # release candidates so far, which may break each other.
-rsa = "=0.10.0-rc.19"
+rsa = "=0.10.0"
 serde_bytes = "0.11"
 sha1 = { version = "0.11.0", features = ["oid"] }
 sha3 = "0.12.0"
