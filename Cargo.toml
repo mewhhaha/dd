@@ -69,6 +69,9 @@ opt-level = 2
 [profile.test.build-override]
 opt-level = 2
 
+[profile.release.build-override]
+opt-level = 2
+
 [profile.dev.package.wtime-aot]
 opt-level = 3
 debug-assertions = false

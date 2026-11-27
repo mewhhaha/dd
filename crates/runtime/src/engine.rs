@@ -36,6 +36,10 @@ const CORE_JS: &str = include_str!("../js/core/core.js");
 const WEB_INIT_JS: &str = include_str!("../js/web/init.js");
 const NODE_ASYNC_HOOKS_SOURCE: &str =
     include_str!("../../../packages/dd-vite/src/shims/node_async_hooks.js");
+const PRECOMPILED_BOOTSTRAP_SHA256: &[u8; 32] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/dd_bootstrap.sha256"));
+const PRECOMPILED_BOOTSTRAP_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/dd_bootstrap.wtmn"));
 
 static BOOTSTRAP_SNAPSHOT: OnceLock<Result<Box<[u8]>>> = OnceLock::new();
 
@@ -48,40 +52,50 @@ fn runtime_ops() -> Vec<OpDecl> {
     ops
 }
 
+fn record_bootstrap_runtime(ops: Vec<OpDecl>) -> Result<JsRuntime> {
+    let mut runtime = JsRuntime::new_for_snapshot(RuntimeOptions {
+        ops,
+        ext_scripts: crate::web::EXT_SCRIPTS,
+        ..Default::default()
+    })
+    .map_err(runtime_error)?;
+    runtime
+        .execute_script("ext:core/00_primordials.js", PRIMORDIALS_JS)
+        .map_err(runtime_error)?;
+    let bootstrap = runtime
+        .execute_with_ops("ext:core/core.js", CORE_JS)
+        .map_err(runtime_error)?;
+    for (name, source) in [
+        ("ext:web/init.js", WEB_INIT_JS),
+        (BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS),
+        (EXECUTE_WORKER_SPECIFIER, EXECUTE_WORKER_JS),
+    ] {
+        runtime
+            .execute_function(
+                name,
+                source,
+                &["__bootstrap"],
+                std::slice::from_ref(&bootstrap),
+            )
+            .map_err(runtime_error)?;
+    }
+    runtime.set_internals(bootstrap);
+    Ok(runtime)
+}
+
 /// Builds (once per process) the AOT-compiled snapshot every isolate starts from:
 /// all 20 Web Platform scripts, primordials, core, web/init, dd bootstrap, and
-/// execute_worker compiled directly into native x64 machine code by Scriptw + wtime.
+/// execute_worker compiled directly into native machine code by Scriptw + wtime.
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     BOOTSTRAP_SNAPSHOT
         .get_or_init(|| {
-            let mut runtime = JsRuntime::new_for_snapshot(RuntimeOptions {
-                ops: runtime_ops(),
-                ext_scripts: crate::web::EXT_SCRIPTS,
-                ..Default::default()
-            })
-            .map_err(runtime_error)?;
-            runtime
-                .execute_script("ext:core/00_primordials.js", PRIMORDIALS_JS)
-                .map_err(runtime_error)?;
-            let bootstrap = runtime
-                .execute_with_ops("ext:core/core.js", CORE_JS)
-                .map_err(runtime_error)?;
-            for (name, source) in [
-                ("ext:web/init.js", WEB_INIT_JS),
-                (BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS),
-                (EXECUTE_WORKER_SPECIFIER, EXECUTE_WORKER_JS),
-            ] {
-                runtime
-                    .execute_function(
-                        name,
-                        source,
-                        &["__bootstrap"],
-                        std::slice::from_ref(&bootstrap),
-                    )
-                    .map_err(runtime_error)?;
-            }
-            runtime.set_internals(bootstrap);
-            runtime.snapshot().map_err(runtime_error)
+            dd_v8::register_precompiled_bundle(
+                *PRECOMPILED_BOOTSTRAP_SHA256,
+                PRECOMPILED_BOOTSTRAP_BYTES,
+            );
+            record_bootstrap_runtime(runtime_ops())?
+                .snapshot()
+                .map_err(runtime_error)
         })
         .as_deref()
         .map_err(Clone::clone)
@@ -490,3 +504,23 @@ fn runtime_error(error: impl std::fmt::Display) -> PlatformError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn precompiled_bootstrap_matches_runtime_bundle() {
+    assert!(
+        !PRECOMPILED_BOOTSTRAP_BYTES.is_empty(),
+        "build.rs should embed a precompiled bootstrap native image on native targets"
+    );
+    let source = record_bootstrap_runtime(Vec::new())
+        .expect("record bootstrap")
+        .snapshot_bundle_source()
+        .expect("render bootstrap bundle source");
+    assert_eq!(
+        dd_v8::bundle_source_sha256(&source),
+        *PRECOMPILED_BOOTSTRAP_SHA256,
+        "build.rs precompiled bootstrap SHA-256 must match runtime bootstrap bundle"
+    );
+    dd_v8::register_precompiled_bundle(*PRECOMPILED_BOOTSTRAP_SHA256, PRECOMPILED_BOOTSTRAP_BYTES);
+    assert!(dd_v8::has_precompiled_bundle(*PRECOMPILED_BOOTSTRAP_SHA256));
+}

@@ -25,6 +25,9 @@ pub use ops::{
     AsyncOp, FromV8, JsBuffer, OpDecl, OpError, OpErrorClass, OpResult, RawBuffer, SyncOp,
 };
 pub use platform::{init, set_flags};
-pub use runtime::{JsRuntime, JsValue, RuntimeHandle, RuntimeOptions};
+pub use runtime::{
+    JsRuntime, JsValue, RuntimeHandle, RuntimeOptions, bundle_source_sha256,
+    has_precompiled_bundle, precompile_snapshot_bundle, register_precompiled_bundle,
+};
 pub use serde_v8::ToJsBuffer;
 pub use state::OpState;
