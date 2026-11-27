@@ -4,9 +4,8 @@
 
 #![allow(dead_code)]
 
-use dd_v8::builtins::{buffer_bytes, with_buffer_mut, write_u32s};
-use dd_v8::{JsBuffer, JsRuntime, OpDecl, OpState, RuntimeOptions, ToJsBuffer, v8};
-use dd_v8::{op_async, op_raw, op_sync};
+use dd_v8::{JsBuffer, JsRuntime, JsValue, OpDecl, OpState, RuntimeOptions, ToJsBuffer};
+use dd_v8::{op_async, op_sync};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -112,55 +111,6 @@ fn op_big_numbers(_state: &mut OpState) -> (u64, u64, i64, i64, u64) {
     ((1 << 53) - 1, 1 << 53, i64::MIN, i64::MAX, u64::MAX)
 }
 
-fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
-    let message = v8::String::new(scope, message).unwrap();
-    let exception = v8::Exception::type_error(scope, message);
-    scope.throw_exception(exception);
-}
-
-/// `op_raw_copy(buffer)`: the bytes `buffer_bytes` copies, as a new array.
-fn op_raw_copy<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    match buffer_bytes(args.get(0)) {
-        Some(bytes) => rv.set(dd_v8::serde_v8::uint8_array(scope, bytes).into()),
-        None => throw_type_error(scope, "not a buffer"),
-    }
-}
-
-/// `op_raw_fill(buffer)`: fills the buffer in place with 0xab through
-/// `with_buffer_mut` and returns how many bytes it saw.
-fn op_raw_fill<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let filled = with_buffer_mut(args.get(0), |bytes| {
-        bytes.fill(0xab);
-        bytes.len()
-    });
-    match filled {
-        Some(length) => rv.set_double(length as f64),
-        None => throw_type_error(scope, "not a buffer"),
-    }
-}
-
-/// `op_raw_write_u32s(buffer)`: writes the words 0x04030201 through
-/// `write_u32s`.
-fn op_raw_write_u32s<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    if write_u32s(args.get(0), &[0x0403_0201; 1024]) {
-        rv.set_bool(true);
-    } else {
-        throw_type_error(scope, "not a buffer");
-    }
-}
-
 pub fn test_ops() -> Vec<OpDecl> {
     vec![
         op_sync!(op_echo_bytes),
@@ -183,9 +133,6 @@ pub fn test_ops() -> Vec<OpDecl> {
         op_sync!(op_shape),
         op_sync!(op_command),
         op_sync!(op_big_numbers),
-        op_raw!(op_raw_copy),
-        op_raw!(op_raw_fill),
-        op_raw!(op_raw_write_u32s),
     ]
 }
 
@@ -244,10 +191,10 @@ pub fn runtime_with(options: RuntimeOptions) -> JsRuntime {
     runtime
 }
 
-pub fn string(runtime: &mut JsRuntime, value: v8::Global<v8::Value>) -> String {
-    dd_v8::scope!(scope, runtime);
-    let value = v8::Local::new(scope, value);
-    value.to_rust_string_lossy(scope)
+pub fn string(runtime: &mut JsRuntime, value: JsValue) -> String {
+    runtime
+        .value_to_string(&value)
+        .unwrap_or_else(|e| panic!("to_string failed: {e}"))
 }
 
 pub fn eval(runtime: &mut JsRuntime, source: &str) -> String {

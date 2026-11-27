@@ -1,18 +1,12 @@
 //! Host functions callable from JavaScript.
 //!
-//! An op is a plain Rust function. Sync ops take `&mut OpState` (or, to
-//! hand the state to a task, `Rc<RefCell<OpState>>`) first and async ops
-//! take `Rc<RefCell<OpState>>` first; every other argument and the
-//! return value convert through serde (see [`crate::serde_v8`]). A return of
-//! `()` is `undefined`, and an `Err` (of any error convertible to
-//! [`OpError`]) throws (sync) or rejects (async).
-//! Ops that need V8 values directly register as raw ops.
-//!
-//! All ops share one native callback, so a snapshot needs a single external
-//! reference; the op's index rides along as the function's data.
+//! An op is a plain Rust function. Sync ops take `&mut OpState` (or
+//! `Rc<RefCell<OpState>>`) first and async ops take `Rc<RefCell<OpState>>`
+//! first; every other argument and the return value convert through serde
+//! (see [`crate::serde_v8`]). A return of `()` is `undefined`, and an `Err`
+//! (of any error convertible to [`OpError`]) throws (sync) or rejects (async).
 
-use crate::runtime::{PendingOp, runtime_state};
-use crate::serde_v8;
+use crate::serde_v8::{self, WireValue};
 use crate::state::OpState;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -21,53 +15,64 @@ use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
 
-pub(crate) type OpHandler = Box<
-    dyn for<'s, 'i> Fn(
-        &mut v8::PinScope<'s, 'i>,
-        &v8::FunctionCallbackArguments<'s>,
-        &mut v8::ReturnValue<'s, v8::Value>,
-    ),
+pub(crate) type SyncOpFn =
+    Box<dyn Fn(&Rc<RefCell<OpState>>, &[WireValue]) -> Result<WireValue, OpError>>;
+
+pub(crate) type AsyncOpFn = Box<
+    dyn Fn(
+        &Rc<RefCell<OpState>>,
+        &[WireValue],
+    ) -> Result<Pin<Box<dyn Future<Output = Result<WireValue, OpError>>>>, OpError>,
 >;
 
-/// A raw op reads its arguments and writes its return value itself.
-pub type RawOp = for<'s, 'i> fn(
-    &mut v8::PinScope<'s, 'i>,
-    &v8::FunctionCallbackArguments<'s>,
-    &mut v8::ReturnValue<'s, v8::Value>,
-);
+pub(crate) enum OpKind {
+    Sync(SyncOpFn),
+    Async(AsyncOpFn),
+    /// Handled directly inside `kernel.mjs` (pure JS builtin or wrapped op).
+    BuiltinJs,
+}
 
 pub struct OpDecl {
     pub(crate) name: &'static str,
-    pub(crate) handler: OpHandler,
+    pub(crate) kind: OpKind,
 }
 
 impl OpDecl {
     pub fn sync<Args>(name: &'static str, op: impl SyncOp<Args>) -> Self {
         Self {
             name,
-            handler: op.into_handler(name),
+            kind: OpKind::Sync(op.into_handler(name)),
         }
     }
 
     pub fn async_op<Args>(name: &'static str, op: impl AsyncOp<Args>) -> Self {
         Self {
             name,
-            handler: op.into_handler(name),
+            kind: OpKind::Async(op.into_handler(name)),
         }
     }
 
-    pub fn raw(name: &'static str, op: RawOp) -> Self {
+    /// Declares an op whose implementation lives in the Scriptw JS host kernel.
+    pub fn builtin_js(name: &'static str) -> Self {
         Self {
             name,
-            handler: Box::new(op),
+            kind: OpKind::BuiltinJs,
         }
     }
 
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    pub(crate) fn is_async(&self) -> bool {
+        matches!(self.kind, OpKind::Async(_))
+    }
+
+    pub(crate) fn is_builtin_js(&self) -> bool {
+        matches!(self.kind, OpKind::BuiltinJs)
     }
 }
 
@@ -84,14 +89,6 @@ macro_rules! op_sync {
 macro_rules! op_async {
     ($op:ident) => {
         $crate::OpDecl::async_op(stringify!($op), $op)
-    };
-}
-
-/// Declares a raw op named after the function.
-#[macro_export]
-macro_rules! op_raw {
-    ($op:ident) => {
-        $crate::OpDecl::raw(stringify!($op), $op)
     };
 }
 
@@ -148,19 +145,6 @@ impl OpError {
     pub fn message(&self) -> &str {
         &self.message
     }
-
-    pub fn to_exception<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
-        let message =
-            v8::String::new(scope, &self.message).unwrap_or_else(|| v8::String::empty(scope));
-        match self.class {
-            OpErrorClass::Error => v8::Exception::error(scope, message),
-            OpErrorClass::TypeError => v8::Exception::type_error(scope, message),
-            OpErrorClass::RangeError => v8::Exception::range_error(scope, message),
-            OpErrorClass::Custom(class) => {
-                crate::builtins::build_custom_error(scope, class, message)
-            }
-        }
-    }
 }
 
 impl fmt::Display for OpError {
@@ -189,30 +173,20 @@ impl From<serde_v8::Error> for OpError {
     }
 }
 
-/// An op argument.
+/// An op argument deserialized from JS wire data.
 pub trait FromV8: Sized {
-    fn from_v8<'s>(
-        scope: &mut v8::PinScope<'s, '_>,
-        value: v8::Local<'s, v8::Value>,
-    ) -> Result<Self, OpError>;
+    fn from_wire(value: &WireValue) -> Result<Self, OpError>;
 }
 
 impl<T: DeserializeOwned> FromV8 for T {
-    fn from_v8<'s>(
-        scope: &mut v8::PinScope<'s, '_>,
-        value: v8::Local<'s, v8::Value>,
-    ) -> Result<Self, OpError> {
-        Ok(serde_v8::from_v8(scope, value)?)
+    fn from_wire(value: &WireValue) -> Result<Self, OpError> {
+        Ok(serde_v8::from_wire(value)?)
     }
 }
 
 /// An op's return value. `Marker` tells plain values from `Result`s.
 pub trait OpResult<Marker>: 'static {
-    /// `None` means `undefined`.
-    fn into_v8<'s>(
-        self,
-        scope: &mut v8::PinScope<'s, '_>,
-    ) -> Result<Option<v8::Local<'s, v8::Value>>, OpError>;
+    fn into_wire(self) -> Result<WireValue, OpError>;
 }
 
 #[doc(hidden)]
@@ -222,23 +196,17 @@ pub struct Value;
 pub struct Fallible;
 
 impl<T: Serialize + 'static> OpResult<Value> for T {
-    fn into_v8<'s>(
-        self,
-        scope: &mut v8::PinScope<'s, '_>,
-    ) -> Result<Option<v8::Local<'s, v8::Value>>, OpError> {
+    fn into_wire(self) -> Result<WireValue, OpError> {
         if TypeId::of::<T>() == TypeId::of::<()>() {
-            return Ok(None);
+            return Ok(WireValue::Undefined);
         }
-        Ok(Some(serde_v8::to_v8(scope, &self)?))
+        Ok(serde_v8::to_wire(&self)?)
     }
 }
 
 impl<T: Serialize + 'static, E: Into<OpError> + 'static> OpResult<Fallible> for Result<T, E> {
-    fn into_v8<'s>(
-        self,
-        scope: &mut v8::PinScope<'s, '_>,
-    ) -> Result<Option<v8::Local<'s, v8::Value>>, OpError> {
-        OpResult::<Value>::into_v8(self.map_err(Into::into)?, scope)
+    fn into_wire(self) -> Result<WireValue, OpError> {
+        OpResult::<Value>::into_wire(self.map_err(Into::into)?)
     }
 }
 
@@ -289,8 +257,6 @@ impl<'de> serde::Deserialize<'de> for JsBuffer {
                 self,
                 mut seq: A,
             ) -> Result<JsBuffer, A::Error> {
-                // The hint is a JavaScript array's length, which a sparse
-                // array sets to 2^32 - 1 for free; reserve at most 1 MiB.
                 let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 20));
                 while let Some(byte) = seq.next_element::<u8>()? {
                     bytes.push(byte);
@@ -303,107 +269,12 @@ impl<'de> serde::Deserialize<'de> for JsBuffer {
     }
 }
 
-fn handler<F>(f: F) -> OpHandler
-where
-    F: for<'s, 'i> Fn(
-            &mut v8::PinScope<'s, 'i>,
-            &v8::FunctionCallbackArguments<'s>,
-            &mut v8::ReturnValue<'s, v8::Value>,
-        ) + 'static,
-{
-    Box::new(f)
+fn arg_error(op: &str, index: usize, error: OpError) -> OpError {
+    OpError::type_error(format!("{op}: argument {}: {}", index + 1, error.message))
 }
 
-fn throw(scope: &mut v8::PinScope<'_, '_>, error: &OpError) {
-    let exception = error.to_exception(scope);
-    scope.throw_exception(exception);
-}
-
-fn throw_argument_error(scope: &mut v8::PinScope<'_, '_>, op: &str, index: usize, error: OpError) {
-    throw(
-        scope,
-        &OpError::type_error(format!("{op}: argument {}: {}", index + 1, error.message)),
-    );
-}
-
-fn return_result<'s, M>(
-    scope: &mut v8::PinScope<'s, '_>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-    result: impl OpResult<M>,
-) {
-    match result.into_v8(scope) {
-        Ok(Some(value)) => rv.set(value),
-        Ok(None) => rv.set_undefined(),
-        Err(error) => throw(scope, &error),
-    }
-}
-
-/// The settled value of an async op, converted once a scope is available.
-pub(crate) trait AsyncResult {
-    fn into_v8<'s>(
-        self: Box<Self>,
-        scope: &mut v8::PinScope<'s, '_>,
-    ) -> Result<Option<v8::Local<'s, v8::Value>>, OpError>;
-}
-
-struct Settled<R, M>(R, PhantomData<M>);
-
-impl<R: OpResult<M>, M: 'static> AsyncResult for Settled<R, M> {
-    fn into_v8<'s>(
-        self: Box<Self>,
-        scope: &mut v8::PinScope<'s, '_>,
-    ) -> Result<Option<v8::Local<'s, v8::Value>>, OpError> {
-        self.0.into_v8(scope)
-    }
-}
-
-pub(crate) fn settle<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    resolver: v8::Local<'s, v8::PromiseResolver>,
-    result: Box<dyn AsyncResult>,
-) {
-    match result.into_v8(scope) {
-        Ok(value) => {
-            let value = value.unwrap_or_else(|| v8::undefined(scope).into());
-            resolver.resolve(scope, value);
-        }
-        Err(error) => {
-            let exception = error.to_exception(scope);
-            resolver.reject(scope, exception);
-        }
-    }
-}
-
-/// Starts an async op: polls it once, and either settles the returned promise
-/// now or parks the future on the event loop.
-fn submit<'s, R: OpResult<M>, M: 'static>(
-    scope: &mut v8::PinScope<'s, '_>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-    future: impl Future<Output = R> + 'static,
-) {
-    let Some(resolver) = v8::PromiseResolver::new(scope) else {
-        return;
-    };
-    rv.set(resolver.get_promise(scope).into());
-    let mut future: std::pin::Pin<Box<dyn Future<Output = Box<dyn AsyncResult>>>> = Box::pin(
-        async move { Box::new(Settled(future.await, PhantomData)) as Box<dyn AsyncResult> },
-    );
-    match future
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-    {
-        Poll::Ready(result) => settle(scope, resolver, result),
-        Poll::Pending => {
-            let state = runtime_state(scope);
-            state
-                .pending_ops
-                .borrow_mut()
-                .push(PendingOp::new(v8::Global::new(scope, resolver), future));
-            // The first poll registered no waker; the loop must poll the
-            // future again before it can wake anything.
-            state.waker.wake();
-        }
-    }
+fn get_arg(args: &[WireValue], index: usize) -> &WireValue {
+    args.get(index).unwrap_or(&WireValue::Undefined)
 }
 
 /// Marks sync ops that take `&mut OpState`.
@@ -415,11 +286,11 @@ pub struct ExclusiveState;
 pub struct SharedState;
 
 pub trait SyncOp<Args>: 'static {
-    fn into_handler(self, name: &'static str) -> OpHandler;
+    fn into_handler(self, name: &'static str) -> SyncOpFn;
 }
 
 pub trait AsyncOp<Args>: 'static {
-    fn into_handler(self, name: &'static str) -> OpHandler;
+    fn into_handler(self, name: &'static str) -> AsyncOpFn;
 }
 
 macro_rules! impl_ops {
@@ -432,19 +303,17 @@ macro_rules! impl_ops {
             $($arg: FromV8,)*
         {
             #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
-            fn into_handler(self, name: &'static str) -> OpHandler {
-                handler(move |scope, args, rv| {
-                    let mut index = 0;
+            fn into_handler(self, name: &'static str) -> SyncOpFn {
+                let _marker = PhantomData::<M>;
+                Box::new(move |op_state, args| {
+                    let mut index = 0usize;
                     $(
-                        let $arg = match <$arg as FromV8>::from_v8(scope, args.get(index as i32)) {
-                            Ok(value) => value,
-                            Err(error) => return throw_argument_error(scope, name, index, error),
-                        };
+                        let $arg = <$arg as FromV8>::from_wire(get_arg(args, index))
+                            .map_err(|e| arg_error(name, index, e))?;
                         index += 1;
                     )*
-                    let op_state = Rc::clone(&runtime_state(scope).op_state);
                     let result = (self)(&mut op_state.borrow_mut(), $($arg),*);
-                    return_result(scope, rv, result);
+                    result.into_wire()
                 })
             }
         }
@@ -457,19 +326,17 @@ macro_rules! impl_ops {
             $($arg: FromV8,)*
         {
             #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
-            fn into_handler(self, name: &'static str) -> OpHandler {
-                handler(move |scope, args, rv| {
-                    let mut index = 0;
+            fn into_handler(self, name: &'static str) -> SyncOpFn {
+                let _marker = PhantomData::<M>;
+                Box::new(move |op_state, args| {
+                    let mut index = 0usize;
                     $(
-                        let $arg = match <$arg as FromV8>::from_v8(scope, args.get(index as i32)) {
-                            Ok(value) => value,
-                            Err(error) => return throw_argument_error(scope, name, index, error),
-                        };
+                        let $arg = <$arg as FromV8>::from_wire(get_arg(args, index))
+                            .map_err(|e| arg_error(name, index, e))?;
                         index += 1;
                     )*
-                    let op_state = Rc::clone(&runtime_state(scope).op_state);
-                    let result = (self)(op_state, $($arg),*);
-                    return_result(scope, rv, result);
+                    let result = (self)(Rc::clone(op_state), $($arg),*);
+                    result.into_wire()
                 })
             }
         }
@@ -483,19 +350,17 @@ macro_rules! impl_ops {
             $($arg: FromV8,)*
         {
             #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
-            fn into_handler(self, name: &'static str) -> OpHandler {
-                handler(move |scope, args, rv| {
-                    let mut index = 0;
+            fn into_handler(self, name: &'static str) -> AsyncOpFn {
+                let _marker = PhantomData::<M>;
+                Box::new(move |op_state, args| {
+                    let mut index = 0usize;
                     $(
-                        let $arg = match <$arg as FromV8>::from_v8(scope, args.get(index as i32)) {
-                            Ok(value) => value,
-                            Err(error) => return throw_argument_error(scope, name, index, error),
-                        };
+                        let $arg = <$arg as FromV8>::from_wire(get_arg(args, index))
+                            .map_err(|e| arg_error(name, index, e))?;
                         index += 1;
                     )*
-                    let op_state = Rc::clone(&runtime_state(scope).op_state);
-                    let future = (self)(op_state, $($arg),*);
-                    submit(scope, rv, future);
+                    let fut = (self)(Rc::clone(op_state), $($arg),*);
+                    Ok(Box::pin(async move { fut.await.into_wire() }))
                 })
             }
         }
@@ -513,41 +378,3 @@ impl_ops!(A1, A2, A3, A4, A5, A6, A7);
 impl_ops!(A1, A2, A3, A4, A5, A6, A7, A8);
 impl_ops!(A1, A2, A3, A4, A5, A6, A7, A8, A9);
 impl_ops!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
-
-/// The callback behind every op function.
-pub(crate) fn dispatch<'s, 'i>(
-    scope: &mut v8::PinScope<'s, 'i>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s, v8::Value>,
-) {
-    let state = runtime_state(scope);
-    let Some(index) = v8::Local::<v8::Integer>::try_from(args.data())
-        .ok()
-        .and_then(|index| usize::try_from(index.value()).ok())
-    else {
-        return;
-    };
-    let Some(op) = state.ops.get(index) else {
-        return;
-    };
-    (op.handler)(scope, &args, &mut rv);
-}
-
-/// Builds the object holding one function per op, keyed by op name.
-pub(crate) fn ops_object<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    ops: &[OpDecl],
-) -> v8::Local<'s, v8::Object> {
-    let object = v8::Object::new(scope);
-    for (index, op) in ops.iter().enumerate() {
-        let data = v8::Integer::new_from_unsigned(scope, index as u32);
-        let function = v8::Function::builder(dispatch)
-            .data(data.into())
-            .build(scope)
-            .expect("op function");
-        let name = serde_v8::key(scope, op.name);
-        function.set_name(name);
-        object.create_data_property(scope, name.into(), function.into());
-    }
-    object
-}

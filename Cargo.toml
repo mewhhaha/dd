@@ -63,6 +63,42 @@ opt-level = 3
 [profile.dev.package.p521]
 opt-level = 3
 
+[profile.dev.build-override]
+opt-level = 2
+
+[profile.test.build-override]
+opt-level = 2
+
+[profile.dev.package.wtime-aot]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.wtime-aot-host]
+opt-level = 3
+
+[profile.dev.package.scriptw-aot-wasm]
+opt-level = 2
+
+[profile.dev.package.scriptw-ir]
+opt-level = 2
+
+[profile.dev.package.scriptw-runtime]
+opt-level = 2
+
+[profile.dev.package.scriptw-front]
+opt-level = 2
+
+[profile.dev.package.scriptw-intl]
+opt-level = 2
+
+[patch.crates-io]
+boa_ast = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/vendor/boa_ast-0.21.1" }
+boa_parser = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/vendor/boa_parser-0.21.1" }
+regress = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/vendor/regress-0.10.5" }
+temporal_rs = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/vendor/temporal_rs-0.1.0" }
+timezone_provider = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/vendor/timezone_provider-0.1.2" }
+
 [profile.dev-runtime]
 inherits = "release"
 codegen-units = 1

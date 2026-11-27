@@ -2,7 +2,7 @@ use crate::engine::{load_worker_source, new_runtime_from_snapshot_with_heap_limi
 use crate::module_registry::ModuleRegistry;
 use crate::ops::WorkerSource;
 use common::{PlatformError, Result};
-use dd_v8::v8::IsolateHandle;
+use dd_v8::RuntimeHandle;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, oneshot};
@@ -17,7 +17,7 @@ pub(super) struct DeploymentValidator {
 
 #[derive(Default)]
 struct ValidationState {
-    isolate: Option<IsolateHandle>,
+    isolate: Option<RuntimeHandle>,
     cancelled: bool,
 }
 
@@ -75,7 +75,7 @@ impl DeploymentValidator {
                                     "deployment validation cancelled",
                                 ));
                             }
-                            state.isolate = Some(runtime.v8_isolate().thread_safe_handle());
+                            state.isolate = Some(runtime.handle());
                         }
                         tokio::time::timeout(timeout, load_worker_source(&mut runtime, &source))
                             .await

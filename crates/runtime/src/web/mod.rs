@@ -2,7 +2,7 @@
 //! streams, encoding, events, and WebCrypto (vendored from Deno and owned by
 //! dd), and the ops they call.
 
-use dd_v8::{OpDecl, OpError, op_async, op_raw, op_sync, v8};
+use dd_v8::{OpDecl, op_async, op_sync};
 
 mod blob;
 mod crypto;
@@ -13,10 +13,9 @@ mod urlpattern;
 
 macro_rules! ext_scripts {
     ($($path:literal),* $(,)?) => {
-        /// The web layer's scripts, loaded on first use by
-        /// `core.loadExtScript(specifier)`. Each evaluates to its exports.
-        /// A script's specifier is `ext:` and its path under `js/`.
-        const EXT_SCRIPTS: &[(&str, &str)] =
+        /// The web layer's scripts, precompiled into the AOT snapshot bundle
+        /// and loaded on first use by `core.loadExtScript(specifier)`.
+        pub(crate) const EXT_SCRIPTS: &[(&str, &str)] =
             &[$((concat!("ext:", $path), include_str!(concat!("../../js/", $path)))),*];
     };
 }
@@ -46,23 +45,23 @@ ext_scripts! {
 
 pub(crate) fn ops() -> Vec<OpDecl> {
     vec![
-        op_raw!(op_load_ext_script),
-        op_raw!(op_url_parse),
-        op_raw!(op_url_parse_with_base),
-        op_raw!(op_url_reparse),
+        OpDecl::builtin_js("op_load_ext_script"),
+        op_sync!(op_url_parse),
+        op_sync!(op_url_parse_with_base),
+        op_sync!(op_url_reparse),
         op_sync!(op_url_get_serialization),
-        op_raw!(op_url_parse_search_params),
+        op_sync!(op_url_parse_search_params),
         op_sync!(op_url_stringify_search_params),
         op_sync!(op_urlpattern_parse),
-        op_raw!(op_urlpattern_process_match_input),
+        op_sync!(op_urlpattern_process_match_input),
         op_sync!(op_encoding_normalize_label),
-        op_raw!(op_encoding_decode_utf8),
-        op_raw!(op_encoding_decode_utf8_ascii_only),
+        op_sync!(op_encoding_decode_utf8),
+        op_sync!(op_encoding_decode_utf8_ascii_only),
         op_sync!(op_encoding_decode_single),
         op_sync!(op_encoding_new_decoder),
         op_sync!(op_encoding_decode),
         op_sync!(op_encoding_drop_decoder),
-        op_raw!(op_encoding_encode_into),
+        OpDecl::builtin_js("op_encoding_encode_into"),
         op_sync!(op_base64_decode),
         op_sync!(op_base64_encode_from_buffer),
         op_sync!(op_blob_create_part),
@@ -83,55 +82,3 @@ use encoding::*;
 use time::*;
 use url_parse::*;
 use urlpattern::*;
-
-/// `op_load_ext_script(specifier, bootstrap)`: runs one of [`EXT_SCRIPTS`]
-/// as the body of a function whose parameter `__bootstrap` is `bootstrap`
-/// and returns what it returns. `core.loadExtScript` caches the result.
-fn op_load_ext_script<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let specifier = args.get(0).to_rust_string_lossy(scope);
-    let Some((_, source)) = EXT_SCRIPTS.iter().find(|(name, _)| *name == specifier) else {
-        let error = OpError::type_error(format!("unknown web layer script: {specifier}"))
-            .to_exception(scope);
-        scope.throw_exception(error);
-        return;
-    };
-    let (Some(name), Some(source), Some(parameter)) = (
-        v8::String::new(scope, &specifier),
-        v8::String::new(scope, source),
-        v8::String::new(scope, "__bootstrap"),
-    ) else {
-        return;
-    };
-    let origin = v8::ScriptOrigin::new(
-        scope,
-        name.into(),
-        0,
-        0,
-        false,
-        -1,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
-    let mut source = v8::script_compiler::Source::new(source, Some(&origin));
-    let Some(function) = v8::script_compiler::compile_function(
-        scope,
-        &mut source,
-        &[parameter],
-        &[],
-        v8::script_compiler::CompileOptions::NoCompileOptions,
-        v8::script_compiler::NoCacheReason::NoReason,
-    ) else {
-        return;
-    };
-    let receiver = v8::undefined(scope).into();
-    if let Some(exports) = function.call(scope, receiver, &[args.get(1)]) {
-        rv.set(exports);
-    }
-}

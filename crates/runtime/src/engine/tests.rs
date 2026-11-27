@@ -15,20 +15,17 @@ fn simple_worker_source() -> &'static str {
 
 /// Runs `source` as a function body with the runtime's internals as
 /// `__bootstrap`, as the runtime's own scripts see them.
-fn execute_internal(runtime: &mut JsRuntime, source: &str) -> v8::Global<v8::Value> {
+fn execute_internal(runtime: &mut JsRuntime, source: &str) -> JsValue {
     let internals = runtime.internals().expect("runtime internals");
     runtime
         .execute_function("<dd:test>", source, &["__bootstrap"], &[internals])
         .expect("internal script should run")
 }
 
-fn string(runtime: &mut JsRuntime, value: v8::Global<v8::Value>) -> String {
-    dd_v8::scope!(scope, runtime);
-    let value = v8::Local::new(scope, value);
-    value
-        .to_string(scope)
+fn string(runtime: &mut JsRuntime, value: JsValue) -> String {
+    runtime
+        .value_to_string(&value)
         .expect("value should stringify")
-        .to_rust_string_lossy(scope)
 }
 
 #[tokio::test]

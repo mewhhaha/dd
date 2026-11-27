@@ -5,8 +5,7 @@
 // they are given and return a status; a URL whose serialization differs from
 // its input leaves the serialization for `op_url_get_serialization`.
 
-use dd_v8::builtins::{buffer_bytes, write_u32s};
-use dd_v8::{OpError, OpState, runtime_op_state, v8};
+use dd_v8::{JsBuffer, OpError, OpState};
 use url::{Url, form_urlencoded, quirks};
 
 const STATUS_OK: u32 = 0;
@@ -16,102 +15,63 @@ const NO_PORT: u32 = 65536;
 
 struct UrlSerialization(String);
 
-fn string_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
-    value
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-}
-
-fn finish(
-    scope: &mut v8::PinScope<'_, '_>,
-    href: &str,
-    url: Url,
-    buf: v8::Local<v8::Value>,
-    no_port: u32,
-) -> u32 {
+fn finish(state: &mut OpState, href: &str, url: Url, no_port: u32) -> (u32, Option<[u32; 8]>) {
     let components = quirks::internal_components(&url);
-    write_u32s(
-        buf,
-        &[
-            components.scheme_end,
-            components.username_end,
-            components.host_start,
-            components.host_end,
-            components.port.map(u32::from).unwrap_or(no_port),
-            components.path_start,
-            components.query_start.unwrap_or(0),
-            components.fragment_start.unwrap_or(0),
-        ],
-    );
+    let words = [
+        components.scheme_end,
+        components.username_end,
+        components.host_start,
+        components.host_end,
+        components.port.map(u32::from).unwrap_or(no_port),
+        components.path_start,
+        components.query_start.unwrap_or(0),
+        components.fragment_start.unwrap_or(0),
+    ];
     let serialization: String = url.into();
-    if serialization == href {
+    let status = if serialization == href {
         STATUS_OK
     } else {
-        runtime_op_state(scope)
-            .borrow_mut()
-            .put(UrlSerialization(serialization));
+        state.put(UrlSerialization(serialization));
         STATUS_OK_SERIALIZATION
-    }
+    };
+    (status, Some(words))
 }
 
-/// `op_url_parse(href, componentsBuf) -> status`
-pub(super) fn op_url_parse<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let Some(href) = string_arg(scope, args.get(0)) else {
-        return;
-    };
-    let buf = args.get(1);
+/// `op_url_parse(href) -> [status, components?]`
+pub(super) fn op_url_parse(state: &mut OpState, href: String) -> (u32, Option<[u32; 8]>) {
     if let Some(components) = parse_simple_special_url(&href) {
-        write_u32s(buf, &components);
-        return rv.set_uint32(STATUS_OK);
+        return (STATUS_OK, Some(components));
     }
-    let status = match Url::parse(&href) {
-        Ok(url) => finish(scope, &href, url, buf, 0),
-        Err(_) => STATUS_ERR,
-    };
-    rv.set_uint32(status);
+    match Url::parse(&href) {
+        Ok(url) => finish(state, &href, url, 0),
+        Err(_) => (STATUS_ERR, None),
+    }
 }
 
-/// `op_url_parse_with_base(href, baseHref, componentsBuf) -> status`
-pub(super) fn op_url_parse_with_base<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let (Some(href), Some(base)) = (
-        string_arg(scope, args.get(0)),
-        string_arg(scope, args.get(1)),
-    ) else {
-        return;
-    };
-    let status = match Url::parse(&base) {
+/// `op_url_parse_with_base(href, baseHref) -> [status, components?]`
+pub(super) fn op_url_parse_with_base(
+    state: &mut OpState,
+    href: String,
+    base: String,
+) -> (u32, Option<[u32; 8]>) {
+    match Url::parse(&base) {
         Ok(base) => match Url::options().base_url(Some(&base)).parse(&href) {
-            Ok(url) => finish(scope, &href, url, args.get(2), 0),
-            Err(_) => STATUS_ERR,
+            Ok(url) => finish(state, &href, url, 0),
+            Err(_) => (STATUS_ERR, None),
         },
-        Err(_) => STATUS_ERR,
-    };
-    rv.set_uint32(status);
+        Err(_) => (STATUS_ERR, None),
+    }
 }
 
-/// `op_url_reparse(href, setter, value, componentsBuf) -> status`
-pub(super) fn op_url_reparse<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let (Some(href), Some(value)) = (
-        string_arg(scope, args.get(0)),
-        string_arg(scope, args.get(2)),
-    ) else {
-        return;
-    };
-    let setter = args.get(1).uint32_value(scope).unwrap_or(u32::MAX);
+/// `op_url_reparse(href, setter, value) -> [status, components?]`
+pub(super) fn op_url_reparse(
+    state: &mut OpState,
+    href: String,
+    setter: u32,
+    value: String,
+) -> (u32, Option<[u32; 8]>) {
     let Ok(mut url) = Url::parse(&href) else {
-        return rv.set_uint32(STATUS_ERR);
+        return (STATUS_ERR, None);
     };
     let value = value.as_str();
     let result = match setter {
@@ -135,11 +95,10 @@ pub(super) fn op_url_reparse<'s>(
         8 => quirks::set_username(&mut url, value),
         _ => Err(()),
     };
-    let status = match result {
-        Ok(()) => finish(scope, &href, url, args.get(3), NO_PORT),
-        Err(()) => STATUS_ERR,
-    };
-    rv.set_uint32(status);
+    match result {
+        Ok(()) => finish(state, &href, url, NO_PORT),
+        Err(()) => (STATUS_ERR, None),
+    }
 }
 
 pub(super) fn op_url_get_serialization(state: &mut OpState) -> String {
@@ -150,30 +109,21 @@ pub(super) fn op_url_get_serialization(state: &mut OpState) -> String {
 }
 
 /// `op_url_parse_search_params(string)` or `op_url_parse_search_params(null, bytes)`
-pub(super) fn op_url_parse_search_params<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let input = if args.get(0).is_string() {
-        args.get(0).to_rust_string_lossy(scope).into_bytes()
-    } else if let Some(bytes) = buffer_bytes(args.get(1)) {
-        bytes
+pub(super) fn op_url_parse_search_params(
+    _state: &mut OpState,
+    text: Option<String>,
+    bytes: Option<JsBuffer>,
+) -> Result<Vec<(String, String)>, OpError> {
+    let input = if let Some(s) = text {
+        s.into_bytes()
+    } else if let Some(b) = bytes {
+        b.into_vec()
     } else {
-        let error = OpError::type_error("invalid parameters").to_exception(scope);
-        scope.throw_exception(error);
-        return;
+        return Err(OpError::type_error("invalid parameters"));
     };
-    let pairs = form_urlencoded::parse(&input)
+    Ok(form_urlencoded::parse(&input)
         .map(|(name, value)| (name.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    match dd_v8::serde_v8::to_v8(scope, &pairs) {
-        Ok(value) => rv.set(value),
-        Err(error) => {
-            let error = OpError::from(error).to_exception(scope);
-            scope.throw_exception(error);
-        }
-    }
+        .collect())
 }
 
 pub(super) fn op_url_stringify_search_params(

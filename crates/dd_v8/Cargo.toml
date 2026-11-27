@@ -6,10 +6,16 @@ publish = false
 version.workspace = true
 
 [dependencies]
+boa_ast = { version = "0.21.1", features = ["annex-b"] }
+boa_interner = "0.21.1"
+boa_parser = { version = "0.21.1", features = ["annex-b"] }
 futures-util.workspace = true
+scriptw-engine = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/crates/scriptw-engine" }
+scriptw-ir = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/crates/scriptw-ir" }
 serde.workspace = true
 tokio = { workspace = true }
-v8 = "152.2.0"
+wasmtime = { package = "wtime-aot-host", path = "/home/mewhhaha/src/wtime/tools/wtime-aot/host" }
+wtime-runtime = { path = "/home/mewhhaha/src/wtime/crates/wtime-runtime" }
 
 [dev-dependencies]
 serde_json.workspace = true

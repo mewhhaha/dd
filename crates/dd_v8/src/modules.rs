@@ -1,10 +1,15 @@
-//! ES modules: loading a graph through the embedder's [`ModuleLoader`],
-//! instantiating it, and the V8 callbacks that resolve imports,
-//! initialize `import.meta`, and start dynamic imports.
+//! ES modules: AST-based parsing (`boa_parser` / `boa_ast`), dependency graph
+//! loading through [`ModuleLoader`], import attributes (`json`, `text`, `bytes`),
+//! `import.meta`, live getter-backed exports, and dynamic `import()`.
 
 use crate::error::Error;
-use crate::runtime::{RuntimeState, runtime_state};
-use crate::serde_v8;
+use crate::serde_v8::WireValue;
+use boa_ast::declaration::{ExportDeclaration, ImportKind, ModuleRequest, ReExportKind};
+use boa_ast::operations::bound_names;
+use boa_ast::scope::Scope;
+use boa_ast::{ModuleItem, ModuleItemSourceSyntax};
+use boa_interner::Interner;
+use boa_parser::{Parser, Source};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -30,6 +35,25 @@ impl ModuleType {
             Self::Json => "json",
             Self::Text => "text",
             Self::Bytes => "bytes",
+        }
+    }
+
+    pub(crate) fn from_attr(attr: &str) -> Result<Self, String> {
+        match attr {
+            "" | "javascript" => Ok(Self::JavaScript),
+            "json" => Ok(Self::Json),
+            "text" => Ok(Self::Text),
+            "bytes" => Ok(Self::Bytes),
+            other => Err(format!("unsupported module type \"{other}\"")),
+        }
+    }
+
+    pub(crate) fn kind_code(self) -> i32 {
+        match self {
+            Self::JavaScript => 0,
+            Self::Json => 1,
+            Self::Text => 2,
+            Self::Bytes => 3,
         }
     }
 }
@@ -79,21 +103,60 @@ impl ModuleLoader for NoModules {
     }
 }
 
-struct ModuleRecord {
-    name: String,
-    handle: v8::Global<v8::Module>,
-    /// The default export of a JSON, text, or bytes module.
-    synthetic_value: Option<v8::Global<v8::Value>>,
-    /// Each static import of this module and the module it resolved to.
-    requests: Vec<(String, ModuleType, ModuleId)>,
+#[derive(Clone)]
+pub(crate) enum CompiledPayload {
+    String(String),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Clone)]
+pub(crate) struct ModuleRecord {
+    pub(crate) id: ModuleId,
+    pub(crate) name: String,
+    pub(crate) module_type: ModuleType,
+    pub(crate) is_main: bool,
+    pub(crate) payload: CompiledPayload,
+    pub(crate) dep_ids: Vec<ModuleId>,
+    pub(crate) registered_in_js: bool,
+}
+
+impl ModuleRecord {
+    pub(crate) fn deps_json(&self) -> String {
+        let mut s = String::from("[");
+        for (i, id) in self.dep_ids.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&id.to_string());
+        }
+        s.push(']');
+        s
+    }
+
+    pub(crate) fn to_wire(&self) -> WireValue {
+        let payload = match &self.payload {
+            CompiledPayload::String(s) => WireValue::String(s.clone()),
+            CompiledPayload::Bytes(b) => WireValue::Bytes(b.clone()),
+        };
+        WireValue::Object(vec![
+            ("id".to_string(), WireValue::I32(self.id as i32)),
+            ("name".to_string(), WireValue::String(self.name.clone())),
+            (
+                "kind".to_string(),
+                WireValue::I32(self.module_type.kind_code()),
+            ),
+            ("isMain".to_string(), WireValue::Bool(self.is_main)),
+            ("payload".to_string(), payload),
+            ("depsJson".to_string(), WireValue::String(self.deps_json())),
+        ])
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct ModuleMap {
-    modules: Vec<ModuleRecord>,
-    ids: HashMap<(String, ModuleType), ModuleId>,
-    by_hash: HashMap<i32, Vec<ModuleId>>,
-    main: Option<ModuleId>,
+    pub(crate) modules: Vec<ModuleRecord>,
+    pub(crate) ids: HashMap<(String, ModuleType), ModuleId>,
+    pub(crate) main: Option<ModuleId>,
 }
 
 impl ModuleMap {
@@ -101,92 +164,643 @@ impl ModuleMap {
         self.modules.is_empty()
     }
 
-    pub(crate) fn handle(&self, id: ModuleId) -> Option<&v8::Global<v8::Module>> {
-        self.modules.get(id).map(|record| &record.handle)
-    }
-
-    fn id_of(
-        &self,
-        scope: &v8::PinScope<'_, '_>,
-        module: v8::Local<v8::Module>,
-    ) -> Option<ModuleId> {
-        let ids = self.by_hash.get(&module.get_identity_hash().get())?;
-        ids.iter()
-            .copied()
-            .find(|id| v8::Local::new(scope, &self.modules[*id].handle) == module)
-    }
-
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
     }
 }
 
-/// Reads the `type` attribute from `[key, value, (offset,) ...]`.
-pub(crate) fn requested_type(
-    scope: &v8::PinScope<'_, '_>,
-    attributes: v8::Local<v8::FixedArray>,
-    stride: usize,
-) -> Result<ModuleType, String> {
-    let mut index = 0;
-    while index + 1 < attributes.length() {
-        let key = attributes
-            .get(scope, index)
-            .and_then(|key| v8::Local::<v8::Value>::try_from(key).ok())
-            .map(|key| key.to_rust_string_lossy(scope));
-        if key.as_deref() == Some("type") {
-            let value = attributes
-                .get(scope, index + 1)
-                .and_then(|value| v8::Local::<v8::Value>::try_from(value).ok())
-                .map(|value| value.to_rust_string_lossy(scope))
-                .unwrap_or_default();
-            return match value.as_str() {
-                "json" => Ok(ModuleType::Json),
-                "text" => Ok(ModuleType::Text),
-                "bytes" => Ok(ModuleType::Bytes),
-                other => Err(format!("unsupported module type \"{other}\"")),
-            };
+struct ParsedJsModule {
+    requests: Vec<(String, ModuleType)>,
+    transformed_body: String,
+}
+
+fn code_utf8<'a>(name: &str, code: &'a ModuleCode) -> Result<&'a str, Error> {
+    let bytes = match code {
+        ModuleCode::String(s) => s.as_bytes(),
+        ModuleCode::Bytes(b) => b,
+    };
+    std::str::from_utf8(bytes)
+        .map_err(|_| Error::new(format!("module is not valid UTF-8: {name}")))
+}
+
+fn extract_request_type(
+    req: &ModuleRequest,
+    interner: &Interner,
+    referrer: &str,
+) -> Result<ModuleType, Error> {
+    for attr in req.attributes() {
+        let key = interner.resolve_expect(attr.key()).to_string();
+        if key == "type" {
+            let val = interner.resolve_expect(attr.value()).to_string();
+            return ModuleType::from_attr(&val)
+                .map_err(|e| Error::new(format!("{e} imported by {referrer}")));
         }
-        index += stride;
     }
     Ok(ModuleType::JavaScript)
 }
 
-fn code_string<'s>(
-    scope: &v8::PinScope<'s, '_>,
-    name: &str,
-    code: &ModuleCode,
-) -> Result<v8::Local<'s, v8::String>, Error> {
-    let text = match code {
-        ModuleCode::String(text) => text.as_bytes(),
-        ModuleCode::Bytes(bytes) => bytes,
-    };
-    if std::str::from_utf8(text).is_err() {
-        return Err(Error::new(format!("module is not valid UTF-8: {name}")));
+fn js_str_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
     }
-    v8::String::new_from_utf8(scope, text, v8::NewStringType::Normal)
-        .ok_or_else(|| Error::new(format!("module source is too large: {name}")))
+    out.push('"');
+    out
 }
 
-/// Compiles (or finds) one module. Returns its id and whether it is new.
-fn register(
-    scope: &mut v8::PinScope<'_, '_>,
-    state: &RuntimeState,
+/// Parses an ES module with `boa_parser` and transforms it into a strict async
+/// module factory body accepting `(__dd_imp, __dd_exp, __dd_exp_star, __dd_meta, __dd_dyn_import)`.
+fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error> {
+    let mut interner = Interner::new();
+    let scope = Scope::new_global();
+    let mut parser = Parser::new(Source::from_bytes(source));
+    let module = parser
+        .parse_module(&scope, &mut interner)
+        .map_err(|err| Error::new(format!("Uncaught SyntaxError: {err}")))?;
+
+    let utf16_units: Vec<u16> = source.encode_utf16().collect();
+    // Map UTF-16 code unit index -> UTF-8 byte offset in `source`.
+    let mut u16_to_byte = Vec::with_capacity(utf16_units.len() + 1);
+    for (byte_idx, ch) in source.char_indices() {
+        let n = ch.len_utf16();
+        for _ in 0..n {
+            u16_to_byte.push(byte_idx);
+        }
+    }
+    u16_to_byte.push(source.len());
+
+    let to_byte = |pos: usize| -> usize {
+        u16_to_byte
+            .get(pos)
+            .copied()
+            .unwrap_or(source.len())
+            .min(source.len())
+    };
+
+    let mut requests: Vec<(String, ModuleType)> = Vec::new();
+    let mut req_indices: HashMap<(String, ModuleType), usize> = HashMap::new();
+    let mut add_request = |req: &ModuleRequest, interner: &Interner| -> Result<usize, Error> {
+        let spec = interner.resolve_expect(req.specifier().sym()).to_string();
+        let req_ty = extract_request_type(req, interner, name)?;
+        let key = (spec.clone(), req_ty);
+        if let Some(&idx) = req_indices.get(&key) {
+            return Ok(idx);
+        }
+        let idx = requests.len();
+        requests.push((spec, req_ty));
+        req_indices.insert(key, idx);
+        Ok(idx)
+    };
+
+    // Edits to apply to `source` as `(byte_start, byte_end, replacement)`.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut import_prelude = String::new();
+    let mut hoisted_exports = String::new();
+    let mut epilogue_exports = String::new();
+
+    let items = module.items().items();
+    let syntaxes = module.items().source_syntax();
+    debug_assert_eq!(items.len(), syntaxes.len());
+
+    let erase_span = |start: usize, end: usize| -> String {
+        let slice = &source[start..end];
+        let mut out = String::with_capacity(slice.len());
+        for ch in slice.chars() {
+            if ch == '\n' || ch == '\r' {
+                out.push(ch);
+            } else {
+                out.push(' ');
+            }
+        }
+        out
+    };
+
+    for (item, syntax) in items.iter().zip(syntaxes.iter()) {
+        match item {
+            ModuleItem::ImportDeclaration(import_decl) => {
+                let dep_idx = add_request(import_decl.request(), &interner)?;
+                if let Some(def) = import_decl.default() {
+                    let local = interner.resolve_expect(def.sym()).to_string();
+                    import_prelude.push_str(&format!(
+                        "const {local} = __dd_imp({dep_idx}).default;\n"
+                    ));
+                }
+                match import_decl.kind() {
+                    ImportKind::DefaultOrUnnamed => {}
+                    ImportKind::Namespaced { binding } => {
+                        let local = interner.resolve_expect(binding.sym()).to_string();
+                        import_prelude
+                            .push_str(&format!("const {local} = __dd_imp({dep_idx});\n"));
+                    }
+                    ImportKind::Named { names } => {
+                        for spec in names.iter() {
+                            let local = interner.resolve_expect(spec.binding().sym()).to_string();
+                            let export_name =
+                                interner.resolve_expect(spec.export_name()).to_string();
+                            import_prelude.push_str(&format!(
+                                "const {local} = __dd_imp({dep_idx})[{}];\n",
+                                js_str_lit(&export_name)
+                            ));
+                        }
+                    }
+                }
+                if let ModuleItemSourceSyntax::Declaration(span) = syntax {
+                    let s = to_byte(span.start().pos());
+                    let e = to_byte(span.end().pos());
+                    edits.push((s, e, erase_span(s, e)));
+                }
+            }
+            ModuleItem::ExportDeclaration(export_decl) => match export_decl.as_ref() {
+                ExportDeclaration::ReExport { kind, request } => {
+                    let dep_idx = add_request(request.module_request(), &interner)?;
+                    match kind {
+                        ReExportKind::Namespaced { name: None } => {
+                            hoisted_exports.push_str(&format!("__dd_exp_star({dep_idx});\n"));
+                        }
+                        ReExportKind::Namespaced { name: Some(alias) } => {
+                            let alias_s = interner.resolve_expect(*alias).to_string();
+                            hoisted_exports.push_str(&format!(
+                                "__dd_exp({}, () => __dd_imp({dep_idx}));\n",
+                                js_str_lit(&alias_s)
+                            ));
+                        }
+                        ReExportKind::Named { names } => {
+                            for spec in names.iter() {
+                                let exported = interner.resolve_expect(spec.alias()).to_string();
+                                let imported =
+                                    interner.resolve_expect(spec.private_name()).to_string();
+                                hoisted_exports.push_str(&format!(
+                                    "__dd_exp({}, () => __dd_imp({dep_idx})[{}]);\n",
+                                    js_str_lit(&exported),
+                                    js_str_lit(&imported)
+                                ));
+                            }
+                        }
+                    }
+                    if let ModuleItemSourceSyntax::Declaration(span) = syntax {
+                        let s = to_byte(span.start().pos());
+                        let e = to_byte(span.end().pos());
+                        edits.push((s, e, erase_span(s, e)));
+                    }
+                }
+                ExportDeclaration::List(specs) => {
+                    for spec in specs.iter() {
+                        let exported = interner.resolve_expect(spec.alias()).to_string();
+                        let local = interner.resolve_expect(spec.private_name()).to_string();
+                        epilogue_exports.push_str(&format!(
+                            "__dd_exp({}, () => {local});\n",
+                            js_str_lit(&exported)
+                        ));
+                    }
+                    if let ModuleItemSourceSyntax::Declaration(span) = syntax {
+                        let s = to_byte(span.start().pos());
+                        let e = to_byte(span.end().pos());
+                        edits.push((s, e, erase_span(s, e)));
+                    }
+                }
+                ExportDeclaration::VarStatement(var_decl) => {
+                    for sym in bound_names(var_decl) {
+                        let id = interner.resolve_expect(sym).to_string();
+                        epilogue_exports.push_str(&format!(
+                            "__dd_exp({}, () => {id});\n",
+                            js_str_lit(&id)
+                        ));
+                    }
+                    if let ModuleItemSourceSyntax::ExportKeyword(span) = syntax {
+                        let s = to_byte(span.start().pos());
+                        let e = to_byte(span.end().pos());
+                        edits.push((s, e, erase_span(s, e)));
+                    }
+                }
+                ExportDeclaration::Declaration(decl) => {
+                    for sym in bound_names(decl) {
+                        let id = interner.resolve_expect(sym).to_string();
+                        epilogue_exports.push_str(&format!(
+                            "__dd_exp({}, () => {id});\n",
+                            js_str_lit(&id)
+                        ));
+                    }
+                    if let ModuleItemSourceSyntax::ExportKeyword(span) = syntax {
+                        let s = to_byte(span.start().pos());
+                        let e = to_byte(span.end().pos());
+                        edits.push((s, e, erase_span(s, e)));
+                    }
+                }
+                ExportDeclaration::DefaultFunctionDeclaration(f) => {
+                    let fname = interner.resolve_expect(f.name().sym()).to_string();
+                    if let ModuleItemSourceSyntax::DefaultExport { keywords, .. } = syntax {
+                        let s = to_byte(keywords.start().pos());
+                        let e = to_byte(keywords.end().pos());
+                        if fname == "default" {
+                            edits.push((s, e, "const __dd_default = ".to_string()));
+                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                        } else {
+                            edits.push((s, e, erase_span(s, e)));
+                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                        }
+                    }
+                }
+                ExportDeclaration::DefaultAsyncFunctionDeclaration(f) => {
+                    let fname = interner.resolve_expect(f.name().sym()).to_string();
+                    if let ModuleItemSourceSyntax::DefaultExport { keywords, .. } = syntax {
+                        let s = to_byte(keywords.start().pos());
+                        let e = to_byte(keywords.end().pos());
+                        if fname == "default" {
+                            edits.push((s, e, "const __dd_default = ".to_string()));
+                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                        } else {
+                            edits.push((s, e, erase_span(s, e)));
+                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                        }
+                    }
+                }
+                ExportDeclaration::DefaultGeneratorDeclaration(f) => {
+                    let fname = interner.resolve_expect(f.name().sym()).to_string();
+                    if let ModuleItemSourceSyntax::DefaultExport { keywords, .. } = syntax {
+                        let s = to_byte(keywords.start().pos());
+                        let e = to_byte(keywords.end().pos());
+                        if fname == "default" {
+                            edits.push((s, e, "const __dd_default = ".to_string()));
+                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                        } else {
+                            edits.push((s, e, erase_span(s, e)));
+                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                        }
+                    }
+                }
+                ExportDeclaration::DefaultAsyncGeneratorDeclaration(f) => {
+                    let fname = interner.resolve_expect(f.name().sym()).to_string();
+                    if let ModuleItemSourceSyntax::DefaultExport { keywords, .. } = syntax {
+                        let s = to_byte(keywords.start().pos());
+                        let e = to_byte(keywords.end().pos());
+                        if fname == "default" {
+                            edits.push((s, e, "const __dd_default = ".to_string()));
+                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                        } else {
+                            edits.push((s, e, erase_span(s, e)));
+                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                        }
+                    }
+                }
+                ExportDeclaration::DefaultClassDeclaration(c) => {
+                    let cname = interner.resolve_expect(c.name().sym()).to_string();
+                    if let ModuleItemSourceSyntax::DefaultExport { keywords, .. } = syntax {
+                        let s = to_byte(keywords.start().pos());
+                        let e = to_byte(keywords.end().pos());
+                        if cname == "default" {
+                            edits.push((s, e, "const __dd_default = ".to_string()));
+                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                        } else {
+                            edits.push((s, e, erase_span(s, e)));
+                            epilogue_exports.push_str(&format!("__dd_exp(\"default\", () => {cname});\n"));
+                        }
+                    }
+                }
+                ExportDeclaration::DefaultAssignmentExpression(_) => {
+                    if let ModuleItemSourceSyntax::DefaultExport { keywords, .. } = syntax {
+                        let s = to_byte(keywords.start().pos());
+                        let e = to_byte(keywords.end().pos());
+                        edits.push((s, e, "const __dd_default = ".to_string()));
+                        epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                    }
+                }
+            },
+            ModuleItem::StatementListItem(_) => {}
+        }
+    }
+
+    edits.sort_by_key(|(s, _, _)| *s);
+    let mut rewritten = String::with_capacity(source.len() + 256);
+    let mut cursor = 0usize;
+    for (s, e, rep) in edits {
+        if s >= cursor && e <= source.len() {
+            rewritten.push_str(&source[cursor..s]);
+            rewritten.push_str(&rep);
+            cursor = e;
+        }
+    }
+    rewritten.push_str(&source[cursor..]);
+
+    // Rewrite `import.meta` and dynamic `import(` outside string/comment literals.
+    let rewritten = rewrite_import_meta_and_dynamic_import(&rewritten);
+
+    let mut body = String::with_capacity(
+        rewritten.len() + import_prelude.len() + hoisted_exports.len() + epilogue_exports.len() + 64,
+    );
+    body.push_str("\"use strict\";\n");
+    body.push_str(&import_prelude);
+    body.push_str(&hoisted_exports);
+    body.push_str(&rewritten);
+    body.push('\n');
+    body.push_str(&epilogue_exports);
+
+    Ok(ParsedJsModule {
+        requests,
+        transformed_body: body,
+    })
+}
+
+/// Rewrites `import.meta` -> `__dd_meta` and `import(` -> `__dd_dyn_import(`
+/// while skipping string literals, template text, and JS comments.
+fn rewrite_import_meta_and_dynamic_import(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 32);
+    let mut i = 0usize;
+    let mut prev_ident_char = false;
+
+    let is_id_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+
+    while i < len {
+        let b = bytes[i];
+        // Line comment
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&src[start..i]);
+            prev_ident_char = false;
+            continue;
+        }
+        // Block comment
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            out.push_str(&src[start..i]);
+            prev_ident_char = false;
+            continue;
+        }
+        // String literals (' or ")
+        if b == b'\'' || b == b'"' {
+            let quote = b;
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(len);
+                } else if bytes[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&src[start..i]);
+            prev_ident_char = false;
+            continue;
+        }
+        // Template literal (simple scan; skips static parts, scans ${...} naturally? Keep intact unless ${)
+        if b == b'`' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(len);
+                } else if bytes[i] == b'`' {
+                    i += 1;
+                    break;
+                } else if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
+                    // Flush static chunk up to `${` and scan expression normally!
+                    i += 2;
+                    out.push_str(&src[start..i]);
+                    let mut depth = 1usize;
+                    let expr_start = i;
+                    while i < len && depth > 0 {
+                        if bytes[i] == b'{' {
+                            depth += 1;
+                        } else if bytes[i] == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    let rewritten_expr = rewrite_import_meta_and_dynamic_import(&src[expr_start..i]);
+                    out.push_str(&rewritten_expr);
+                    if i < len {
+                        out.push('}');
+                        i += 1;
+                    }
+                    // Continue template after `}`
+                    let cont_start = i;
+                    while i < len {
+                        if bytes[i] == b'\\' {
+                            i = (i + 2).min(len);
+                        } else if bytes[i] == b'`' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    out.push_str(&src[cont_start..i]);
+                    // Jump out of template loop
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            if !out.ends_with('`') && i > start && i <= len && bytes[i - 1] == b'`' {
+                out.push_str(&src[start..i]);
+            }
+            prev_ident_char = false;
+            continue;
+        }
+
+        // Check for `import` keyword (not preceded by `.` or identifier char).
+        if !prev_ident_char
+            && bytes[i..].starts_with(b"import")
+            && (i + 6 == len || !is_id_byte(bytes[i + 6]))
+        {
+            // Check not preceded by `.` (ignoring whitespace).
+            let trimmed_prev = out.trim_end();
+            let after_dot = trimmed_prev.ends_with('.');
+            if !after_dot {
+                let mut j = i + 6;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                // `import.meta`
+                if j < len && bytes[j] == b'.' {
+                    let mut k = j + 1;
+                    while k < len && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if bytes[k..].starts_with(b"meta")
+                        && (k + 4 == len || !is_id_byte(bytes[k + 4]))
+                    {
+                        out.push_str("__dd_meta");
+                        i = k + 4;
+                        prev_ident_char = true;
+                        continue;
+                    }
+                }
+                // Dynamic `import(`
+                if j < len && bytes[j] == b'(' {
+                    out.push_str("__dd_dyn_import");
+                    i = i + 6;
+                    prev_ident_char = true;
+                    continue;
+                }
+            }
+        }
+
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        prev_ident_char = ch.is_ascii_alphanumeric() || ch == '_' || ch == '$';
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Rewrites dynamic `import(` calls inside a classic script to `__dd_dyn_import(`.
+/// Returns `None` when the script contains no dynamic `import(` calls.
+pub(crate) fn rewrite_script_dynamic_import(src: &str) -> Option<String> {
+    if !src.contains("import") {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 16);
+    let mut i = 0;
+    let mut prev_ident_char = false;
+    let mut replaced = false;
+
+    let is_id_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+
+    while i < len {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&src[start..i]);
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            out.push_str(&src[start..i]);
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            let quote = b;
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(len);
+                } else if bytes[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&src[start..i]);
+            prev_ident_char = false;
+            continue;
+        }
+        if !prev_ident_char
+            && bytes[i..].starts_with(b"import")
+            && (i + 6 == len || !is_id_byte(bytes[i + 6]))
+        {
+            let trimmed_prev = out.trim_end();
+            if !trimmed_prev.ends_with('.') {
+                let mut j = i + 6;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b'(' {
+                    out.push_str("__dd_dyn_import");
+                    i += 6;
+                    prev_ident_char = true;
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        prev_ident_char = ch.is_ascii_alphanumeric() || ch == '_' || ch == '$';
+        i += ch.len_utf8();
+    }
+    if replaced { Some(out) } else { None }
+}
+
+/// Loads `name` and every static dependency recursively into `modules`,
+/// returning `(root_id, newly_added_module_ids)`.
+pub(crate) fn load_graph(
+    modules: &mut ModuleMap,
+    loader: &dyn ModuleLoader,
     name: &str,
     module_type: ModuleType,
     code: Option<ModuleCode>,
-) -> Result<(ModuleId, bool), Error> {
-    if let Some(id) = state
-        .modules
-        .borrow()
-        .ids
-        .get(&(name.to_string(), module_type))
-    {
-        return Ok((*id, false));
+    main: bool,
+) -> Result<(ModuleId, Vec<ModuleId>), Error> {
+    let mut newly_added = Vec::new();
+    let root = load_recursive(
+        modules,
+        loader,
+        name,
+        module_type,
+        code,
+        main,
+        &mut newly_added,
+    )?;
+    Ok((root, newly_added))
+}
+
+fn load_recursive(
+    modules: &mut ModuleMap,
+    loader: &dyn ModuleLoader,
+    name: &str,
+    module_type: ModuleType,
+    code: Option<ModuleCode>,
+    main: bool,
+    newly_added: &mut Vec<ModuleId>,
+) -> Result<ModuleId, Error> {
+    if let Some(&id) = modules.ids.get(&(name.to_string(), module_type)) {
+        if main {
+            if modules.main.is_some_and(|existing| existing != id) {
+                return Err(Error::new(format!(
+                    "a main module is already loaded; cannot load {name} as main"
+                )));
+            }
+            modules.main = Some(id);
+            modules.modules[id].is_main = true;
+        }
+        return Ok(id);
     }
+
     let code = match code {
-        Some(code) => code,
+        Some(c) => c,
         None => {
-            let source = state.loader.load(name, module_type).map_err(Error::new)?;
+            let source = loader.load(name, module_type).map_err(Error::new)?;
             if source.module_type != module_type {
                 return Err(Error::new(format!(
                     "requested module type {module_type} does not match {} module: {name}",
@@ -197,341 +811,56 @@ fn register(
         }
     };
 
-    v8::tc_scope!(let tc, scope);
-    let resource_name = v8::String::new(tc, name)
-        .ok_or_else(|| Error::new(format!("module name is too long: {name}")))?;
-    let (module, synthetic_value) = match module_type {
+    let (payload, requests) = match module_type {
         ModuleType::JavaScript => {
-            let source_text = code_string(tc, name, &code)?;
-            let origin = v8::ScriptOrigin::new(
-                tc,
-                resource_name.into(),
-                0,
-                0,
-                false,
-                -1,
-                None,
-                false,
-                false,
-                true,
-                None,
-            );
-            let mut source = v8::script_compiler::Source::new(source_text, Some(&origin));
-            let Some(module) = v8::script_compiler::compile_module(tc, &mut source) else {
-                return Err(Error::from_try_catch(tc, "Uncaught"));
-            };
-            (module, None)
+            let text = code_utf8(name, &code)?;
+            let parsed = transform_js_module(name, text)?;
+            (CompiledPayload::String(parsed.transformed_body), parsed.requests)
         }
-        synthetic => {
-            let value: v8::Local<v8::Value> = match synthetic {
-                ModuleType::Json => {
-                    let text = code_string(tc, name, &code)?;
-                    match v8::json::parse(tc, text) {
-                        Some(value) => value,
-                        None => return Err(Error::from_try_catch(tc, "Uncaught")),
-                    }
-                }
-                ModuleType::Text => code_string(tc, name, &code)?.into(),
-                ModuleType::Bytes => {
-                    let bytes = match code {
-                        ModuleCode::String(text) => text.into_bytes(),
-                        ModuleCode::Bytes(bytes) => bytes.to_vec(),
-                    };
-                    serde_v8::uint8_array(tc, bytes).into()
-                }
-                ModuleType::JavaScript => unreachable!(),
+        ModuleType::Json => {
+            let text = code_utf8(name, &code)?;
+            (CompiledPayload::String(text.to_string()), Vec::new())
+        }
+        ModuleType::Text => {
+            let text = code_utf8(name, &code)?;
+            (CompiledPayload::String(text.to_string()), Vec::new())
+        }
+        ModuleType::Bytes => {
+            let bytes = match code {
+                ModuleCode::String(s) => s.into_bytes(),
+                ModuleCode::Bytes(b) => b.to_vec(),
             };
-            let default = serde_v8::key(tc, "default");
-            let module = v8::Module::create_synthetic_module(
-                tc,
-                resource_name,
-                &[default],
-                synthetic_module_evaluation_steps,
-            );
-            (module, Some(v8::Global::new(tc, value)))
+            (CompiledPayload::Bytes(bytes), Vec::new())
         }
     };
 
-    let mut modules = state.modules.borrow_mut();
     let id = modules.modules.len();
-    modules.modules.push(ModuleRecord {
-        name: name.to_string(),
-        handle: v8::Global::new(tc, module),
-        synthetic_value,
-        requests: Vec::new(),
-    });
-    modules.ids.insert((name.to_string(), module_type), id);
-    modules
-        .by_hash
-        .entry(module.get_identity_hash().get())
-        .or_default()
-        .push(id);
-    Ok((id, true))
-}
-
-/// Loads `name` and every module it imports, then instantiates the graph.
-pub(crate) fn load_graph(
-    scope: &mut v8::PinScope<'_, '_>,
-    state: &RuntimeState,
-    name: &str,
-    module_type: ModuleType,
-    code: Option<ModuleCode>,
-    main: bool,
-) -> Result<ModuleId, Error> {
-    let (root, new) = register(scope, state, name, module_type, code)?;
     if main {
-        let mut modules = state.modules.borrow_mut();
-        if modules.main.is_some_and(|existing| existing != root) {
+        if modules.main.is_some_and(|existing| existing != id) {
             return Err(Error::new(format!(
                 "a main module is already loaded; cannot load {name} as main"
             )));
         }
-        modules.main = Some(root);
+        modules.main = Some(id);
     }
-    let mut queue = if new { vec![root] } else { Vec::new() };
-    while let Some(id) = queue.pop() {
-        let (referrer, module) = {
-            let modules = state.modules.borrow();
-            let record = &modules.modules[id];
-            (record.name.clone(), v8::Local::new(scope, &record.handle))
-        };
-        if !module.is_source_text_module() {
-            continue;
-        }
-        let requests = module.get_module_requests();
-        for index in 0..requests.length() {
-            let Some(request) = requests
-                .get(scope, index)
-                .and_then(|request| v8::Local::<v8::ModuleRequest>::try_from(request).ok())
-            else {
-                continue;
-            };
-            let specifier = request.get_specifier().to_rust_string_lossy(scope);
-            let requested = requested_type(scope, request.get_import_attributes(), 3)
-                .map_err(|error| Error::new(format!("{error} imported by {referrer}")))?;
-            let resolved = state
-                .loader
-                .resolve(&specifier, &referrer)
-                .map_err(Error::new)?;
-            let (child, child_new) = register(scope, state, &resolved, requested, None)?;
-            state.modules.borrow_mut().modules[id]
-                .requests
-                .push((specifier, requested, child));
-            if child_new {
-                queue.push(child);
-            }
-        }
-    }
-
-    let module = {
-        let modules = state.modules.borrow();
-        v8::Local::new(scope, &modules.modules[root].handle)
-    };
-    if module.get_status() == v8::ModuleStatus::Uninstantiated {
-        v8::tc_scope!(let tc, scope);
-        if module
-            .instantiate_module(tc, resolve_module_callback)
-            .is_none()
-        {
-            return Err(Error::from_try_catch(tc, "Uncaught"));
-        }
-    }
-    Ok(root)
-}
-
-fn resolve_module_callback<'s>(
-    context: v8::Local<'s, v8::Context>,
-    specifier: v8::Local<'s, v8::String>,
-    import_attributes: v8::Local<'s, v8::FixedArray>,
-    referrer: v8::Local<'s, v8::Module>,
-) -> Option<v8::Local<'s, v8::Module>> {
-    // SAFETY: V8 calls this with a live context on the current thread.
-    v8::callback_scope!(unsafe scope, context);
-    let state = runtime_state(scope);
-    let modules = state.modules.borrow();
-    let referrer_id = modules.id_of(scope, referrer)?;
-    let specifier = specifier.to_rust_string_lossy(scope);
-    let requested = requested_type(scope, import_attributes, 3).ok()?;
-    let (_, _, child) = modules.modules[referrer_id]
-        .requests
-        .iter()
-        .find(|(name, module_type, _)| *name == specifier && *module_type == requested)?;
-    Some(v8::Local::new(scope, &modules.modules[*child].handle))
-}
-
-fn synthetic_module_evaluation_steps<'s>(
-    context: v8::Local<'s, v8::Context>,
-    module: v8::Local<'s, v8::Module>,
-) -> Option<v8::Local<'s, v8::Value>> {
-    // SAFETY: V8 calls this with a live context on the current thread.
-    v8::callback_scope!(unsafe scope, context);
-    let state = runtime_state(scope);
-    let value = {
-        let modules = state.modules.borrow();
-        let id = modules.id_of(scope, module)?;
-        v8::Local::new(scope, modules.modules[id].synthetic_value.as_ref()?)
-    };
-    let default = serde_v8::key(scope, "default");
-    module.set_synthetic_module_export(scope, default, value)?;
-    let resolver = v8::PromiseResolver::new(scope)?;
-    let undefined = v8::undefined(scope);
-    resolver.resolve(scope, undefined.into());
-    Some(resolver.get_promise(scope).into())
-}
-
-pub(crate) extern "C" fn import_meta_callback(
-    context: v8::Local<v8::Context>,
-    module: v8::Local<v8::Module>,
-    meta: v8::Local<v8::Object>,
-) {
-    // SAFETY: V8 calls this with a live context on the current thread.
-    v8::callback_scope!(unsafe scope, context);
-    let state = runtime_state(scope);
-    let modules = state.modules.borrow();
-    let Some(id) = modules.id_of(scope, module) else {
-        return;
-    };
-    let url_key = serde_v8::key(scope, "url");
-    if let Some(url) = v8::String::new(scope, &modules.modules[id].name) {
-        meta.create_data_property(scope, url_key.into(), url.into());
-    }
-    let main_key = serde_v8::key(scope, "main");
-    let main = v8::Boolean::new(scope, modules.main == Some(id));
-    meta.create_data_property(scope, main_key.into(), main.into());
-}
-
-/// A dynamic `import()` waiting for the event loop.
-pub(crate) struct DynamicImport {
-    pub(crate) resolver: v8::Global<v8::PromiseResolver>,
-    pub(crate) specifier: String,
-    pub(crate) referrer: String,
-    pub(crate) module_type: ModuleType,
-}
-
-/// A dynamically imported module whose evaluation is still running.
-pub(crate) struct PendingEvaluation {
-    pub(crate) resolver: v8::Global<v8::PromiseResolver>,
-    pub(crate) module: v8::Global<v8::Module>,
-    pub(crate) promise: v8::Global<v8::Promise>,
-}
-
-pub(crate) fn dynamic_import_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    _host_defined_options: v8::Local<'s, v8::Data>,
-    resource_name: v8::Local<'s, v8::Value>,
-    specifier: v8::Local<'s, v8::String>,
-    import_attributes: v8::Local<'s, v8::FixedArray>,
-) -> Option<v8::Local<'s, v8::Promise>> {
-    let resolver = v8::PromiseResolver::new(scope)?;
-    let promise = resolver.get_promise(scope);
-    let module_type = match requested_type(scope, import_attributes, 2) {
-        Ok(module_type) => module_type,
-        Err(error) => {
-            let message = v8::String::new(scope, &error)?;
-            let exception = v8::Exception::type_error(scope, message);
-            resolver.reject(scope, exception);
-            return Some(promise);
-        }
-    };
-    let state = runtime_state(scope);
-    state.dynamic_imports.borrow_mut().push(DynamicImport {
-        resolver: v8::Global::new(scope, resolver),
-        specifier: specifier.to_rust_string_lossy(scope),
-        referrer: resource_name.to_rust_string_lossy(scope),
+    modules.modules.push(ModuleRecord {
+        id,
+        name: name.to_string(),
         module_type,
+        is_main: main,
+        payload,
+        dep_ids: Vec::new(),
+        registered_in_js: false,
     });
-    state.waker.wake();
-    Some(promise)
-}
+    modules.ids.insert((name.to_string(), module_type), id);
+    newly_added.push(id);
 
-/// Starts the queued dynamic imports and settles finished ones. Returns
-/// whether anything started or settled, so the caller runs microtasks and
-/// polls again.
-pub(crate) fn poll_dynamic_imports(scope: &mut v8::PinScope<'_, '_>, state: &RuntimeState) -> bool {
-    let mut progressed = false;
-    let imports = std::mem::take(&mut *state.dynamic_imports.borrow_mut());
-    for import in imports {
-        let resolver = v8::Local::new(scope, &import.resolver);
-        let loaded = state
-            .loader
-            .resolve(&import.specifier, &import.referrer)
-            .map_err(Error::new)
-            .and_then(|name| load_graph(scope, state, &name, import.module_type, None, false));
-        let id = match loaded {
-            Ok(id) => id,
-            Err(error) => {
-                progressed = true;
-                reject_with_message(scope, resolver, error.message());
-                continue;
-            }
-        };
-        let module = {
-            let modules = state.modules.borrow();
-            v8::Local::new(scope, modules.handle(id).expect("loaded module"))
-        };
-        v8::tc_scope!(let tc, scope);
-        match module.evaluate(tc) {
-            Some(result) => {
-                let promise = v8::Local::<v8::Promise>::try_from(result).ok();
-                match promise {
-                    Some(promise) => {
-                        progressed = true;
-                        promise.mark_as_handled();
-                        state
-                            .pending_evaluations
-                            .borrow_mut()
-                            .push(PendingEvaluation {
-                                resolver: import.resolver,
-                                module: v8::Global::new(tc, module),
-                                promise: v8::Global::new(tc, promise),
-                            });
-                    }
-                    None => {
-                        let namespace = module.get_module_namespace();
-                        resolver.resolve(tc, namespace);
-                        progressed = true;
-                    }
-                }
-            }
-            None => {
-                progressed = true;
-                if let Some(exception) = tc.exception() {
-                    resolver.reject(tc, exception);
-                }
-            }
-        }
+    let mut dep_ids = Vec::with_capacity(requests.len());
+    for (specifier, req_type) in requests {
+        let resolved = loader.resolve(&specifier, name).map_err(Error::new)?;
+        let child_id = load_recursive(modules, loader, &resolved, req_type, None, false, newly_added)?;
+        dep_ids.push(child_id);
     }
-
-    let evaluations = std::mem::take(&mut *state.pending_evaluations.borrow_mut());
-    let mut still_pending = Vec::new();
-    for evaluation in evaluations {
-        let promise = v8::Local::new(scope, &evaluation.promise);
-        let resolver = v8::Local::new(scope, &evaluation.resolver);
-        match promise.state() {
-            v8::PromiseState::Pending => still_pending.push(evaluation),
-            v8::PromiseState::Fulfilled => {
-                let module = v8::Local::new(scope, &evaluation.module);
-                let namespace = module.get_module_namespace();
-                resolver.resolve(scope, namespace);
-                progressed = true;
-            }
-            v8::PromiseState::Rejected => {
-                let reason = promise.result(scope);
-                resolver.reject(scope, reason);
-                progressed = true;
-            }
-        }
-    }
-    state.pending_evaluations.borrow_mut().extend(still_pending);
-    progressed
-}
-
-fn reject_with_message(
-    scope: &mut v8::PinScope<'_, '_>,
-    resolver: v8::Local<v8::PromiseResolver>,
-    message: &str,
-) {
-    let message = v8::String::new(scope, message).unwrap_or_else(|| v8::String::empty(scope));
-    let exception = v8::Exception::type_error(scope, message);
-    resolver.reject(scope, exception);
+    modules.modules[id].dep_ids = dep_ids;
+    Ok(id)
 }

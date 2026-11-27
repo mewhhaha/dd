@@ -5,8 +5,7 @@
 
 use crate::ops::HandleTable;
 use base64::Engine;
-use dd_v8::builtins::{buffer_bytes, with_buffer_mut};
-use dd_v8::{JsBuffer, OpError, OpState, ToJsBuffer, v8};
+use dd_v8::{JsBuffer, OpError, OpState, ToJsBuffer};
 use encoding_rs::{CoderResult, Decoder, DecoderResult, Encoding};
 
 /// Streaming decoders, each with whether it is fatal.
@@ -24,48 +23,29 @@ pub(super) fn op_encoding_normalize_label(
     Ok(encoding.name().to_lowercase())
 }
 
-fn throw(scope: &mut v8::PinScope<'_, '_>, error: OpError) {
-    let exception = error.to_exception(scope);
-    scope.throw_exception(exception);
-}
-
 /// `op_encoding_decode_utf8(bytes, ignoreBOM) -> string`
-pub(super) fn op_encoding_decode_utf8<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let Some(bytes) = buffer_bytes(args.get(0)) else {
-        return throw(scope, OpError::type_error("expected a buffer source"));
-    };
-    let ignore_bom = args.get(1).is_true();
-    let bytes = if !ignore_bom {
+pub(super) fn op_encoding_decode_utf8(
+    _state: &mut OpState,
+    bytes: JsBuffer,
+    ignore_bom: bool,
+) -> Result<String, OpError> {
+    let slice = if !ignore_bom {
         bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)
     } else {
         &bytes
     };
-    match v8::String::new_from_utf8(scope, bytes, v8::NewStringType::Normal) {
-        Some(text) => rv.set(text.into()),
-        None => throw(scope, OpError::range_error("The string is too long")),
-    }
+    Ok(String::from_utf8_lossy(slice).into_owned())
 }
 
 /// `op_encoding_decode_utf8_ascii_only(bytes) -> string | null`
-pub(super) fn op_encoding_decode_utf8_ascii_only<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let Some(bytes) = buffer_bytes(args.get(0)) else {
-        return throw(scope, OpError::type_error("expected a buffer source"));
-    };
+pub(super) fn op_encoding_decode_utf8_ascii_only(
+    _state: &mut OpState,
+    bytes: JsBuffer,
+) -> Option<String> {
     if !bytes.is_ascii() {
-        return rv.set_null();
+        return None;
     }
-    match v8::String::new_from_one_byte(scope, &bytes, v8::NewStringType::Normal) {
-        Some(text) => rv.set(text.into()),
-        None => throw(scope, OpError::range_error("The string is too long")),
-    }
+    String::from_utf8(bytes.into_vec()).ok()
 }
 
 fn decode(decoder: &mut Decoder, fatal: bool, data: &[u8], last: bool) -> Result<String, OpError> {
@@ -160,32 +140,6 @@ pub(super) fn op_encoding_drop_decoder(state: &mut OpState, handle: u32) {
     if let Some(decoders) = state.try_borrow_mut::<Decoders>() {
         decoders.remove(handle);
     }
-}
-
-/// `op_encoding_encode_into(source, destination) -> [read, written]`
-pub(super) fn op_encoding_encode_into<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let Ok(source) = v8::Local::<v8::String>::try_from(args.get(0)) else {
-        return throw(scope, OpError::type_error("expected a string"));
-    };
-    let mut read = 0;
-    let written = with_buffer_mut(args.get(1), |destination| {
-        source.write_utf8_v2(
-            scope,
-            destination,
-            v8::WriteFlags::kReplaceInvalidUtf8,
-            Some(&mut read),
-        )
-    });
-    let Some(written) = written else {
-        return throw(scope, OpError::type_error("expected a Uint8Array"));
-    };
-    let read = v8::Number::new(scope, read as f64).into();
-    let written = v8::Number::new(scope, written as f64).into();
-    rv.set(v8::Array::new_with_elements(scope, &[read, written]).into());
 }
 
 fn is_ascii_whitespace(byte: u8) -> bool {

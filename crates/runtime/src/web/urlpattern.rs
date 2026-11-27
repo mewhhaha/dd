@@ -1,8 +1,7 @@
 // `URLPattern` parsing and matching, ported from deno_web's urlpattern.rs
 // (Copyright 2018-2026 the Deno authors, MIT license).
 
-use dd_v8::builtins::write_u32s;
-use dd_v8::{OpError, OpState, serde_v8, v8};
+use dd_v8::{OpError, OpState};
 use serde::Serialize;
 use urlpattern::quirks::{self, StringOrInit, UrlPatternInit};
 
@@ -114,58 +113,38 @@ pub(super) fn op_urlpattern_parse(
     })
 }
 
-/// `op_urlpattern_process_match_input(input, baseURL, offsetsBuf)`: the eight
-/// URL components concatenated, with their start offsets (and the total
-/// length) written to the 9-word buffer; `null` when the input is no URL.
-pub(super) fn op_urlpattern_process_match_input<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let result = (|| -> Result<Option<(String, [u32; 9])>, OpError> {
-        let input: StringOrInit = serde_v8::from_v8(scope, args.get(0))?;
-        let base_url: Option<String> = serde_v8::from_v8(scope, args.get(1))?;
-        let Some((input, _)) = quirks::process_match_input(input, base_url.as_deref())
-            .map_err(|error| OpError::type_error(error.to_string()))?
-        else {
-            return Ok(None);
-        };
-        let Some(input) = quirks::parse_match_input(input) else {
-            return Ok(None);
-        };
-        let fields = [
-            &input.protocol,
-            &input.username,
-            &input.password,
-            &input.hostname,
-            &input.port,
-            &input.pathname,
-            &input.search,
-            &input.hash,
-        ];
-        let mut offsets = [0u32; 9];
-        let mut concat = String::with_capacity(fields.iter().map(|field| field.len()).sum());
-        let mut offset = 0u32;
-        for (index, field) in fields.iter().enumerate() {
-            offsets[index] = offset;
-            offset += field.len() as u32;
-            concat.push_str(field);
-        }
-        offsets[8] = offset;
-        Ok(Some((concat, offsets)))
-    })();
-    match result {
-        Ok(Some((concat, offsets))) => {
-            write_u32s(args.get(2), &offsets);
-            match v8::String::new(scope, &concat) {
-                Some(concat) => rv.set(concat.into()),
-                None => rv.set_null(),
-            }
-        }
-        Ok(None) => rv.set_null(),
-        Err(error) => {
-            let error = error.to_exception(scope);
-            scope.throw_exception(error);
-        }
+/// `op_urlpattern_process_match_input(input, baseURL) -> [concat, offsets] | null`
+pub(super) fn op_urlpattern_process_match_input(
+    _state: &mut OpState,
+    input: StringOrInit,
+    base_url: Option<String>,
+) -> Result<Option<(String, [u32; 9])>, OpError> {
+    let Some((input, _)) = quirks::process_match_input(input, base_url.as_deref())
+        .map_err(|error| OpError::type_error(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let Some(input) = quirks::parse_match_input(input) else {
+        return Ok(None);
+    };
+    let fields = [
+        &input.protocol,
+        &input.username,
+        &input.password,
+        &input.hostname,
+        &input.port,
+        &input.pathname,
+        &input.search,
+        &input.hash,
+    ];
+    let mut offsets = [0u32; 9];
+    let mut concat = String::with_capacity(fields.iter().map(|field| field.len()).sum());
+    let mut offset = 0u32;
+    for (index, field) in fields.iter().enumerate() {
+        offsets[index] = offset;
+        offset += field.len() as u32;
+        concat.push_str(field);
     }
+    offsets[8] = offset;
+    Ok(Some((concat, offsets)))
 }

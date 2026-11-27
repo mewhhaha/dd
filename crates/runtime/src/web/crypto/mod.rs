@@ -74,12 +74,11 @@ use self::shared::V8RawKeyData;
 use self::shared::{not_supported_error, operation_error, quota_exceeded_error};
 use self::x448::*;
 use self::x25519::*;
-use dd_v8::builtins::with_buffer_mut;
-use dd_v8::{OpDecl, op_async, op_raw, op_sync, v8};
+use dd_v8::{OpDecl, op_async, op_sync};
 
 pub(crate) fn ops() -> Vec<OpDecl> {
     vec![
-        op_raw!(op_crypto_get_random_values),
+        op_sync!(op_crypto_get_random_values),
         op_async!(op_crypto_generate_key),
         op_async!(op_crypto_sign_key),
         op_async!(op_crypto_verify_key),
@@ -191,26 +190,19 @@ pub fn op_crypto_base64url_encode(_state: &mut OpState, data: JsBuffer) -> Strin
     data
 }
 
-/// `op_crypto_get_random_values(view)`: fills the view in place.
-fn op_crypto_get_random_values<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    _rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let filled = with_buffer_mut(args.get(0), |out| {
-        if out.len() > 65536 {
-            return Err(CryptoError::ArrayBufferViewLengthExceeded(out.len()));
-        }
-        rand::rng().fill_bytes(out);
-        Ok(())
-    });
-    let error = match filled {
-        Some(Ok(())) => return,
-        Some(Err(error)) => OpError::from(error),
-        None => OpError::type_error("expected an integer TypedArray"),
-    };
-    let exception = error.to_exception(scope);
-    scope.throw_exception(exception);
+/// `op_crypto_get_random_values(len)`: returns `len` random bytes (copied into
+/// the caller's TypedArray by the JS wrapper).
+fn op_crypto_get_random_values(
+    _state: &mut OpState,
+    len: u32,
+) -> Result<ToJsBuffer, CryptoError> {
+    let len = len as usize;
+    if len > 65536 {
+        return Err(CryptoError::ArrayBufferViewLengthExceeded(len));
+    }
+    let mut out = vec![0u8; len];
+    rand::rng().fill_bytes(&mut out);
+    Ok(out.into())
 }
 
 #[derive(Deserialize)]

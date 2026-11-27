@@ -1,4 +1,4 @@
-//! Isolate construction and worker execution.
+//! Isolate construction and worker execution (Scriptw + wtime x64 AOT).
 
 mod loader;
 
@@ -20,8 +20,8 @@ use crate::service::MemoryExecutionCall;
 use base64::Engine;
 use common::{PlatformError, Result, WorkerInvocation};
 use dd_v8::{
-    JsRuntime, ModuleCode, ModuleId, ModuleLoader, ModuleSource, ModuleType, OpDecl,
-    RuntimeOptions, v8,
+    JsRuntime, JsValue, ModuleCode, ModuleId, ModuleLoader, ModuleSource, ModuleType, OpDecl,
+    RuntimeOptions,
 };
 use std::borrow::Cow;
 use std::future::poll_fn;
@@ -48,20 +48,15 @@ fn runtime_ops() -> Vec<OpDecl> {
     ops
 }
 
-/// Builds (once per process) the snapshot every isolate starts from: the
-/// web layer, dd's worker globals and its request machinery, evaluated and
-/// captured.
-///
-/// Every runtime script runs as the body of a function, so nothing it
-/// declares is global. core.js returns the bootstrap object (the ops, the
-/// web layer's shared state, and dd's own under `dd`); each later script
-/// receives it as its `__bootstrap` parameter, and the snapshot keeps it as
-/// the runtime's internals, where only the host reaches it.
+/// Builds (once per process) the AOT-compiled snapshot every isolate starts from:
+/// all 20 Web Platform scripts, primordials, core, web/init, dd bootstrap, and
+/// execute_worker compiled directly into native x64 machine code by Scriptw + wtime.
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     BOOTSTRAP_SNAPSHOT
         .get_or_init(|| {
             let mut runtime = JsRuntime::new_for_snapshot(RuntimeOptions {
                 ops: runtime_ops(),
+                ext_scripts: crate::web::EXT_SCRIPTS,
                 ..Default::default()
             })
             .map_err(runtime_error)?;
@@ -103,13 +98,11 @@ pub struct IsolatePolicy {
     /// Expose `globalThis.__dd_internals`, the bootstrap object with every
     /// op. For the runtime's own tests and benchmarks only.
     pub expose_internals: bool,
-    /// The most one op argument may copy out of JavaScript (see
-    /// [`op_argument_budget`]); 0 keeps dd_v8's default.
+    /// The most one op argument may copy out of JavaScript.
     pub max_op_argument_bytes: usize,
 }
 
 impl IsolatePolicy {
-    /// The policy a deployed worker's isolates run under with `config`.
     pub fn for_config(config: &RuntimeConfig) -> Self {
         Self {
             allow_code_generation: config.debug_code_generation,
@@ -123,8 +116,6 @@ impl IsolatePolicy {
     }
 }
 
-/// What one op argument may copy into Rust: room for the largest request or
-/// response body the runtime accepts, and never less than dd_v8's default.
 fn op_argument_budget(max_request_body_bytes: usize, max_response_body_bytes: usize) -> usize {
     dd_v8::serde_v8::DEFAULT_MAX_OP_ARGUMENT_BYTES
         .max(max_request_body_bytes)
@@ -175,14 +166,7 @@ pub fn new_runtime_from_snapshot_with_heap_limit(
 async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
     let module_id = evaluate_module(runtime, WORKER_SPECIFIER, source).await?;
     let namespace = runtime.module_namespace(module_id).map_err(runtime_error)?;
-    let namespace = {
-        dd_v8::scope!(scope, runtime);
-        let namespace = v8::Local::new(scope, namespace);
-        v8::Global::new(scope, v8::Local::<v8::Value>::from(namespace))
-    };
-    let install = cached_entrypoint(runtime, |entrypoints| {
-        Rc::clone(&entrypoints.install_worker)
-    });
+    let install = cached_entrypoint(runtime, |entrypoints| entrypoints.install_worker.clone());
     runtime
         .call_function(&install, &[namespace])
         .map_err(runtime_error)?;
@@ -201,12 +185,12 @@ pub async fn load_worker_source(runtime: &mut JsRuntime, source: &WorkerSource) 
 
 /// The functions on the runtime's internals (`__bootstrap.dd`) the host calls.
 struct RuntimeEntrypoints {
-    install_worker: Rc<v8::Global<v8::Function>>,
-    install_worker_deployment_handle: Rc<v8::Global<v8::Function>>,
-    execute_worker_handle: Rc<v8::Global<v8::Function>>,
-    abort_worker_request_handle: Rc<v8::Global<v8::Function>>,
-    drain_request_control_queue: Rc<v8::Global<v8::Function>>,
-    set_time: Rc<v8::Global<v8::Function>>,
+    install_worker: JsValue,
+    install_worker_deployment_handle: JsValue,
+    execute_worker_handle: JsValue,
+    abort_worker_request_handle: JsValue,
+    drain_request_control_queue: JsValue,
+    set_time: JsValue,
 }
 
 pub fn install_worker_deployment_config(
@@ -223,7 +207,7 @@ pub fn install_worker_deployment_config(
         runtime,
         "installWorkerDeploymentHandle",
         deployment_handle,
-        |entrypoints| Rc::clone(&entrypoints.install_worker_deployment_handle),
+        |entrypoints| entrypoints.install_worker_deployment_handle.clone(),
     ) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -239,33 +223,29 @@ fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
     let internals = runtime
         .internals()
         .ok_or_else(|| PlatformError::runtime("the bootstrap snapshot has no runtime internals"))?;
-    let entrypoints = {
-        dd_v8::scope!(scope, runtime);
-        let internals = v8::Local::new(scope, internals);
-        let dd = v8::Local::<v8::Object>::try_from(internals)
-            .ok()
-            .and_then(|internals| {
-                let key = v8::String::new(scope, "dd")?;
-                internals.get(scope, key.into())
-            })
-            .and_then(|dd| v8::Local::<v8::Object>::try_from(dd).ok())
-            .ok_or_else(|| PlatformError::runtime("the runtime internals have no dd object"))?;
-        RuntimeEntrypoints {
-            install_worker: internal_function(scope, dd, "installWorker")?,
-            install_worker_deployment_handle: internal_function(
-                scope,
-                dd,
-                "installWorkerDeploymentHandle",
-            )?,
-            execute_worker_handle: internal_function(scope, dd, "executeWorkerHandle")?,
-            abort_worker_request_handle: internal_function(scope, dd, "abortWorkerRequestHandle")?,
-            drain_request_control_queue: internal_function(
-                scope,
-                dd,
-                "drainRequestControlQueueHandle",
-            )?,
-            set_time: internal_function(scope, dd, "setTime")?,
-        }
+    let dd = runtime
+        .get_property(&internals, "dd")
+        .map_err(|_| PlatformError::runtime("the runtime internals have no dd object"))?;
+    if dd.is_undefined() {
+        return Err(PlatformError::runtime(
+            "the runtime internals have no dd object",
+        ));
+    }
+    let entrypoints = RuntimeEntrypoints {
+        install_worker: internal_function(runtime, &dd, "installWorker")?,
+        install_worker_deployment_handle: internal_function(
+            runtime,
+            &dd,
+            "installWorkerDeploymentHandle",
+        )?,
+        execute_worker_handle: internal_function(runtime, &dd, "executeWorkerHandle")?,
+        abort_worker_request_handle: internal_function(runtime, &dd, "abortWorkerRequestHandle")?,
+        drain_request_control_queue: internal_function(
+            runtime,
+            &dd,
+            "drainRequestControlQueueHandle",
+        )?,
+        set_time: internal_function(runtime, &dd, "setTime")?,
     };
     let op_state = runtime.op_state();
     op_state.borrow_mut().put(entrypoints);
@@ -333,7 +313,7 @@ pub fn dispatch_worker_request(
         runtime,
         "executeWorkerHandle",
         request_handle,
-        |entrypoints| Rc::clone(&entrypoints.execute_worker_handle),
+        |entrypoints| entrypoints.execute_worker_handle.clone(),
     ) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -353,13 +333,13 @@ pub fn abort_worker_request_handle(
         runtime,
         "abortWorkerRequestHandle",
         request_context_handle,
-        |entrypoints| Rc::clone(&entrypoints.abort_worker_request_handle),
+        |entrypoints| entrypoints.abort_worker_request_handle.clone(),
     )
 }
 
 pub fn drain_request_control_queue(runtime: &mut JsRuntime) -> Result<()> {
     call_cached_noarg_function(runtime, "drainRequestControlQueueHandle", |entrypoints| {
-        Rc::clone(&entrypoints.drain_request_control_queue)
+        entrypoints.drain_request_control_queue.clone()
     })
 }
 
@@ -385,18 +365,11 @@ fn new_runtime(
         startup_snapshot: Some(startup_snapshot),
         max_heap_bytes,
         max_op_argument_bytes: policy.max_op_argument_bytes,
+        ext_scripts: &[],
     })
     .map_err(runtime_error)?;
-    if max_heap_bytes > 0 {
-        let isolate = runtime.v8_isolate().thread_safe_handle();
-        runtime.set_near_heap_limit_callback(move |current_limit, _| {
-            isolate.terminate_execution();
-            // V8 needs headroom to unwind after termination instead of aborting the process.
-            current_limit.saturating_add(16 * 1024 * 1024)
-        });
-    }
     runtime.op_state().borrow_mut().put(module_registry);
-    set_code_generation_from_strings(&mut runtime, policy.allow_code_generation);
+    runtime.set_allow_code_generation(policy.allow_code_generation);
     cache_runtime_entrypoints(&mut runtime)?;
     sync_isolate_clock(&mut runtime)?;
     if policy.unscoped_fetch {
@@ -422,27 +395,15 @@ fn new_runtime(
     Ok(runtime)
 }
 
-/// Sets the worker's frozen clock to now. The snapshot keeps the clock as it
-/// read while the snapshot was built, so without this `Date.now()` and
-/// `performance.now()` would report that moment until the first timer or
-/// I/O boundary.
 fn sync_isolate_clock(runtime: &mut JsRuntime) -> Result<()> {
     let boundary = crate::ops::current_time_boundary();
-    let set_time = cached_entrypoint(runtime, |entrypoints| Rc::clone(&entrypoints.set_time));
-    dd_v8::scope!(scope, runtime);
-    let set_time = v8::Local::new(scope, set_time.as_ref());
-    let now = v8::Number::new(scope, boundary.now_ms as f64).into();
-    let perf = v8::Number::new(scope, boundary.perf_ms).into();
-    v8::tc_scope!(let scope, scope);
-    let receiver = v8::undefined(scope).into();
-    set_time
-        .call(scope, receiver, &[now, perf])
-        .ok_or_else(|| PlatformError::runtime("runtime entrypoint setTime threw"))?;
+    let set_time = cached_entrypoint(runtime, |entrypoints| entrypoints.set_time.clone());
+    runtime
+        .call_function_f64_2(&set_time, boundary.now_ms as f64, boundary.perf_ms)
+        .map_err(|e| PlatformError::runtime(format!("runtime entrypoint setTime threw: {e}")))?;
     Ok(())
 }
 
-/// Defines `globalThis[name]` as `value`, an expression over the runtime's
-/// internals (`__bootstrap`).
 fn expose_global(runtime: &mut JsRuntime, script: &str, name: &str, value: &str) -> Result<()> {
     let internals = runtime
         .internals()
@@ -456,74 +417,52 @@ fn expose_global(runtime: &mut JsRuntime, script: &str, name: &str, value: &str)
     Ok(())
 }
 
-fn set_code_generation_from_strings(runtime: &mut JsRuntime, allow: bool) {
-    dd_v8::scope!(scope, runtime);
-    scope
-        .get_current_context()
-        .set_allow_generation_from_strings(allow);
-}
-
 fn call_cached_u32_function(
     runtime: &mut JsRuntime,
     name: &str,
     arg: u32,
-    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+    select: impl FnOnce(&RuntimeEntrypoints) -> JsValue,
 ) -> Result<()> {
     let function = cached_entrypoint(runtime, select);
-    dd_v8::scope!(scope, runtime);
-    let function = v8::Local::new(scope, function.as_ref());
-    let arg = v8::Integer::new_from_unsigned(scope, arg).into();
-    v8::tc_scope!(let scope, scope);
-    let receiver = v8::undefined(scope).into();
-    function
-        .call(scope, receiver, &[arg])
-        .ok_or_else(|| PlatformError::runtime(format!("runtime entrypoint {name} threw")))?;
+    runtime
+        .call_function_u32(&function, arg)
+        .map_err(|e| PlatformError::runtime(format!("runtime entrypoint {name} threw: {e}")))?;
     Ok(())
 }
 
 fn call_cached_noarg_function(
     runtime: &mut JsRuntime,
     name: &str,
-    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+    select: impl FnOnce(&RuntimeEntrypoints) -> JsValue,
 ) -> Result<()> {
     let function = cached_entrypoint(runtime, select);
-    dd_v8::scope!(scope, runtime);
-    let function = v8::Local::new(scope, function.as_ref());
-    v8::tc_scope!(let scope, scope);
-    let receiver = v8::undefined(scope).into();
-    function
-        .call(scope, receiver, &[])
-        .ok_or_else(|| PlatformError::runtime(format!("runtime entrypoint {name} threw")))?;
+    runtime
+        .call_function(&function, &[])
+        .map_err(|e| PlatformError::runtime(format!("runtime entrypoint {name} threw: {e}")))?;
     Ok(())
 }
 
 fn cached_entrypoint(
     runtime: &mut JsRuntime,
-    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
-) -> Rc<v8::Global<v8::Function>> {
+    select: impl FnOnce(&RuntimeEntrypoints) -> JsValue,
+) -> JsValue {
     let op_state = runtime.op_state();
     let op_state = op_state.borrow();
     select(op_state.borrow::<RuntimeEntrypoints>())
 }
 
-fn internal_function<'scope>(
-    scope: &mut v8::PinScope<'scope, '_>,
-    dd: v8::Local<'scope, v8::Object>,
-    name: &str,
-) -> Result<Rc<v8::Global<v8::Function>>> {
-    let key = v8::String::new(scope, name)
-        .ok_or_else(|| PlatformError::runtime("failed to allocate V8 function name"))?;
-    let function = dd
-        .get(scope, key.into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-        .ok_or_else(|| {
-            PlatformError::runtime(format!("runtime entrypoint {name} is not a function"))
-        })?;
-    Ok(Rc::new(v8::Global::new(scope, function)))
+fn internal_function(runtime: &mut JsRuntime, dd: &JsValue, name: &str) -> Result<JsValue> {
+    let value = runtime
+        .get_property(dd, name)
+        .map_err(|_| PlatformError::runtime(format!("runtime entrypoint {name} is not a function")))?;
+    if value.is_undefined() {
+        return Err(PlatformError::runtime(format!(
+            "runtime entrypoint {name} is not a function"
+        )));
+    }
+    Ok(value)
 }
 
-/// Loads and evaluates a module, then runs one turn of the event loop so an
-/// error its evaluation left behind (an unhandled rejection) fails the load.
 async fn evaluate_module(
     runtime: &mut JsRuntime,
     specifier: &str,
