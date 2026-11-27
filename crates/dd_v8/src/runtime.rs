@@ -2,11 +2,12 @@
 //! Scriptw + `wtime` x64 AOT (`wtime-aot-host`).
 
 use crate::error::Error;
-use crate::inspector::InspectorHandle;
+use crate::inspector::{InspectorCore, InspectorHandle, PauseStep, PendingEvalRequest};
+use crate::instrument;
 use crate::modules::{
     self, CompiledPayload, ModuleCode, ModuleId, ModuleLoader, ModuleMap, ModuleType, NoModules,
 };
-use crate::ops::{OpDecl, OpError, OpKind};
+use crate::ops::{OpDecl, OpError, OpKind, RawBuffer};
 use crate::platform;
 use crate::serde_v8::{
     self, WireValue, decode_wire_args, encode_err_envelope, encode_ok_envelope,
@@ -17,9 +18,10 @@ use crate::wasm_api::WasmHostState;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::task::AtomicWaker;
 use scriptw_engine::{
-    CompileOptions, EmbeddedEvaluation, EmbeddedInstance, EmbeddedRuntime, Engine as ScriptwCompiler,
-    ForeignValue, JsCompletion, JsPromiseState, JsValue as ScriptwJsValue,
-    NativeCompilationPolicy, RealmBuilder, WasmStoreState, configure_wasm_runtime,
+    CompileOptions, EmbeddedEvaluation, EmbeddedInstance, EmbeddedRuntime,
+    Engine as ScriptwCompiler, ForeignValue, JsCompletion, JsPromiseState,
+    JsValue as ScriptwJsValue, NativeCompilationPolicy, RealmBuilder, WasmStoreState,
+    configure_wasm_runtime,
 };
 use scriptw_ir::foreign::{
     ForeignFunctionDeclaration, ForeignModuleDeclaration, ForeignModuleRegistry, ForeignResultType,
@@ -123,7 +125,7 @@ impl RuntimeHandle {
             handle.interrupt();
         }
         if let Some(inspector) = self.inspector.get() {
-            inspector.close();
+            inspector.wake_for_termination();
         }
         true
     }
@@ -160,6 +162,9 @@ fn shared_engine() -> Result<&'static wasmtime::Engine, Error> {
                 NativeCompilationPolicy::default(),
                 scriptw_engine::CompilationJobs::current(),
             );
+            // Allow unbounded runtimes (e.g. >2 GiB typed-array views plus wire copies)
+            // to use the full 8 GiB virtual semi-space reserved by wtime-aot-host.
+            config.gc_heap_reservation(8u64 << 30);
             wasmtime::Engine::new(&config).map_err(|e| format!("wtime engine init failed: {e}"))
         })
         .as_ref()
@@ -207,6 +212,14 @@ fn dd_foreign_registry() -> Result<ForeignModuleRegistry, Error> {
                     ForeignResultType::Bytes,
                 )
                 .map_err(|e| Error::new(format!("foreign decl wasm_op: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "inspector_op",
+                    "dd",
+                    "inspector_op",
+                    vec![ForeignValueType::Number, ForeignValueType::Bytes],
+                    ForeignResultType::Bytes,
+                )
+                .map_err(|e| Error::new(format!("foreign decl inspector_op: {e}")))?,
             ],
         )
         .map_err(|e| Error::new(format!("foreign module dd:host: {e}")))?,
@@ -218,18 +231,19 @@ fn compile_embedded_module(source: &str) -> Result<Arc<EmbeddedRuntime>, Error> 
     let engine = shared_engine()?;
     let declarations = dd_foreign_registry()?;
     let compiler = ScriptwCompiler::new(RealmBuilder::new().build());
-    let unit = compiler
-        .compile_module(
+    let artifact = compiler
+        .compile_and_emit_module_native_host_cached(
             source,
             CompileOptions {
                 foreign_modules: declarations,
                 ..CompileOptions::default()
             },
         )
-        .map_err(|e| Error::new(format!("scriptw compile_module failed: {e}")))?;
-    let artifact = compiler
-        .emit_wasm_native_host(&unit)
-        .map_err(|e| Error::new(format!("scriptw emit_wasm_native_host failed: {e}")))?;
+        .map_err(|e| {
+            Error::new(format!(
+                "scriptw compile_and_emit_module_native_host_cached failed: {e}"
+            ))
+        })?;
     let embedded = EmbeddedRuntime::compile_native_host(engine, &artifact)
         .map_err(|e| Error::new(format!("wtime-aot compile_native_host failed: {e}")))?;
     Ok(Arc::new(embedded))
@@ -271,6 +285,8 @@ struct RuntimeState {
     loader: Rc<dyn ModuleLoader>,
     modules: RefCell<ModuleMap>,
     wasm: RefCell<WasmHostState>,
+    inspector: Arc<OnceLock<InspectorHandle>>,
+    last_wire_out: RefCell<Vec<u8>>,
 }
 
 impl RuntimeState {
@@ -308,6 +324,10 @@ struct KernelExports {
     set_internals: ScriptwJsValue,
     get_internals: ScriptwJsValue,
     set_allow_codegen: ScriptwJsValue,
+    set_inspector_enabled: ScriptwJsValue,
+    dbg_eval_global: ScriptwJsValue,
+    wire_to_js: ScriptwJsValue,
+    js_to_wire: ScriptwJsValue,
     settle_async: ScriptwJsValue,
     take_unhandled_rejection: ScriptwJsValue,
     register_module: ScriptwJsValue,
@@ -422,9 +442,7 @@ impl SnapshotRecorder {
         for (idx, step) in self.steps.iter().enumerate() {
             match step {
                 SnapshotStep::ExecuteScript { slot, .. } => {
-                    out.push_str(&format!(
-                        "  __dd_slots[{slot}] = __dd_snap_step_{idx}();\n"
-                    ));
+                    out.push_str(&format!("  __dd_slots[{slot}] = __dd_snap_step_{idx}();\n"));
                 }
                 SnapshotStep::ExecuteWithOps { slot, .. } => {
                     out.push_str(&format!(
@@ -479,6 +497,8 @@ fn build_op_specs_json(ops: &[OpDecl]) -> String {
         }
         let kind = if op.is_builtin_js() {
             2
+        } else if op.is_raw_buffer() {
+            3
         } else if op.is_async() {
             1
         } else {
@@ -537,6 +557,9 @@ impl JsRuntime {
             0 => serde_v8::DEFAULT_MAX_OP_ARGUMENT_BYTES,
             n => n,
         };
+        let terminated = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let inspector_handle = Arc::new(OnceLock::new());
         let state = Rc::new(RuntimeState {
             op_state: Rc::new(RefCell::new(OpState::new(Arc::clone(&waker)))),
             max_op_argument_bytes: max_arg_bytes,
@@ -547,16 +570,14 @@ impl JsRuntime {
             loader: module_loader.unwrap_or_else(|| Rc::new(NoModules)),
             modules: RefCell::new(ModuleMap::default()),
             wasm: RefCell::new(WasmHostState::new()),
+            inspector: Arc::clone(&inspector_handle),
+            last_wire_out: RefCell::new(Vec::new()),
         });
-
-        let terminated = Arc::new(AtomicBool::new(false));
-        let alive = Arc::new(AtomicBool::new(true));
 
         if will_snapshot {
             let (vm, interrupt) = if ext_scripts.is_empty() {
                 let embedded = base_kernel_runtime()?;
-                let (mut vm, interrupt) =
-                    instantiate_vm(&embedded, &state, max_heap_bytes, false)?;
+                let (mut vm, interrupt) = instantiate_vm(&embedded, &state, max_heap_bytes, false)?;
                 // Mirror V8's SnapshotCreator behavior where globalThis.queueMicrotask
                 // is absent during snapshot construction (ops.op_queue_microtask is used).
                 let n = str_val(&mut vm, "<snapshot-init>")?;
@@ -574,7 +595,7 @@ impl JsRuntime {
                 terminated,
                 alive,
                 interrupt_handle: interrupt,
-                inspector_handle: Arc::new(OnceLock::new()),
+                inspector_handle,
                 max_heap_bytes,
             });
         }
@@ -600,7 +621,7 @@ impl JsRuntime {
             terminated,
             alive,
             interrupt_handle: Some(interrupt),
-            inspector_handle: Arc::new(OnceLock::new()),
+            inspector_handle,
             max_heap_bytes,
         })
     }
@@ -630,47 +651,81 @@ impl JsRuntime {
         }
     }
 
-    pub fn enable_inspector(&mut self, _name: &str) -> Result<InspectorHandle, Error> {
+    pub fn enable_inspector(&mut self, name: &str) -> Result<InspectorHandle, Error> {
         if self.recorder.is_some() {
             return Err(Error::new("a snapshot runtime cannot have an inspector"));
         }
-        Ok(self
+        let handle = self
             .inspector_handle
-            .get_or_init(InspectorHandle::new)
-            .clone())
+            .get_or_init(|| {
+                let core = InspectorCore::new(
+                    name.to_string(),
+                    Arc::clone(&self.state.waker),
+                    Arc::clone(&self.terminated),
+                );
+                InspectorHandle::new(core)
+            })
+            .clone();
+        if let Some(ref mut vm) = self.vm {
+            let arg = vm
+                .instance
+                .value(&mut vm.store, ForeignValue::Number(1.0))
+                .map_err(|e| Error::new(e.to_string()))?;
+            let _ = vm.instance.call(
+                &mut vm.store,
+                &vm.exports.set_inspector_enabled.clone(),
+                None,
+                &[arg],
+            );
+        }
+        Ok(handle)
     }
 
-    pub fn wait_for_debugger(&mut self) {}
+    pub fn wait_for_debugger(&mut self) {
+        if let Some(handle) = self.inspector_handle.get() {
+            handle.core().wait_for_debugger();
+        }
+    }
 
     /// Controls whether user code may invoke `eval` or `new Function`.
     pub fn set_allow_code_generation(&mut self, allow: bool) {
         if let Some(ref mut vm) = self.vm {
-            let arg = vm
-                .instance
-                .value(&mut vm.store, ForeignValue::Number(if allow { 1.0 } else { 0.0 }));
+            let arg = vm.instance.value(
+                &mut vm.store,
+                ForeignValue::Number(if allow { 1.0 } else { 0.0 }),
+            );
             if let Ok(arg) = arg {
-                let _ = vm
-                    .instance
-                    .call(&mut vm.store, &vm.exports.set_allow_codegen, None, &[arg]);
+                let _ =
+                    vm.instance
+                        .call(&mut vm.store, &vm.exports.set_allow_codegen, None, &[arg]);
             }
         }
     }
 
     /// Runs a classic script and returns its completion value.
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<JsValue, Error> {
-        let live = if self.vm.is_some() {
-            self.check_terminated()?;
+        let live = if let Some(vm) = self.vm.as_mut() {
+            if self.terminated.load(Ordering::Acquire) {
+                return Err(Error::terminated());
+            }
             let rewritten = modules::rewrite_script_dynamic_import(source);
-            let (effective_src, has_dyn) = match &rewritten {
+            let (base_src, has_dyn) = match &rewritten {
                 Some(s) => (s.as_str(), true),
                 None => (source, false),
             };
-            let vm = self.vm.as_mut().expect("live vm");
+            let instrumented = self.inspector_handle.get().map(|handle| {
+                let sid = handle.core().register_script(name, source);
+                instrument::instrument_js(sid, base_src)
+            });
+            let effective_src = instrumented.as_deref().unwrap_or(base_src);
             let name_v = str_val(vm, name)?;
             let src_v = str_val(vm, effective_src)?;
             let has_dyn_v = vm
                 .instance
-                .value(&mut vm.store, ForeignValue::Number(if has_dyn { 1.0 } else { 0.0 }))
+                .value(
+                    &mut vm.store,
+                    ForeignValue::Number(if has_dyn { 1.0 } else { 0.0 }),
+                )
                 .map_err(|e| Error::new(e.to_string()))?;
             let eval_fn = vm.exports.eval_script.clone();
             Some(call_js(
@@ -698,9 +753,10 @@ impl JsRuntime {
 
     /// Runs `source` as the body of a function whose one parameter is `ops`.
     pub fn execute_with_ops(&mut self, name: &str, source: &str) -> Result<JsValue, Error> {
-        let live = if self.vm.is_some() {
-            self.check_terminated()?;
-            let vm = self.vm.as_mut().expect("live vm");
+        let live = if let Some(vm) = self.vm.as_mut() {
+            if self.terminated.load(Ordering::Acquire) {
+                return Err(Error::terminated());
+            }
             let name_v = str_val(vm, name)?;
             let src_v = str_val(vm, source)?;
             Some(call_js(
@@ -734,9 +790,10 @@ impl JsRuntime {
         params: &[&str],
         args: &[JsValue],
     ) -> Result<JsValue, Error> {
-        let live = if self.vm.is_some() {
-            self.check_terminated()?;
-            let vm = self.vm.as_mut().expect("live vm");
+        let live = if let Some(vm) = self.vm.as_mut() {
+            if self.terminated.load(Ordering::Acquire) {
+                return Err(Error::terminated());
+            }
             let name_v = str_val(vm, name)?;
             let src_v = str_val(vm, source)?;
             let mut params_json = String::from("[");
@@ -764,7 +821,9 @@ impl JsRuntime {
                 match a.slot {
                     Some(s) => arg_slots.push(s),
                     None => {
-                        return Err(Error::new("live value without snapshot slot passed to snapshot recorder"));
+                        return Err(Error::new(
+                            "live value without snapshot slot passed to snapshot recorder",
+                        ));
                     }
                 }
             }
@@ -871,12 +930,61 @@ impl JsRuntime {
         js_value_to_rust_string(&mut vm.store, &s)
     }
 
+    /// Serializes a Rust value into a live JavaScript value via `serde_v8`.
+    pub fn to_js<T: serde::Serialize>(&mut self, value: &T) -> Result<JsValue, Error> {
+        self.check_terminated()?;
+        let wire = serde_v8::to_wire(value).map_err(|e| Error::new(e.to_string()))?;
+        let env = encode_ok_envelope(&wire);
+        let vm = self.vm.as_mut().expect("live vm");
+        let bytes_v = vm
+            .instance
+            .value(&mut vm.store, ForeignValue::Bytes(env))
+            .map_err(|e| Error::new(e.to_string()))?;
+        let val = call_js(
+            vm,
+            &self.terminated,
+            &vm.exports.wire_to_js.clone(),
+            &[bytes_v],
+        )?;
+        Ok(JsValue::live(val))
+    }
+
+    /// Deserializes a live JavaScript value into a Rust value via `serde_v8`.
+    pub fn from_js<T: serde::de::DeserializeOwned>(&mut self, value: &JsValue) -> Result<T, Error> {
+        self.check_terminated()?;
+        let live = value.as_live()?.clone();
+        self.state.last_wire_out.borrow_mut().clear();
+        let vm = self.vm.as_mut().expect("live vm");
+        let _ = call_js(
+            vm,
+            &self.terminated,
+            &vm.exports.js_to_wire.clone(),
+            &[live],
+        )?;
+        let raw = std::mem::take(&mut *self.state.last_wire_out.borrow_mut());
+        let args = decode_wire_args(&raw, self.state.max_op_argument_bytes)
+            .map_err(|e| Error::new(e.to_string()))?;
+        let first = args.first().unwrap_or(&WireValue::Undefined);
+        serde_v8::from_wire(first).map_err(|e| Error::new(e.to_string()))
+    }
+
+    /// Creates a live JavaScript `Uint8Array` containing `bytes`.
+    pub fn uint8_array(&mut self, bytes: &[u8]) -> Result<JsValue, Error> {
+        self.check_terminated()?;
+        let vm = self.vm.as_mut().expect("live vm");
+        let val = vm
+            .instance
+            .value(&mut vm.store, ForeignValue::Bytes(bytes.to_vec()))
+            .map_err(|e| Error::new(e.to_string()))?;
+        Ok(JsValue::live(val))
+    }
+
     pub fn set_internals(&mut self, value: JsValue) {
-        if let Some(ref mut rec) = self.recorder {
-            if let Some(slot) = value.slot {
-                rec.internals_slot = Some(slot);
-                rec.steps.push(SnapshotStep::SetInternals { slot });
-            }
+        if let Some(ref mut rec) = self.recorder
+            && let Some(slot) = value.slot
+        {
+            rec.internals_slot = Some(slot);
+            rec.steps.push(SnapshotStep::SetInternals { slot });
         }
         if let Some(live) = value.live.as_ref()
             && let Some(ref mut vm) = self.vm
@@ -893,13 +1001,7 @@ impl JsRuntime {
     pub fn internals(&mut self) -> Option<JsValue> {
         let slot = self.recorder.as_ref().and_then(|r| r.internals_slot);
         if let Some(ref mut vm) = self.vm {
-            let val = call_js(
-                vm,
-                &self.terminated,
-                &vm.exports.get_internals.clone(),
-                &[],
-            )
-            .ok()?;
+            let val = call_js(vm, &self.terminated, &vm.exports.get_internals.clone(), &[]).ok()?;
             if val.is_undefined() {
                 None
             } else {
@@ -935,6 +1037,7 @@ impl JsRuntime {
         self.check_terminated()?;
         let (root_id, newly_added) = {
             let mut mods = self.state.modules.borrow_mut();
+            let insp = self.inspector_handle.get().map(|h| h.core().as_ref());
             modules::load_graph(
                 &mut mods,
                 self.state.loader.as_ref(),
@@ -942,6 +1045,7 @@ impl JsRuntime {
                 ModuleType::JavaScript,
                 code.map(ModuleCode::String),
                 main,
+                insp,
             )?
         };
         self.sync_registered_modules(&newly_added)?;
@@ -1079,7 +1183,10 @@ impl JsRuntime {
         .await
     }
 
-    fn promise_outcome(&mut self, promise: &ScriptwJsValue) -> Option<Result<ScriptwJsValue, Error>> {
+    fn promise_outcome(
+        &mut self,
+        promise: &ScriptwJsValue,
+    ) -> Option<Result<ScriptwJsValue, Error>> {
         let vm = self.vm.as_mut()?;
         match vm.instance.promise_state(&mut vm.store, promise) {
             Ok(JsPromiseState::Pending) => None,
@@ -1103,6 +1210,11 @@ impl JsRuntime {
         self.state.waker.register(cx.waker());
         if self.terminated.load(Ordering::Acquire) {
             return Poll::Ready(Err(Error::terminated()));
+        }
+
+        // 0. Dispatch any queued DevTools inspector commands (including Runtime.evaluate).
+        if let Err(err) = self.dispatch_inspector_messages() {
+            return Poll::Ready(Err(err));
         }
 
         // 1. Drain pending JS microtasks.
@@ -1173,6 +1285,36 @@ impl JsRuntime {
         }
     }
 
+    fn dispatch_inspector_messages(&mut self) -> Result<(), Error> {
+        let Some(handle) = self.inspector_handle.get().cloned() else {
+            return Ok(());
+        };
+        let core = handle.core();
+        let evals = core.drain_idle_messages();
+        for req in evals {
+            if let PendingEvalRequest::Global {
+                session_id,
+                req_id,
+                expression,
+            } = req
+            {
+                let sid = core.register_script("", &expression);
+                let instrumented = instrument::instrument_js(sid, &expression);
+                let vm = self.vm.as_mut().expect("live vm");
+                let src_v = str_val(vm, &instrumented)?;
+                let eval_fn = vm.exports.dbg_eval_global.clone();
+                let res_v = call_js(vm, &self.terminated, &eval_fn, &[src_v])?;
+                let json_str = js_value_to_rust_string(&mut vm.store, &res_v)?;
+                let parsed: serde_json::Value = serde_json::from_str(&json_str)
+                    .unwrap_or_else(|_| serde_json::json!(["{\"type\":\"undefined\"}", null]));
+                let remote_json = parsed[0].as_str().unwrap_or("{\"type\":\"undefined\"}");
+                let exc_desc = parsed[1].as_str();
+                core.send_eval_response(session_id, req_id, remote_json, exc_desc);
+            }
+        }
+        Ok(())
+    }
+
     fn pump_microtasks(&mut self) -> Result<(), Error> {
         self.check_terminated()?;
         let vm = self.vm.as_mut().expect("live vm");
@@ -1240,10 +1382,7 @@ impl JsRuntime {
         SNAPSHOTS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                snap_id,
-                Arc::new(CompiledSnapshot { runtime, op_names }),
-            );
+            .insert(snap_id, Arc::new(CompiledSnapshot { runtime, op_names }));
 
         let mut blob = Vec::with_capacity(16);
         blob.extend_from_slice(SNAPSHOT_MAGIC);
@@ -1308,11 +1447,14 @@ fn instantiate_vm(
     let mut store_state = embedded
         .new_state(RealmBuilder::new().build(), StatePtr(Rc::as_ptr(state)))
         .map_err(|e| Error::new(format!("scriptw new_state failed: {e}")))?;
-    if max_heap_bytes > 0 {
-        *store_state.limits_mut() = wasmtime::StoreLimitsBuilder::new()
-            .memory_size(max_heap_bytes)
-            .build();
-    }
+    let heap_limit = if max_heap_bytes > 0 {
+        max_heap_bytes
+    } else {
+        usize::MAX
+    };
+    *store_state.limits_mut() = wasmtime::StoreLimitsBuilder::new()
+        .memory_size(heap_limit)
+        .build();
     let mut store = wasmtime::Store::new(engine, store_state);
     store.limiter(|s| s.limits_mut());
     let interrupt = store.interrupt_handle();
@@ -1339,7 +1481,9 @@ fn instantiate_vm(
         }
     }
 
-    let get_exp = |store: &mut wasmtime::Store<WasmStoreState>, name: &str| -> Result<ScriptwJsValue, Error> {
+    let get_exp = |store: &mut wasmtime::Store<WasmStoreState>,
+                   name: &str|
+     -> Result<ScriptwJsValue, Error> {
         match instance
             .get_export(store, name)
             .map_err(|e| Error::new(format!("get_export {name}: {e}")))?
@@ -1363,6 +1507,10 @@ fn instantiate_vm(
         set_internals: get_exp(&mut store, "__dd_set_internals")?,
         get_internals: get_exp(&mut store, "__dd_get_internals")?,
         set_allow_codegen: get_exp(&mut store, "__dd_set_allow_codegen")?,
+        set_inspector_enabled: get_exp(&mut store, "__dd_set_inspector_enabled")?,
+        dbg_eval_global: get_exp(&mut store, "__dd_dbg_eval_global")?,
+        wire_to_js: get_exp(&mut store, "__dd_wire_to_js")?,
+        js_to_wire: get_exp(&mut store, "__dd_js_to_wire")?,
         settle_async: get_exp(&mut store, "__dd_settle_async")?,
         take_unhandled_rejection: get_exp(&mut store, "__dd_take_unhandled_rejection")?,
         register_module: get_exp(&mut store, "__dd_register_module")?,
@@ -1415,11 +1563,14 @@ fn register_dd_foreigns(
     // 1. `dd.call_sync(op_id: f64, args_bytes: Bytes) -> Bytes`
     embedded
         .register_foreign(linker, "dd", "call_sync", |caller, args| {
-            let [ForeignValue::Number(op_id_f), ForeignValue::Bytes(arg_bytes)] = args.as_slice()
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::Bytes(arg_bytes),
+            ] = args.as_slice()
             else {
-                return Ok(ForeignValue::Bytes(encode_err_envelope(&OpError::type_error(
-                    "invalid call_sync arguments",
-                ))));
+                return Ok(ForeignValue::Bytes(encode_err_envelope(
+                    &OpError::type_error("invalid call_sync arguments"),
+                )));
             };
             let state_ptr = caller
                 .data()
@@ -1442,6 +1593,28 @@ fn register_dd_foreigns(
             };
             let result = match &op.kind {
                 OpKind::Sync(f) => f(&state.op_state, &decoded),
+                OpKind::RawBuffer(f) => {
+                    let is_buf = matches!(decoded.first(), Some(WireValue::I32(1)));
+                    let buf_bytes = if is_buf {
+                        match decoded.get(1) {
+                            Some(WireValue::Bytes(b)) => Some(b.clone()),
+                            _ => Some(Vec::new()),
+                        }
+                    } else {
+                        None
+                    };
+                    let mut raw = RawBuffer::from_bytes(buf_bytes);
+                    match f(&state.op_state, &mut raw) {
+                        Ok(ret) => {
+                            let wb = match raw.take_writeback() {
+                                Some(b) => WireValue::Bytes(b),
+                                None => WireValue::Null,
+                            };
+                            Ok(WireValue::Array(vec![ret, wb]))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
                 _ => Err(OpError::new(format!("op {} is not synchronous", op.name))),
             };
             let out = match result {
@@ -1455,11 +1628,14 @@ fn register_dd_foreigns(
     // 2. `dd.start_async(op_id: f64, args_bytes: Bytes) -> Bytes`
     embedded
         .register_foreign(linker, "dd", "start_async", |caller, args| {
-            let [ForeignValue::Number(op_id_f), ForeignValue::Bytes(arg_bytes)] = args.as_slice()
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::Bytes(arg_bytes),
+            ] = args.as_slice()
             else {
-                return Ok(ForeignValue::Bytes(encode_err_envelope(&OpError::type_error(
-                    "invalid start_async arguments",
-                ))));
+                return Ok(ForeignValue::Bytes(encode_err_envelope(
+                    &OpError::type_error("invalid start_async arguments"),
+                )));
             };
             let state_ptr = caller
                 .data()
@@ -1517,9 +1693,9 @@ fn register_dd_foreigns(
                 ForeignValue::StringUtf16(kind_u16),
             ] = args.as_slice()
             else {
-                return Ok(ForeignValue::Bytes(encode_err_envelope(&OpError::type_error(
-                    "invalid load_module arguments",
-                ))));
+                return Ok(ForeignValue::Bytes(encode_err_envelope(
+                    &OpError::type_error("invalid load_module arguments"),
+                )));
             };
             let state_ptr = caller
                 .data()
@@ -1540,6 +1716,7 @@ fn register_dd_foreigns(
                     .resolve(&specifier, &referrer)
                     .map_err(OpError::type_error)?;
                 let mut mods = state.modules.borrow_mut();
+                let insp = state.inspector.get().map(|h| h.core().as_ref());
                 let (root_id, newly_added) = modules::load_graph(
                     &mut mods,
                     state.loader.as_ref(),
@@ -1547,6 +1724,7 @@ fn register_dd_foreigns(
                     req_type,
                     None,
                     false,
+                    insp,
                 )
                 .map_err(|e| OpError::new(e.message().to_string()))?;
                 let mut wire_records = Vec::with_capacity(newly_added.len());
@@ -1573,9 +1751,9 @@ fn register_dd_foreigns(
         .register_foreign(linker, "dd", "wasm_op", |caller, args| {
             let [ForeignValue::Number(kind_f), ForeignValue::Bytes(payload)] = args.as_slice()
             else {
-                return Ok(ForeignValue::Bytes(encode_err_envelope(&OpError::type_error(
-                    "invalid wasm_op arguments",
-                ))));
+                return Ok(ForeignValue::Bytes(encode_err_envelope(
+                    &OpError::type_error("invalid wasm_op arguments"),
+                )));
             };
             let state_ptr = caller
                 .data()
@@ -1593,7 +1771,171 @@ fn register_dd_foreigns(
         })
         .map_err(|e| Error::new(format!("register_foreign wasm_op: {e}")))?;
 
+    // 5. `dd.inspector_op(kind: f64, payload: Bytes) -> Bytes`
+    embedded
+        .register_foreign(linker, "dd", "inspector_op", |caller, args| {
+            let [ForeignValue::Number(kind_f), ForeignValue::Bytes(payload)] = args.as_slice()
+            else {
+                return Ok(ForeignValue::Bytes(Vec::new()));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            let kind = *kind_f as u32;
+            if kind == 6 {
+                *state.last_wire_out.borrow_mut() = payload.clone();
+                return Ok(ForeignValue::Bytes(Vec::new()));
+            }
+            let Some(handle) = state.inspector.get() else {
+                return Ok(ForeignValue::Bytes(Vec::new()));
+            };
+            let core = handle.core();
+            match kind {
+                // 0: console API call
+                0 => {
+                    if let Ok(decoded) = decode_wire_args(payload, state.max_op_argument_bytes) {
+                        let cdp_type = match decoded.first() {
+                            Some(WireValue::String(s)) => s.as_str(),
+                            _ => "log",
+                        };
+                        let args_json = match decoded.get(1) {
+                            Some(WireValue::String(s)) => s.as_str(),
+                            _ => "[]",
+                        };
+                        let script_id = wire_to_u64(decoded.get(2));
+                        let url = match decoded.get(3) {
+                            Some(WireValue::String(s)) => s.as_str(),
+                            _ => "",
+                        };
+                        let line = wire_to_u64(decoded.get(4)) as u32;
+                        let col = wire_to_u64(decoded.get(5)) as u32;
+                        core.emit_console_api_called(
+                            cdp_type, args_json, script_id, url, line, col,
+                        );
+                    }
+                    Ok(ForeignValue::Bytes(Vec::new()))
+                }
+                // 1: fast statement/debugger check + enter pause loop if triggered
+                1 => {
+                    if core.is_terminated() {
+                        return Err(wasmtime::Error::msg("execution interrupted"));
+                    }
+                    if payload.len() < 16 {
+                        return Ok(ForeignValue::Bytes(Vec::new()));
+                    }
+                    let sid = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as u64;
+                    let line = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                    let col = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+                    let is_dbg = payload[12] != 0;
+                    let Some((reason, hit_bps)) = core.check_break(sid, line, is_dbg) else {
+                        return Ok(ForeignValue::Bytes(Vec::new()));
+                    };
+                    let _cf = core.emit_paused(sid, line, col, reason, &hit_bps);
+                    encode_pause_step(core.wait_pause_step())
+                }
+                // 2: submit eval response while paused + wait for next pause command
+                2 => {
+                    if let Ok(decoded) = decode_wire_args(payload, state.max_op_argument_bytes) {
+                        let session_id = wire_to_u64(decoded.first());
+                        let req_id_str = match decoded.get(1) {
+                            Some(WireValue::String(s)) => s.as_str(),
+                            _ => "null",
+                        };
+                        let req_id: serde_json::Value =
+                            serde_json::from_str(req_id_str).unwrap_or(serde_json::Value::Null);
+                        let remote_json = match decoded.get(2) {
+                            Some(WireValue::String(s)) => s.as_str(),
+                            _ => "{\"type\":\"undefined\"}",
+                        };
+                        let exc_desc = match decoded.get(3) {
+                            Some(WireValue::String(s)) => Some(s.as_str()),
+                            _ => None,
+                        };
+                        core.send_eval_response(session_id, req_id, remote_json, exc_desc);
+                    }
+                    encode_pause_step(core.wait_pause_step())
+                }
+                // 3: instrument expression for nested Runtime.evaluate
+                3 => {
+                    let expr = decode_wire_args(payload, state.max_op_argument_bytes)
+                        .ok()
+                        .and_then(|mut a| match a.drain(..).next() {
+                            Some(WireValue::String(s)) => Some(s),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let sid = core.register_script("", &expr);
+                    let inst = instrument::instrument_js(sid, &expr);
+                    Ok(ForeignValue::Bytes(encode_ok_envelope(&WireValue::String(
+                        inst,
+                    ))))
+                }
+                // 4: check whether any DevTools session is attached
+                4 => Ok(ForeignValue::Bytes(vec![u8::from(core.has_sessions())])),
+                // 5: lookup script URL by scriptId
+                5 => {
+                    let sid = decode_wire_args(payload, state.max_op_argument_bytes)
+                        .ok()
+                        .map(|a| wire_to_u64(a.first()))
+                        .unwrap_or(0);
+                    let url = core.script_url(sid);
+                    Ok(ForeignValue::Bytes(encode_ok_envelope(&WireValue::String(
+                        url,
+                    ))))
+                }
+                _ => Ok(ForeignValue::Bytes(Vec::new())),
+            }
+        })
+        .map_err(|e| Error::new(format!("register_foreign inspector_op: {e}")))?;
+
     Ok(())
+}
+
+fn wire_to_u64(v: Option<&WireValue>) -> u64 {
+    match v {
+        Some(WireValue::I32(n)) => (*n).max(0) as u64,
+        Some(WireValue::F64(f)) if f.is_finite() && *f >= 0.0 => *f as u64,
+        _ => 0,
+    }
+}
+
+fn encode_pause_step(step: PauseStep) -> wasmtime::Result<ForeignValue> {
+    match step {
+        PauseStep::Resume => Ok(ForeignValue::Bytes(encode_ok_envelope(&WireValue::Array(
+            vec![WireValue::I32(1)],
+        )))),
+        PauseStep::Terminate => Err(wasmtime::Error::msg("execution interrupted")),
+        PauseStep::Eval(PendingEvalRequest::CallFrame {
+            session_id,
+            req_id,
+            expression,
+        }) => Ok(ForeignValue::Bytes(encode_ok_envelope(&WireValue::Array(
+            vec![
+                WireValue::I32(2),
+                WireValue::Bool(true),
+                WireValue::F64(session_id as f64),
+                WireValue::String(req_id.to_string()),
+                WireValue::String(expression),
+            ],
+        )))),
+        PauseStep::Eval(PendingEvalRequest::Global {
+            session_id,
+            req_id,
+            expression,
+        }) => Ok(ForeignValue::Bytes(encode_ok_envelope(&WireValue::Array(
+            vec![
+                WireValue::I32(2),
+                WireValue::Bool(false),
+                WireValue::F64(session_id as f64),
+                WireValue::String(req_id.to_string()),
+                WireValue::String(expression),
+            ],
+        )))),
+    }
 }
 
 fn str_val(vm: &mut LiveVm, s: &str) -> Result<ScriptwJsValue, Error> {
@@ -1609,9 +1951,7 @@ fn js_value_to_rust_string(
     store: &mut wasmtime::Store<WasmStoreState>,
     val: &ScriptwJsValue,
 ) -> Result<String, Error> {
-    let units = val
-        .to_utf16(store)
-        .map_err(|e| Error::new(e.to_string()))?;
+    let units = val.to_utf16(store).map_err(|e| Error::new(e.to_string()))?;
     Ok(String::from_utf16_lossy(&units))
 }
 
@@ -1623,7 +1963,12 @@ fn make_js_array(
     let arr = call_js(vm, terminated, &vm.exports.make_array.clone(), &[])?;
     for a in args {
         let live = a.as_live()?.clone();
-        let _ = call_js(vm, terminated, &vm.exports.push_array.clone(), &[arr.clone(), live])?;
+        let _ = call_js(
+            vm,
+            terminated,
+            &vm.exports.push_array.clone(),
+            &[arr.clone(), live],
+        )?;
     }
     Ok(arr)
 }

@@ -4,8 +4,11 @@
 
 #![allow(dead_code)]
 
-use dd_v8::{JsBuffer, JsRuntime, JsValue, OpDecl, OpState, RuntimeOptions, ToJsBuffer};
-use dd_v8::{op_async, op_sync};
+use dd_v8::builtins::{buffer_bytes, with_buffer_mut, write_u32s};
+use dd_v8::{
+    JsBuffer, JsRuntime, JsValue, OpDecl, OpError, OpState, RawBuffer, RuntimeOptions, ToJsBuffer,
+};
+use dd_v8::{op_async, op_raw, op_sync};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -111,6 +114,28 @@ fn op_big_numbers(_state: &mut OpState) -> (u64, u64, i64, i64, u64) {
     ((1 << 53) - 1, 1 << 53, i64::MIN, i64::MAX, u64::MAX)
 }
 
+fn op_raw_copy(_state: &mut OpState, buf: &mut RawBuffer) -> Result<ToJsBuffer, OpError> {
+    buffer_bytes(buf)
+        .map(ToJsBuffer::from)
+        .ok_or_else(|| OpError::type_error("not a buffer"))
+}
+
+fn op_raw_fill(_state: &mut OpState, buf: &mut RawBuffer) -> Result<f64, OpError> {
+    with_buffer_mut(buf, |bytes| {
+        bytes.fill(0xab);
+        bytes.len() as f64
+    })
+    .ok_or_else(|| OpError::type_error("not a buffer"))
+}
+
+fn op_raw_write_u32s(_state: &mut OpState, buf: &mut RawBuffer) -> Result<bool, OpError> {
+    if write_u32s(buf, &[0x0403_0201; 1024]) {
+        Ok(true)
+    } else {
+        Err(OpError::type_error("not a buffer"))
+    }
+}
+
 pub fn test_ops() -> Vec<OpDecl> {
     vec![
         op_sync!(op_echo_bytes),
@@ -133,6 +158,9 @@ pub fn test_ops() -> Vec<OpDecl> {
         op_sync!(op_shape),
         op_sync!(op_command),
         op_sync!(op_big_numbers),
+        op_raw!(op_raw_copy),
+        op_raw!(op_raw_fill),
+        op_raw!(op_raw_write_u32s),
     ]
 }
 

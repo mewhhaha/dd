@@ -10,12 +10,12 @@ boa_ast = { version = "0.21.1", features = ["annex-b"] }
 boa_interner = "0.21.1"
 boa_parser = { version = "0.21.1", features = ["annex-b"] }
 futures-util.workspace = true
-scriptw-engine = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/crates/scriptw-engine" }
-scriptw-ir = { path = "/home/mewhhaha/src/scriptw/.worktrees/wtime-aot/crates/scriptw-ir" }
+scriptw-engine = { git = "https://github.com/mewhhaha/scriptw.git", branch = "feat/wtime-aot" }
+scriptw-ir = { git = "https://github.com/mewhhaha/scriptw.git", branch = "feat/wtime-aot" }
 serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true }
-wasmtime = { package = "wtime-aot-host", path = "/home/mewhhaha/src/wtime/tools/wtime-aot/host" }
-wtime-runtime = { path = "/home/mewhhaha/src/wtime/crates/wtime-runtime" }
+wasmtime = { package = "wtime-aot-host", git = "https://github.com/mewhhaha/wtime.git", branch = "feat/aarch64-store-ci" }
+wtime-runtime = { git = "https://github.com/mewhhaha/wtime.git", branch = "feat/aarch64-store-ci" }
 
 [dev-dependencies]
-serde_json.workspace = true

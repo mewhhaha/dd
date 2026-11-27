@@ -532,7 +532,10 @@ fn heap_limit_terminates_execution() {
             "const keep = []; for (;;) keep.push(new Array(1e5).fill(1));",
         )
         .expect_err("terminated");
-    assert!(error.is_terminated() || !error.to_string().is_empty(), "{error}");
+    assert!(
+        error.is_terminated() || !error.to_string().is_empty(),
+        "{error}"
+    );
 }
 
 #[test]

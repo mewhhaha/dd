@@ -192,10 +192,7 @@ pub fn op_crypto_base64url_encode(_state: &mut OpState, data: JsBuffer) -> Strin
 
 /// `op_crypto_get_random_values(len)`: returns `len` random bytes (copied into
 /// the caller's TypedArray by the JS wrapper).
-fn op_crypto_get_random_values(
-    _state: &mut OpState,
-    len: u32,
-) -> Result<ToJsBuffer, CryptoError> {
+fn op_crypto_get_random_values(_state: &mut OpState, len: u32) -> Result<ToJsBuffer, CryptoError> {
     let len = len as usize;
     if len > 65536 {
         return Err(CryptoError::ArrayBufferViewLengthExceeded(len));

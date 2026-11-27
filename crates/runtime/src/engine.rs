@@ -452,9 +452,9 @@ fn cached_entrypoint(
 }
 
 fn internal_function(runtime: &mut JsRuntime, dd: &JsValue, name: &str) -> Result<JsValue> {
-    let value = runtime
-        .get_property(dd, name)
-        .map_err(|_| PlatformError::runtime(format!("runtime entrypoint {name} is not a function")))?;
+    let value = runtime.get_property(dd, name).map_err(|_| {
+        PlatformError::runtime(format!("runtime entrypoint {name} is not a function"))
+    })?;
     if value.is_undefined() {
         return Err(PlatformError::runtime(format!(
             "runtime entrypoint {name} is not a function"

@@ -1,6 +1,6 @@
 // dd_v8 host kernel — runs natively on Scriptw + wtime x64 AOT.
 // Everything stays in module-private lexical scope (zero globalThis pollution).
-import { call_sync, start_async, load_module, wasm_op } from "dd:host";
+import { call_sync, start_async, load_module, wasm_op, inspector_op } from "dd:host";
 
 // ---- Capture genuine primordials before any user/bootstrap code runs ----
 const _globalThis = globalThis;
@@ -109,12 +109,142 @@ const _GeneratorFunction = _ObjectGetPrototypeOf(function* () {}).constructor;
 const _AsyncGeneratorFunction = _ObjectGetPrototypeOf(async function* () {}).constructor;
 const _eval = eval;
 const _JSONParse = JSON.parse;
+const _JSONStringify = JSON.stringify;
 const _Promise = Promise;
 const _PromiseResolve = _FunctionBind.call(Promise.resolve, Promise);
 const _PromiseReject = _FunctionBind.call(Promise.reject, Promise);
 const _PromiseThen = Promise.prototype.then;
 const _Proxy = Proxy;
 const _ProxyRevocable = Proxy.revocable;
+
+// ---- DevTools Inspector state (inert until enable_inspector() is called) ----
+let _dbgEnabled = false;
+let _dbgInEval = false;
+let _dbgLoc = { scriptId: 0, url: "", line: 0, col: 0 };
+let _dbgTicks = 0;
+let _dbgLastSid = -1;
+let _dbgLastLine = -1;
+const _dbgUrls = new _Map();
+const _dbgEmptyBytes = new _Uint8Array(0);
+const _dbgCheckBuf = new _Uint8Array(16);
+
+function _dbgGetUrl(sid) {
+  if (!sid) return "";
+  let url = _call(_MapGet, _dbgUrls, sid);
+  if (url !== undefined) return url;
+  const env = _decodeEnvelope(inspector_op(5, _encodeWireArgs([sid])));
+  url = env.ok && typeof env.value === "string" ? env.value : "";
+  _call(_MapSet, _dbgUrls, sid, url);
+  return url;
+}
+
+function _toRemoteObject(v) {
+  if (v === undefined) return { type: "undefined" };
+  if (v === null) return { type: "object", subtype: "null", value: null };
+  const t = typeof v;
+  if (t === "boolean") return { type: "boolean", value: v };
+  if (t === "string") return { type: "string", value: v };
+  if (t === "number") {
+    if (v !== v) return { type: "number", unserializableValue: "NaN", description: "NaN" };
+    if (v === Infinity) return { type: "number", unserializableValue: "Infinity", description: "Infinity" };
+    if (v === -Infinity) return { type: "number", unserializableValue: "-Infinity", description: "-Infinity" };
+    if (v === 0 && 1 / v < 0) return { type: "number", unserializableValue: "-0", description: "-0" };
+    return { type: "number", value: v, description: _String(v) };
+  }
+  if (t === "bigint") {
+    const d = `${_call(_BigIntToString, v)}n`;
+    return { type: "bigint", unserializableValue: d, description: d };
+  }
+  if (t === "symbol") return { type: "symbol", description: _String(v) };
+  if (t === "function") return { type: "function", className: "Function", description: _String(v) };
+  try {
+    if (_ArrayIsArray(v)) {
+      return { type: "object", subtype: "array", className: "Array", description: `Array(${v.length})` };
+    }
+    if (_isError(v)) {
+      const cname = typeof v.name === "string" && v.name ? v.name : "Error";
+      return { type: "object", subtype: "error", className: cname, description: _describeException(v) };
+    }
+  } catch {}
+  return { type: "object", className: "Object", description: "Object" };
+}
+
+function _inspectorConsoleCall(cdpType, args) {
+  if (!_dbgEnabled) return;
+  const remotes = new _Array(args.length);
+  for (let i = 0; i < args.length; i++) remotes[i] = _toRemoteObject(args[i]);
+  const argsJson = _JSONStringify(remotes);
+  inspector_op(
+    0,
+    _encodeWireArgs([cdpType, argsJson, _dbgLoc.scriptId, _dbgLoc.url, _dbgLoc.line, _dbgLoc.col]),
+  );
+}
+
+function _dbgEvalCommand(cmd, evalInFrame) {
+  // cmd = [2, isCallFrame, sessionId, reqIdJson, expression]
+  const isCallFrame = !!cmd[1];
+  const sessionId = cmd[2];
+  const reqIdJson = cmd[3];
+  const expr = cmd[4];
+  let remoteJson = "{\"type\":\"undefined\"}";
+  let excDesc = null;
+  const prevInEval = _dbgInEval;
+  const prevGlobalEval = _globalThis.eval;
+  _dbgInEval = true;
+  // Temporarily restore intrinsic `%eval%` so `(__e) => eval(__e)` performs a
+  // true direct eval inside the paused frame's lexical environment.
+  _globalThis.eval = _eval;
+  try {
+    let val;
+    if (isCallFrame && typeof evalInFrame === "function") {
+      val = evalInFrame(expr);
+    } else {
+      const instEnv = _decodeEnvelope(inspector_op(3, _encodeWireArgs([expr])));
+      const src = instEnv.ok && typeof instEnv.value === "string" ? instEnv.value : expr;
+      val = _eval(src);
+    }
+    remoteJson = _JSONStringify(_toRemoteObject(val));
+  } catch (err) {
+    excDesc = _describeException(err);
+    remoteJson = _JSONStringify(_toRemoteObject(err));
+  } finally {
+    _globalThis.eval = prevGlobalEval;
+    _dbgInEval = prevInEval;
+  }
+  return _decodeEnvelope(
+    inspector_op(2, _encodeWireArgs([sessionId, reqIdJson, remoteJson, excDesc])),
+  );
+}
+
+function _dbgCheck(sid, line, col, isDbg, evalInFrame) {
+  if (!_dbgEnabled) return;
+  _dbgLoc.scriptId = sid;
+  _dbgLoc.url = _dbgGetUrl(sid);
+  _dbgLoc.line = line;
+  _dbgLoc.col = col;
+  if (!isDbg && sid === _dbgLastSid && line === _dbgLastLine && ((++_dbgTicks & 63) !== 0)) {
+    return;
+  }
+  _dbgLastSid = sid;
+  _dbgLastLine = line;
+  const b = _dbgCheckBuf;
+  b[0] = sid & 0xff; b[1] = (sid >>> 8) & 0xff; b[2] = (sid >>> 16) & 0xff; b[3] = (sid >>> 24) & 0xff;
+  b[4] = line & 0xff; b[5] = (line >>> 8) & 0xff; b[6] = (line >>> 16) & 0xff; b[7] = (line >>> 24) & 0xff;
+  b[8] = col & 0xff; b[9] = (col >>> 8) & 0xff; b[10] = (col >>> 16) & 0xff; b[11] = (col >>> 24) & 0xff;
+  b[12] = isDbg ? 1 : 0; b[13] = 0; b[14] = 0; b[15] = 0;
+  const resp = inspector_op(1, b);
+  if (!resp || resp.length === 0) return;
+  let env = _decodeEnvelope(resp);
+  while (env.ok && _ArrayIsArray(env.value)) {
+    const kind = env.value[0];
+    if (kind === 1) break; // Resume
+    if (kind === 2) {
+      env = _dbgEvalCommand(env.value, evalInFrame);
+      continue;
+    }
+    break;
+  }
+}
 
 // Provide V8's Error.captureStackTrace when absent (expected by dd's bootstrap primordials).
 if (typeof _Error.captureStackTrace !== "function") {
@@ -126,7 +256,10 @@ if (typeof _Error.captureStackTrace !== "function") {
       if (!_ObjectHasOwn(target, "stack")) {
         const name = typeof target.name === "string" && target.name.length > 0 ? target.name : "Error";
         const msg = typeof target.message === "string" && target.message.length > 0 ? target.message : "";
-        const stack = msg.length > 0 ? `${name}: ${msg}` : name;
+        let stack = msg.length > 0 ? `${name}: ${msg}` : name;
+        if (_dbgLoc.url) {
+          stack += `\n    at ${_dbgLoc.url}:${_dbgLoc.line + 1}:${_dbgLoc.col + 1}`;
+        }
         _ObjectDefineProperty(target, "stack", {
           value: stack,
           writable: true,
@@ -141,15 +274,16 @@ if (typeof _Error.captureStackTrace !== "function") {
   });
 }
 
-// Ensure a silent base console exists before dd's bootstrap.js binds it.
+// Ensure a base inspector-backed console exists before dd's bootstrap.js binds it.
 if (typeof _globalThis.console !== "object" || _globalThis.console === null) {
-  const noop = () => {};
+  const mk = (cdpType) => function (...args) { _inspectorConsoleCall(cdpType, args); };
   _globalThis.console = {
-    log: noop, info: noop, warn: noop, error: noop, debug: noop,
-    trace: noop, dir: noop, dirxml: noop, table: noop, count: noop,
-    countReset: noop, group: noop, groupCollapsed: noop, groupEnd: noop,
-    clear: noop, time: noop, timeLog: noop, timeEnd: noop, assert: noop,
-    profile: noop, profileEnd: noop, timeStamp: noop,
+    log: mk("log"), info: mk("info"), warn: mk("warning"), error: mk("error"), debug: mk("debug"),
+    trace: mk("trace"), dir: mk("dir"), dirxml: mk("dirxml"), table: mk("table"), count: mk("count"),
+    countReset: mk("countReset"), group: mk("startGroup"), groupCollapsed: mk("startGroupCollapsed"),
+    groupEnd: mk("endGroup"), clear: mk("clear"), time: mk("time"), timeLog: mk("timeLog"),
+    timeEnd: mk("timeEnd"), assert: mk("assert"), profile: mk("profile"), profileEnd: mk("profileEnd"),
+    timeStamp: mk("timeStamp"),
   };
 }
 
@@ -188,7 +322,7 @@ let _asyncContextFn = null;
 // ---- Code generation gate (eval / Function) ----
 let _allowCodeGen = true;
 function _checkCodeGen() {
-  if (!_allowCodeGen) {
+  if (!_allowCodeGen && !_dbgInEval) {
     throw new _EvalError("Code generation from strings disallowed for this context");
   }
 }
@@ -305,22 +439,19 @@ function _isBoxedPrimitive(v) {
     _isBigIntObject(v) || _isSymbolObject(v);
 }
 
-// Safely extract bytes from an ArrayBuffer or ArrayBufferView (tamper-resistant,
-// handles detached & out-of-bounds resizable buffers as empty Uint8Array).
-function _bufferBytes(v) {
+// Safely extract backing buffer + view range from an ArrayBuffer or ArrayBufferView
+// (tamper-resistant, rejects Proxies and bare SharedArrayBuffer, treats detached &
+// out-of-bounds resizable views as 0-length).
+function _bufferViewParts(v) {
   if (_isProxy(v)) return null;
   if (_isTypedArray(v)) {
     try {
       const buf = _call(_TAGetBuffer, v);
       const off = _call(_TAGetByteOffset, v);
       const len = _call(_TAGetByteLength, v);
-      if (len === 0) return new _Uint8Array(0);
-      const view = new _Uint8Array(buf, off, len);
-      const out = new _Uint8Array(len);
-      _call(_TASet, out, view);
-      return out;
+      return { buf, off, len };
     } catch {
-      return new _Uint8Array(0);
+      return { buf: null, off: 0, len: 0 };
     }
   }
   if (_isDataView(v)) {
@@ -328,28 +459,34 @@ function _bufferBytes(v) {
       const buf = _call(_DVGetBuffer, v);
       const off = _call(_DVGetByteOffset, v);
       const len = _call(_DVGetByteLength, v);
-      if (len === 0) return new _Uint8Array(0);
-      const view = new _Uint8Array(buf, off, len);
-      const out = new _Uint8Array(len);
-      _call(_TASet, out, view);
-      return out;
+      return { buf, off, len };
     } catch {
-      return new _Uint8Array(0);
+      return { buf: null, off: 0, len: 0 };
     }
   }
   if (_isArrayBuffer(v)) {
     try {
       const len = _call(_ABGetByteLength, v);
-      if (len === 0) return new _Uint8Array(0);
-      const view = new _Uint8Array(v, 0, len);
-      const out = new _Uint8Array(len);
-      _call(_TASet, out, view);
-      return out;
+      return { buf: v, off: 0, len };
     } catch {
-      return new _Uint8Array(0);
+      return { buf: null, off: 0, len: 0 };
     }
   }
   return null;
+}
+
+function _bufferBytes(v) {
+  const parts = _bufferViewParts(v);
+  if (parts === null) return null;
+  if (parts.len === 0 || !parts.buf) return new _Uint8Array(0);
+  try {
+    const view = new _Uint8Array(parts.buf, parts.off, parts.len);
+    const out = new _Uint8Array(parts.len);
+    _call(_TASet, out, view);
+    return out;
+  } catch {
+    return new _Uint8Array(0);
+  }
 }
 
 // ---- UTF-8 codec (handles lone surrogates -> U+FFFD cleanly, immune to sabotaged builtins) ----
@@ -392,6 +529,11 @@ function _utf8Encode(str) {
 function _utf8Decode(bytes, stripBom) {
   let i = 0;
   const len = bytes.length;
+  // Match V8's maximum string length (0x1fffffe8 UTF-16 code units) so multi-GiB
+  // views fail fast with RangeError instead of exhausting memory.
+  if (len > 0x1fffffe8) {
+    throw new _RangeError("Invalid string length");
+  }
   if (stripBom && len >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
     i = 3;
   }
@@ -566,9 +708,15 @@ class _WireBuf {
       throw new _TypeError("op argument is too large");
     }
     if (this.pos + n > this.buf.length) {
-      let cap = this.buf.length * 2;
-      while (cap < this.pos + n) cap *= 2;
-      if (cap > this.budget) cap = this.budget;
+      const needed = this.pos + n;
+      let cap;
+      if (needed > 64 * 1024 * 1024) {
+        cap = _MathMin(this.budget, needed + 4096);
+      } else {
+        cap = this.buf.length * 2;
+        while (cap < needed) cap *= 2;
+        if (cap > this.budget) cap = this.budget;
+      }
       const next = new _Uint8Array(cap);
       _call(_TASet, next, _call(_TASubarray, this.buf, 0, this.pos));
       this.buf = next;
@@ -1882,12 +2030,12 @@ const _BUILTIN_OPS = {
     _wasmStreamingHandler = handler;
   },
   op_wasm_streaming_feed(id, chunk) {
-    const rec = _call(_MapGet, _wasmStreams, id);
-    if (!rec) return;
     const bytes = _bufferBytes(chunk);
     if (bytes === null) {
       throw new _TypeError("WebAssembly streaming chunk must be an ArrayBuffer or ArrayBufferView");
     }
+    const rec = _call(_MapGet, _wasmStreams, id);
+    if (!rec) return;
     if (bytes.length > 0) {
       rec.chunks[rec.chunks.length] = bytes;
       rec.total += bytes.length;
@@ -1924,6 +2072,12 @@ const _BUILTIN_OPS = {
   op_call_console: (_inspectorMethod, method, ...args) => {
     if (typeof _inspectorMethod !== "function" || typeof method !== "function") {
       throw new _TypeError("op_call_console needs two functions");
+    }
+    if (_dbgEnabled) {
+      const st = inspector_op(4, _dbgEmptyBytes);
+      if (st && st.length > 0 && st[0] === 1) {
+        _ReflectApply(_inspectorMethod, undefined, args);
+      }
     }
     return _ReflectApply(method, undefined, args);
   },
@@ -2035,6 +2189,39 @@ function _makeAsyncOp(opId, name) {
   return fn;
 }
 
+function _makeRawBufferOp(opId, name) {
+  const fn = function (arg) {
+    const parts = _bufferViewParts(arg);
+    let envBytes;
+    if (parts === null) {
+      envBytes = call_sync(opId, _encodeWireArgs([0]));
+    } else if (parts.len === 0 || !parts.buf) {
+      envBytes = call_sync(opId, _encodeWireArgs([1, new _Uint8Array(0)]));
+    } else {
+      let view;
+      try {
+        view = new _Uint8Array(parts.buf, parts.off, parts.len);
+      } catch {
+        view = new _Uint8Array(0);
+      }
+      envBytes = call_sync(opId, _encodeWireArgs([1, view]));
+    }
+    const env = _decodeEnvelope(envBytes);
+    if (!env.ok) throw env.error;
+    const retVal = env.value[0];
+    const writeback = env.value[1];
+    if (writeback !== null && writeback !== undefined && parts && parts.buf && parts.len > 0) {
+      try {
+        const dest = new _Uint8Array(parts.buf, parts.off, parts.len);
+        _call(_TASet, dest, writeback);
+      } catch {}
+    }
+    return retVal;
+  };
+  _ObjectDefineProperty(fn, "name", { value: name, configurable: true });
+  return fn;
+}
+
 export function __dd_init_ops(opSpecsJson, maxArgBytes, asyncContextFn) {
   if (typeof asyncContextFn === "function") _asyncContextFn = asyncContextFn;
   if (maxArgBytes > 0) _maxOpArgBytes = maxArgBytes;
@@ -2044,19 +2231,60 @@ export function __dd_init_ops(opSpecsJson, maxArgBytes, asyncContextFn) {
     const spec = specs[i];
     const name = spec[0];
     const kind = spec[1];
-    // kind: 0 = sync, 1 = async, 2 = builtin_js
+    // kind: 0 = sync, 1 = async, 2 = builtin_js, 3 = raw_buffer
     if (kind === 2) {
       const b = _BUILTIN_OPS[name];
       if (!b) throw new _Error(`missing JS builtin op: ${name}`);
       obj[name] = b;
     } else if (kind === 1) {
       obj[name] = _makeAsyncOp(i, name);
+    } else if (kind === 3) {
+      obj[name] = _makeRawBufferOp(i, name);
     } else {
       obj[name] = _makeSyncOp(i, name);
     }
   }
   _opsObject = obj;
   return obj;
+}
+
+export function __dd_set_inspector_enabled(enabled) {
+  _dbgEnabled = !!enabled;
+  if (_dbgEnabled) {
+    const def = (k, v) => _ObjectDefineProperty(_globalThis, k, {
+      value: v, writable: false, enumerable: false, configurable: true,
+    });
+    def("__dd_dbg_s", (sid, line, col, ev) => _dbgCheck(sid, line, col, false, ev));
+    def("__dd_dbg_d", (sid, line, col, ev) => _dbgCheck(sid, line, col, true, ev));
+    def("__dd_dbg_l", (sid, line, col, ev) => _dbgCheck(sid, line, col, false, ev));
+  }
+}
+
+export function __dd_dbg_eval_global(instrumentedSource) {
+  let remoteJson = "{\"type\":\"undefined\"}";
+  let excDesc = null;
+  const prev = _dbgInEval;
+  _dbgInEval = true;
+  try {
+    const val = _eval(instrumentedSource);
+    remoteJson = _JSONStringify(_toRemoteObject(val));
+  } catch (err) {
+    excDesc = _describeException(err);
+    remoteJson = _JSONStringify(_toRemoteObject(err));
+  } finally {
+    _dbgInEval = prev;
+  }
+  return _JSONStringify([remoteJson, excDesc]);
+}
+
+export function __dd_wire_to_js(bytes) {
+  const env = _decodeEnvelope(bytes);
+  if (!env.ok) throw env.error;
+  return env.value;
+}
+
+export function __dd_js_to_wire(val) {
+  inspector_op(6, _encodeWireArgs([val]));
 }
 
 export function __dd_get_ops() { return _opsObject; }

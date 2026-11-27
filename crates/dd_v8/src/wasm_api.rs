@@ -160,7 +160,11 @@ impl WasmHostState {
             };
             match rec.exports.get(name) {
                 Some(External::Func(f)) => *f,
-                _ => return Err(OpError::type_error(format!("export {name} is not a function"))),
+                _ => {
+                    return Err(OpError::type_error(format!(
+                        "export {name} is not a function"
+                    )));
+                }
             }
         };
         let func_ty = match self
@@ -184,7 +188,9 @@ impl WasmHostState {
             RunOutcome::Returned(mut vals) => match vals.len() {
                 0 => Ok(WireValue::Undefined),
                 1 => Ok(wasm_to_wire(vals.remove(0))),
-                _ => Ok(WireValue::Array(vals.into_iter().map(wasm_to_wire).collect())),
+                _ => Ok(WireValue::Array(
+                    vals.into_iter().map(wasm_to_wire).collect(),
+                )),
             },
             other => Err(OpError::custom(
                 "WebAssemblyRuntimeError",
@@ -206,7 +212,9 @@ impl WasmHostState {
             return Err(OpError::type_error("unknown WebAssembly.Instance handle"));
         };
         let Some(External::Global(g)) = rec.exports.get(name) else {
-            return Err(OpError::type_error(format!("export {name} is not a global")));
+            return Err(OpError::type_error(format!(
+                "export {name} is not a global"
+            )));
         };
         let v = self
             .store
@@ -238,7 +246,9 @@ impl WasmHostState {
             return Err(OpError::type_error("unknown WebAssembly.Instance handle"));
         };
         let Some(External::Memory(m)) = rec.exports.get(name) else {
-            return Err(OpError::type_error(format!("export {name} is not a memory")));
+            return Err(OpError::type_error(format!(
+                "export {name} is not a memory"
+            )));
         };
         let bytes = self
             .store
@@ -252,7 +262,13 @@ fn wire_to_f64(v: &WireValue) -> f64 {
     match v {
         WireValue::Undefined => f64::NAN,
         WireValue::Null => 0.0,
-        WireValue::Bool(b) => if *b { 1.0 } else { 0.0 },
+        WireValue::Bool(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
         WireValue::I32(n) => f64::from(*n),
         WireValue::F64(n) => *n,
         WireValue::String(s) => s.trim().parse::<f64>().unwrap_or(f64::NAN),

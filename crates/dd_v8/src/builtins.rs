@@ -4,12 +4,39 @@
 //! JS-level inspection, text coding, structured cloning, async-context,
 //! error-builder, and microtask ops are bound directly inside `kernel.mjs`.
 
-use crate::{OpDecl, OpState, op_async, op_sync};
+use crate::{OpDecl, OpState, RawBuffer, op_async, op_sync};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+/// Copies the bytes of a JavaScript `ArrayBuffer` or `ArrayBufferView`
+/// handed to an [`crate::op_raw!`] handler; returns `None` for non-buffers.
+pub fn buffer_bytes(buf: &RawBuffer) -> Option<Vec<u8>> {
+    buf.bytes().map(|slice| slice.to_vec())
+}
+
+/// Runs `f` on the mutable byte slice of an `ArrayBuffer` or `ArrayBufferView`
+/// handed to an [`crate::op_raw!`] handler; writes are committed strictly inside
+/// the view's range. Returns `None` for non-buffers.
+pub fn with_buffer_mut<R>(buf: &mut RawBuffer, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+    buf.bytes_mut().map(f)
+}
+
+/// Writes as many native-endian `u32` words from `values` as fit wholly inside
+/// the buffer view; leaves trailing partial bytes (< 4 bytes) and all bytes
+/// outside the view untouched. Returns `false` for non-buffers.
+pub fn write_u32s(buf: &mut RawBuffer, values: &[u32]) -> bool {
+    let Some(bytes) = buf.bytes_mut() else {
+        return false;
+    };
+    let count = values.len().min(bytes.len() / 4);
+    for (i, &word) in values.iter().take(count).enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+    }
+    true
+}
 
 /// The symbol objects use to describe how to clone themselves.
 pub const HOST_OBJECT_BRAND: &str = "dd.hostObject";

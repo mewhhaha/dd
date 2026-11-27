@@ -1,16 +1,16 @@
-//! Shared harness for the dd_v8 fuzz targets: one runtime per process (V8
-//! initializes once per process and isolates are expensive), the builtin
-//! ops plus typed ops that read buffers and serde values, and a JavaScript
-//! driver that turns fuzz input into values and op calls.
+//! Shared harness for the dd_v8 fuzz targets: one runtime per process, the
+//! builtin ops plus typed and raw-buffer ops, and a JavaScript driver that
+//! turns fuzz input into values and op calls.
 //!
 //! The driver catches everything an op throws and checks it is an `Error`;
 //! copies and in-place writes are checked against a reference computed in
 //! JavaScript. A broken check comes back as a string starting with `BUG:`,
-//! and [`Harness::call`] panics on it so libFuzzer records the input. Any
-//! crash, abort or sanitizer report is a finding too.
+//! and [`Harness::call`] panics on it so libFuzzer records the input.
 
 use dd_v8::builtins::{buffer_bytes, with_buffer_mut, write_u32s};
-use dd_v8::{JsBuffer, JsRuntime, OpDecl, OpState, RuntimeOptions, ToJsBuffer, v8};
+use dd_v8::{
+    JsBuffer, JsRuntime, JsValue, OpDecl, OpError, OpState, RawBuffer, RuntimeOptions, ToJsBuffer,
+};
 use dd_v8::{op_raw, op_sync};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -65,47 +65,25 @@ fn op_command(_state: &mut OpState, command: Command) -> Command {
     command
 }
 
-fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
-    let message = v8::String::new(scope, message).expect("short message");
-    let exception = v8::Exception::type_error(scope, message);
-    scope.throw_exception(exception);
+fn op_raw_copy(_state: &mut OpState, buf: &mut RawBuffer) -> Result<ToJsBuffer, OpError> {
+    buffer_bytes(buf)
+        .map(ToJsBuffer::from)
+        .ok_or_else(|| OpError::type_error("not a buffer"))
 }
 
-fn op_raw_copy<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    match buffer_bytes(args.get(0)) {
-        Some(bytes) => rv.set(dd_v8::serde_v8::uint8_array(scope, bytes).into()),
-        None => throw_type_error(scope, "not a buffer"),
-    }
-}
-
-fn op_raw_fill<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    let filled = with_buffer_mut(args.get(0), |bytes| {
+fn op_raw_fill(_state: &mut OpState, buf: &mut RawBuffer) -> Result<f64, OpError> {
+    with_buffer_mut(buf, |bytes| {
         bytes.fill(0xab);
-        bytes.len()
-    });
-    match filled {
-        Some(length) => rv.set_double(length as f64),
-        None => throw_type_error(scope, "not a buffer"),
-    }
+        bytes.len() as f64
+    })
+    .ok_or_else(|| OpError::type_error("not a buffer"))
 }
 
-fn op_raw_write_u32s<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    rv: &mut v8::ReturnValue<'s, v8::Value>,
-) {
-    if write_u32s(args.get(0), &[0x0403_0201; 1024]) {
-        rv.set_bool(true);
+fn op_raw_write_u32s(_state: &mut OpState, buf: &mut RawBuffer) -> Result<bool, OpError> {
+    if write_u32s(buf, &[0x0403_0201; 1024]) {
+        Ok(true)
     } else {
-        throw_type_error(scope, "not a buffer");
+        Err(OpError::type_error("not a buffer"))
     }
 }
 
@@ -143,9 +121,9 @@ pub enum Entry {
 
 pub struct Harness {
     runtime: JsRuntime,
-    deserialize: v8::Global<v8::Function>,
-    program: v8::Global<v8::Function>,
-    clone: v8::Global<v8::Function>,
+    deserialize: JsValue,
+    program: JsValue,
+    clone: JsValue,
 }
 
 thread_local! {
@@ -170,20 +148,15 @@ impl Harness {
         let entries = runtime
             .execute_with_ops("<fuzz driver>", DRIVER)
             .unwrap_or_else(|error| panic!("driver failed to load: {error}"));
-        let [deserialize, program, clone] = {
-            dd_v8::scope!(scope, runtime);
-            let entries = v8::Local::new(scope, entries)
-                .to_object(scope)
-                .expect("driver returns an object");
-            ["deserialize", "program", "clone"].map(|name| {
-                let key = v8::String::new(scope, name).expect("short key");
-                let function = entries
-                    .get(scope, key.into())
-                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-                    .unwrap_or_else(|| panic!("driver has no {name}"));
-                v8::Global::new(scope, function)
-            })
-        };
+        let deserialize = runtime
+            .get_property(&entries, "deserialize")
+            .expect("driver has no deserialize");
+        let program = runtime
+            .get_property(&entries, "program")
+            .expect("driver has no program");
+        let clone = runtime
+            .get_property(&entries, "clone")
+            .expect("driver has no clone");
         Self {
             runtime,
             deserialize,
@@ -199,22 +172,17 @@ impl Harness {
     /// Calls a driver entry point with `input` as a `Uint8Array`, panicking
     /// on a `BUG:` report or on anything escaping the driver.
     pub fn call(&mut self, entry: Entry, input: &[u8]) {
-        let argument = {
-            dd_v8::scope!(scope, self.runtime);
-            let array = dd_v8::serde_v8::uint8_array(scope, input.to_vec());
-            v8::Global::new(scope, v8::Local::<v8::Value>::from(array))
-        };
+        let argument = self.runtime.uint8_array(input).expect("uint8_array");
         let report = self.call_value(entry, argument);
-        let report = self.string(report);
+        let report = self
+            .runtime
+            .value_to_string(&report)
+            .expect("report to string");
         assert!(!report.starts_with("BUG"), "{report}");
     }
 
     /// Calls a driver entry point with any value and returns its result.
-    pub fn call_value(
-        &mut self,
-        entry: Entry,
-        argument: v8::Global<v8::Value>,
-    ) -> v8::Global<v8::Value> {
+    pub fn call_value(&mut self, entry: Entry, argument: JsValue) -> JsValue {
         let function = match entry {
             Entry::Deserialize => self.deserialize.clone(),
             Entry::Program => self.program.clone(),
@@ -223,11 +191,5 @@ impl Harness {
         self.runtime
             .call_function(&function, &[argument])
             .unwrap_or_else(|error| panic!("BUG: escaped the driver: {error}"))
-    }
-
-    fn string(&mut self, value: v8::Global<v8::Value>) -> String {
-        dd_v8::scope!(scope, self.runtime);
-        let value = v8::Local::new(scope, value);
-        value.to_rust_string_lossy(scope)
     }
 }

@@ -326,7 +326,9 @@ impl<'a> WireReader<'a> {
             }
             TAG_ARRAY => {
                 let len = self.read_u32()? as usize;
-                let cap = len.min(self.buf.len().saturating_sub(self.pos)).min(1 << 20);
+                let cap = len
+                    .min(self.buf.len().saturating_sub(self.pos))
+                    .min(1 << 20);
                 let mut out = Vec::with_capacity(cap);
                 for _ in 0..len {
                     out.push(self.read_value(depth + 1)?);
@@ -335,7 +337,9 @@ impl<'a> WireReader<'a> {
             }
             TAG_OBJECT => {
                 let len = self.read_u32()? as usize;
-                let cap = len.min(self.buf.len().saturating_sub(self.pos)).min(1 << 20);
+                let cap = len
+                    .min(self.buf.len().saturating_sub(self.pos))
+                    .min(1 << 20);
                 let mut out = Vec::with_capacity(cap);
                 for _ in 0..len {
                     let k = self.read_string()?;
@@ -777,7 +781,11 @@ impl<'de, 'a> de::Deserializer<'de> for Deserializer<'a> {
             WireValue::Bool(b) => visitor.visit_bool(*b),
             WireValue::I32(n) => visitor.visit_i32(*n),
             WireValue::F64(n) => {
-                if n.is_finite() && n.fract() == 0.0 && *n >= (MIN_SAFE_INTEGER as f64) && *n <= (MAX_SAFE_INTEGER as f64) {
+                if n.is_finite()
+                    && n.fract() == 0.0
+                    && *n >= (MIN_SAFE_INTEGER as f64)
+                    && *n <= (MAX_SAFE_INTEGER as f64)
+                {
                     if *n >= 0.0 {
                         visitor.visit_u64(*n as u64)
                     } else {

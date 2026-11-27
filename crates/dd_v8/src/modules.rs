@@ -3,6 +3,8 @@
 //! `import.meta`, live getter-backed exports, and dynamic `import()`.
 
 use crate::error::Error;
+use crate::inspector::InspectorCore;
+use crate::instrument;
 use crate::serde_v8::WireValue;
 use boa_ast::declaration::{ExportDeclaration, ImportKind, ModuleRequest, ReExportKind};
 use boa_ast::operations::bound_names;
@@ -179,8 +181,7 @@ fn code_utf8<'a>(name: &str, code: &'a ModuleCode) -> Result<&'a str, Error> {
         ModuleCode::String(s) => s.as_bytes(),
         ModuleCode::Bytes(b) => b,
     };
-    std::str::from_utf8(bytes)
-        .map_err(|_| Error::new(format!("module is not valid UTF-8: {name}")))
+    std::str::from_utf8(bytes).map_err(|_| Error::new(format!("module is not valid UTF-8: {name}")))
 }
 
 fn extract_request_type(
@@ -219,7 +220,11 @@ fn js_str_lit(s: &str) -> String {
 
 /// Parses an ES module with `boa_parser` and transforms it into a strict async
 /// module factory body accepting `(__dd_imp, __dd_exp, __dd_exp_star, __dd_meta, __dd_dyn_import)`.
-fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error> {
+fn transform_js_module(
+    name: &str,
+    source: &str,
+    inspector: Option<&InspectorCore>,
+) -> Result<ParsedJsModule, Error> {
     let mut interner = Interner::new();
     let scope = Scope::new_global();
     let mut parser = Parser::new(Source::from_bytes(source));
@@ -290,16 +295,14 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                 let dep_idx = add_request(import_decl.request(), &interner)?;
                 if let Some(def) = import_decl.default() {
                     let local = interner.resolve_expect(def.sym()).to_string();
-                    import_prelude.push_str(&format!(
-                        "const {local} = __dd_imp({dep_idx}).default;\n"
-                    ));
+                    import_prelude
+                        .push_str(&format!("const {local} = __dd_imp({dep_idx}).default;\n"));
                 }
                 match import_decl.kind() {
                     ImportKind::DefaultOrUnnamed => {}
                     ImportKind::Namespaced { binding } => {
                         let local = interner.resolve_expect(binding.sym()).to_string();
-                        import_prelude
-                            .push_str(&format!("const {local} = __dd_imp({dep_idx});\n"));
+                        import_prelude.push_str(&format!("const {local} = __dd_imp({dep_idx});\n"));
                     }
                     ImportKind::Named { names } => {
                         for spec in names.iter() {
@@ -370,10 +373,8 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                 ExportDeclaration::VarStatement(var_decl) => {
                     for sym in bound_names(var_decl) {
                         let id = interner.resolve_expect(sym).to_string();
-                        epilogue_exports.push_str(&format!(
-                            "__dd_exp({}, () => {id});\n",
-                            js_str_lit(&id)
-                        ));
+                        epilogue_exports
+                            .push_str(&format!("__dd_exp({}, () => {id});\n", js_str_lit(&id)));
                     }
                     if let ModuleItemSourceSyntax::ExportKeyword(span) = syntax {
                         let s = to_byte(span.start().pos());
@@ -384,10 +385,8 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                 ExportDeclaration::Declaration(decl) => {
                     for sym in bound_names(decl) {
                         let id = interner.resolve_expect(sym).to_string();
-                        epilogue_exports.push_str(&format!(
-                            "__dd_exp({}, () => {id});\n",
-                            js_str_lit(&id)
-                        ));
+                        epilogue_exports
+                            .push_str(&format!("__dd_exp({}, () => {id});\n", js_str_lit(&id)));
                     }
                     if let ModuleItemSourceSyntax::ExportKeyword(span) = syntax {
                         let s = to_byte(span.start().pos());
@@ -402,10 +401,12 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                         let e = to_byte(keywords.end().pos());
                         if fname == "default" {
                             edits.push((s, e, "const __dd_default = ".to_string()));
-                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                            epilogue_exports
+                                .push_str("__dd_exp(\"default\", () => __dd_default);\n");
                         } else {
                             edits.push((s, e, erase_span(s, e)));
-                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                            hoisted_exports
+                                .push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
                         }
                     }
                 }
@@ -416,10 +417,12 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                         let e = to_byte(keywords.end().pos());
                         if fname == "default" {
                             edits.push((s, e, "const __dd_default = ".to_string()));
-                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                            epilogue_exports
+                                .push_str("__dd_exp(\"default\", () => __dd_default);\n");
                         } else {
                             edits.push((s, e, erase_span(s, e)));
-                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                            hoisted_exports
+                                .push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
                         }
                     }
                 }
@@ -430,10 +433,12 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                         let e = to_byte(keywords.end().pos());
                         if fname == "default" {
                             edits.push((s, e, "const __dd_default = ".to_string()));
-                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                            epilogue_exports
+                                .push_str("__dd_exp(\"default\", () => __dd_default);\n");
                         } else {
                             edits.push((s, e, erase_span(s, e)));
-                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                            hoisted_exports
+                                .push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
                         }
                     }
                 }
@@ -444,10 +449,12 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                         let e = to_byte(keywords.end().pos());
                         if fname == "default" {
                             edits.push((s, e, "const __dd_default = ".to_string()));
-                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                            epilogue_exports
+                                .push_str("__dd_exp(\"default\", () => __dd_default);\n");
                         } else {
                             edits.push((s, e, erase_span(s, e)));
-                            hoisted_exports.push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
+                            hoisted_exports
+                                .push_str(&format!("__dd_exp(\"default\", () => {fname});\n"));
                         }
                     }
                 }
@@ -458,10 +465,12 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
                         let e = to_byte(keywords.end().pos());
                         if cname == "default" {
                             edits.push((s, e, "const __dd_default = ".to_string()));
-                            epilogue_exports.push_str("__dd_exp(\"default\", () => __dd_default);\n");
+                            epilogue_exports
+                                .push_str("__dd_exp(\"default\", () => __dd_default);\n");
                         } else {
                             edits.push((s, e, erase_span(s, e)));
-                            epilogue_exports.push_str(&format!("__dd_exp(\"default\", () => {cname});\n"));
+                            epilogue_exports
+                                .push_str(&format!("__dd_exp(\"default\", () => {cname});\n"));
                         }
                     }
                 }
@@ -492,9 +501,22 @@ fn transform_js_module(name: &str, source: &str) -> Result<ParsedJsModule, Error
 
     // Rewrite `import.meta` and dynamic `import(` outside string/comment literals.
     let rewritten = rewrite_import_meta_and_dynamic_import(&rewritten);
+    // When DevTools inspector is enabled, register the module script and instrument
+    // `<rewritten>` BEFORE prepending import/hoisted lines so every statement gets
+    // its exact original 0-based line number!
+    let rewritten = if let Some(insp) = inspector {
+        let script_id = insp.register_script(name, source);
+        instrument::instrument_js(script_id, &rewritten)
+    } else {
+        rewritten
+    };
 
     let mut body = String::with_capacity(
-        rewritten.len() + import_prelude.len() + hoisted_exports.len() + epilogue_exports.len() + 64,
+        rewritten.len()
+            + import_prelude.len()
+            + hoisted_exports.len()
+            + epilogue_exports.len()
+            + 64,
     );
     body.push_str("\"use strict\";\n");
     body.push_str(&import_prelude);
@@ -593,7 +615,8 @@ fn rewrite_import_meta_and_dynamic_import(src: &str) -> String {
                         }
                         i += 1;
                     }
-                    let rewritten_expr = rewrite_import_meta_and_dynamic_import(&src[expr_start..i]);
+                    let rewritten_expr =
+                        rewrite_import_meta_and_dynamic_import(&src[expr_start..i]);
                     out.push_str(&rewritten_expr);
                     if i < len {
                         out.push('}');
@@ -656,7 +679,7 @@ fn rewrite_import_meta_and_dynamic_import(src: &str) -> String {
                 // Dynamic `import(`
                 if j < len && bytes[j] == b'(' {
                     out.push_str("__dd_dyn_import");
-                    i = i + 6;
+                    i += 6;
                     prev_ident_char = true;
                     continue;
                 }
@@ -761,6 +784,7 @@ pub(crate) fn load_graph(
     module_type: ModuleType,
     code: Option<ModuleCode>,
     main: bool,
+    inspector: Option<&InspectorCore>,
 ) -> Result<(ModuleId, Vec<ModuleId>), Error> {
     let mut newly_added = Vec::new();
     let root = load_recursive(
@@ -770,11 +794,13 @@ pub(crate) fn load_graph(
         module_type,
         code,
         main,
+        inspector,
         &mut newly_added,
     )?;
     Ok((root, newly_added))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_recursive(
     modules: &mut ModuleMap,
     loader: &dyn ModuleLoader,
@@ -782,6 +808,7 @@ fn load_recursive(
     module_type: ModuleType,
     code: Option<ModuleCode>,
     main: bool,
+    inspector: Option<&InspectorCore>,
     newly_added: &mut Vec<ModuleId>,
 ) -> Result<ModuleId, Error> {
     if let Some(&id) = modules.ids.get(&(name.to_string(), module_type)) {
@@ -814,8 +841,11 @@ fn load_recursive(
     let (payload, requests) = match module_type {
         ModuleType::JavaScript => {
             let text = code_utf8(name, &code)?;
-            let parsed = transform_js_module(name, text)?;
-            (CompiledPayload::String(parsed.transformed_body), parsed.requests)
+            let parsed = transform_js_module(name, text, inspector)?;
+            (
+                CompiledPayload::String(parsed.transformed_body),
+                parsed.requests,
+            )
         }
         ModuleType::Json => {
             let text = code_utf8(name, &code)?;
@@ -858,7 +888,16 @@ fn load_recursive(
     let mut dep_ids = Vec::with_capacity(requests.len());
     for (specifier, req_type) in requests {
         let resolved = loader.resolve(&specifier, name).map_err(Error::new)?;
-        let child_id = load_recursive(modules, loader, &resolved, req_type, None, false, newly_added)?;
+        let child_id = load_recursive(
+            modules,
+            loader,
+            &resolved,
+            req_type,
+            None,
+            false,
+            inspector,
+            newly_added,
+        )?;
         dep_ids.push(child_id);
     }
     modules.modules[id].dep_ids = dep_ids;

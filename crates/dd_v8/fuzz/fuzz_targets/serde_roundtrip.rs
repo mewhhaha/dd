@@ -1,19 +1,18 @@
-//! Arbitrary Rust values through the serde bridge: to V8 and straight back,
-//! back through `deserialize_any` (as JSON), and back after V8's own
-//! serializer copied them in both modes and op_structured_clone did. Every
-//! path must give the value it started from.
+//! Arbitrary Rust values through the serde bridge: to Scriptw JS and straight
+//! back, back through `deserialize_any` (as JSON), and back after the
+//! structured-clone serializer copied them in both modes and op_structured_clone
+//! did. Every path must give the value it started from.
 
 #![no_main]
 
 use arbitrary::Arbitrary;
-use dd_v8::{serde_v8, v8};
 use dd_v8_fuzz::{Entry, with};
 use libfuzzer_sys::fuzz_target;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Floats compare by bits, so -0 differs from 0, except that every NaN is
-/// equal: V8 may canonicalize NaN payloads.
+/// equal: JS may canonicalize NaN payloads.
 macro_rules! float {
     ($name:ident, $ty:ty) => {
         #[derive(Arbitrary, Clone, Copy, Debug, Deserialize, Serialize)]
@@ -98,7 +97,7 @@ impl Node {
     }
 }
 
-/// JSON equality that compares numbers as numbers: V8 has one number type,
+/// JSON equality that compares numbers as numbers: JS has one number type,
 /// so `deserialize_any` reads 3.0 back as the integer 3.
 fn json_eq(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     use serde_json::Value;
@@ -124,12 +123,13 @@ fuzz_target!(|node: Node| {
     with(|harness| {
         let value = {
             let runtime = harness.runtime();
-            dd_v8::scope!(scope, runtime);
-            let value = serde_v8::to_v8(scope, &node).expect("every Node converts to V8");
-            let back: Node = serde_v8::from_v8(scope, value).expect("a converted Node reads back");
-            assert_eq!(back, node, "to_v8 then from_v8");
+            let value = runtime.to_js(&node).expect("every Node converts to JS");
+            let back: Node = runtime
+                .from_js(&value)
+                .expect("a converted Node reads back");
+            assert_eq!(back, node, "to_js then from_js");
 
-            match serde_v8::from_v8::<serde_json::Value>(scope, value) {
+            match runtime.from_js::<serde_json::Value>(&value) {
                 Ok(json) => {
                     let expected = serde_json::to_value(&node).expect("Node is JSON");
                     assert!(
@@ -142,19 +142,19 @@ fuzz_target!(|node: Node| {
                     "deserialize_any failed without bytes: {error}"
                 ),
             }
-            v8::Global::new(scope, value)
+            value
         };
         let copies = harness.call_value(Entry::Clone, value);
         let runtime = harness.runtime();
-        dd_v8::scope!(scope, runtime);
-        let copies = v8::Local::new(scope, copies);
-        let copies = v8::Local::<v8::Array>::try_from(copies).expect("clone returns an array");
         for (index, path) in ["op_structured_clone", "message", "storage"]
             .into_iter()
             .enumerate()
         {
-            let copy = copies.get_index(scope, index as u32).expect("copy");
-            let back: Node = serde_v8::from_v8(scope, copy)
+            let copy = runtime
+                .get_property(&copies, &index.to_string())
+                .expect("copy");
+            let back: Node = runtime
+                .from_js(&copy)
                 .unwrap_or_else(|error| panic!("{path} copy does not read back: {error}"));
             assert_eq!(back, node, "{path} copy");
         }

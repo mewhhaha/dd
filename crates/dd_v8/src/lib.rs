@@ -9,6 +9,7 @@
 pub mod builtins;
 mod error;
 mod inspector;
+mod instrument;
 mod modules;
 mod ops;
 mod platform;
@@ -20,7 +21,9 @@ mod wasm_api;
 pub use error::Error;
 pub use inspector::{InspectorHandle, InspectorSession};
 pub use modules::{ModuleCode, ModuleId, ModuleLoader, ModuleSource, ModuleType, NoModules};
-pub use ops::{AsyncOp, FromV8, JsBuffer, OpDecl, OpError, OpErrorClass, OpResult, SyncOp};
+pub use ops::{
+    AsyncOp, FromV8, JsBuffer, OpDecl, OpError, OpErrorClass, OpResult, RawBuffer, SyncOp,
+};
 pub use platform::{init, set_flags};
 pub use runtime::{JsRuntime, JsValue, RuntimeHandle, RuntimeOptions};
 pub use serde_v8::ToJsBuffer;

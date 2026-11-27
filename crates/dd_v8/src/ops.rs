@@ -28,11 +28,51 @@ pub(crate) type AsyncOpFn = Box<
     ) -> Result<Pin<Box<dyn Future<Output = Result<WireValue, OpError>>>>, OpError>,
 >;
 
+pub(crate) type RawBufferOpFn =
+    Box<dyn Fn(&Rc<RefCell<OpState>>, &mut RawBuffer) -> Result<WireValue, OpError>>;
+
+/// A JavaScript `ArrayBuffer` / `ArrayBufferView` argument passed to an [`op_raw!`]
+/// handler, supporting both read-only inspection ([`crate::builtins::buffer_bytes`])
+/// and in-place writes back into the exact view range
+/// ([`crate::builtins::with_buffer_mut`], [`crate::builtins::write_u32s`]).
+#[derive(Debug, Default)]
+pub struct RawBuffer {
+    bytes: Option<Vec<u8>>,
+    dirty: bool,
+}
+
+impl RawBuffer {
+    pub(crate) fn from_bytes(bytes: Option<Vec<u8>>) -> Self {
+        Self {
+            bytes,
+            dirty: false,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        if self.bytes.is_some() {
+            self.dirty = true;
+        }
+        self.bytes.as_deref_mut()
+    }
+
+    pub(crate) fn take_writeback(self) -> Option<Vec<u8>> {
+        if self.dirty { self.bytes } else { None }
+    }
+}
+
 pub(crate) enum OpKind {
     Sync(SyncOpFn),
     Async(AsyncOpFn),
     /// Handled directly inside `kernel.mjs` (pure JS builtin or wrapped op).
     BuiltinJs,
+    /// Raw buffer op taking a single `ArrayBuffer` / `ArrayBufferView` with
+    /// optional in-place writeback into the exact view slice.
+    RawBuffer(RawBufferOpFn),
 }
 
 pub struct OpDecl {
@@ -63,6 +103,24 @@ impl OpDecl {
         }
     }
 
+    /// Declares a raw buffer op receiving `&mut RawBuffer` (supporting both byte
+    /// reads and in-place writes bounded strictly to the view slice).
+    pub fn raw_buffer<R, M>(
+        name: &'static str,
+        op: impl Fn(&mut OpState, &mut RawBuffer) -> R + 'static,
+    ) -> Self
+    where
+        R: OpResult<M>,
+        M: 'static,
+    {
+        Self {
+            name,
+            kind: OpKind::RawBuffer(Box::new(move |state, buf| {
+                op(&mut state.borrow_mut(), buf).into_wire()
+            })),
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         self.name
     }
@@ -73,6 +131,10 @@ impl OpDecl {
 
     pub(crate) fn is_builtin_js(&self) -> bool {
         matches!(self.kind, OpKind::BuiltinJs)
+    }
+
+    pub(crate) fn is_raw_buffer(&self) -> bool {
+        matches!(self.kind, OpKind::RawBuffer(_))
     }
 }
 
@@ -89,6 +151,14 @@ macro_rules! op_sync {
 macro_rules! op_async {
     ($op:ident) => {
         $crate::OpDecl::async_op(stringify!($op), $op)
+    };
+}
+
+/// Declares a raw buffer op named after the function.
+#[macro_export]
+macro_rules! op_raw {
+    ($op:ident) => {
+        $crate::OpDecl::raw_buffer(stringify!($op), $op)
     };
 }
 
