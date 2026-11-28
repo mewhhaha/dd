@@ -26,8 +26,9 @@ pub use ops::{
 };
 pub use platform::{init, set_flags};
 pub use runtime::{
-    JsRuntime, JsValue, RuntimeHandle, RuntimeOptions, bundle_source_sha256,
-    has_precompiled_bundle, precompile_snapshot_bundle, register_precompiled_bundle,
+    DetachedPendingOp, HibernatedRuntime, JsRuntime, JsValue, PendingIoTicket, RuntimeHandle,
+    RuntimeOptions, WokenRuntime, bundle_source_sha256, has_precompiled_bundle,
+    precompile_snapshot_bundle, register_precompiled_bundle,
 };
-pub use serde_v8::ToJsBuffer;
+pub use serde_v8::{ToJsBuffer, WireValue};
 pub use state::OpState;

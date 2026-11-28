@@ -251,10 +251,10 @@ fn install_pinned_http_client(
 }
 
 /// Pinned clients waiting for the fetch they were made for.
-type HttpClients = HandleTable<reqwest::Client>;
+pub(crate) type HttpClients = HandleTable<reqwest::Client>;
 
 /// Response bodies of host fetches, read chunk by chunk from JavaScript.
-type HttpResponseBodies = HandleTable<reqwest::Response>;
+pub(crate) type HttpResponseBodies = HandleTable<reqwest::Response>;
 
 /// The response to a host fetch, whatever its status. Its body is read
 /// through `op_http_response_read`.

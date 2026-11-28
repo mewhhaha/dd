@@ -11,8 +11,8 @@ use crate::ops::{OpDecl, OpError, OpKind, RawBuffer};
 use crate::platform;
 use crate::serde_v8::{
     self, WireValue, decode_json_args, decode_wire_args, encode_err_envelope, encode_ok_envelope,
-    encode_pending_envelope, encode_str_err, encode_str_pending, str_to_utf16, try_encode_str_ok,
-    utf16_to_string_strict,
+    encode_pending_envelope, encode_str_err, encode_str_pending, encode_wire, str_to_utf16,
+    try_encode_str_ok, utf16_to_string_strict,
 };
 use crate::state::OpState;
 use crate::wasm_api::WasmHostState;
@@ -50,6 +50,8 @@ static PRECOMPILED_KERNEL_STORAGE: PageAligned<
     "/dd_v8_kernel.wtmn"
 )));
 const SNAPSHOT_MAGIC: &[u8; 8] = b"DDSW0001";
+const HIBERNATION_MAGIC: &[u8; 8] = b"DDHB0001";
+const HIBERNATION_VERSION: u32 = 1;
 
 #[derive(Default)]
 pub struct RuntimeOptions {
@@ -424,6 +426,10 @@ static PRECOMPILED_BUNDLES: LazyLock<Mutex<HashMap<[u8; 32], &'static [u8]>>> =
 
 /// Pure-Rust FIPS 180-4 SHA-256 digest of a generated bundle source string.
 pub fn bundle_source_sha256(source: &str) -> [u8; 32] {
+    sha256_bytes(source.as_bytes())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -440,7 +446,6 @@ pub fn bundle_source_sha256(source: &str) -> [u8; 32] {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
-    let bytes = source.as_bytes();
     let bit_len = (bytes.len() as u64).wrapping_mul(8);
     let mut padded = Vec::with_capacity((bytes.len() + 9).div_ceil(64) * 64);
     padded.extend_from_slice(bytes);
@@ -593,8 +598,116 @@ fn base_kernel_runtime() -> Result<Arc<EmbeddedRuntime>, Error> {
 }
 
 // =========================================================================
-// Per-Runtime State & Pending Async Ops
+// Hibernation Types & Per-Runtime State / Pending Async Ops
 // =========================================================================
+
+/// Description of an in-flight async op that was suspended when a [`JsRuntime`]
+/// hibernated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingIoTicket {
+    /// Runtime-local pending op identifier matching the suspended JS Promise.
+    pub id: u32,
+    /// Name of the async op (matching `OpDecl::name`).
+    pub op_name: String,
+    /// Decoded wire arguments passed by JavaScript when the op was invoked.
+    pub args: Vec<WireValue>,
+}
+
+/// An in-flight Rust future detached from a [`JsRuntime`] when it hibernated.
+///
+/// The host may await this future while the isolate is dropped (using 0 bytes of
+/// Wasm/JS heap), then deliver the result to a woken runtime via
+/// [`JsRuntime::settle_pending_op`], or reattach it with
+/// [`JsRuntime::reattach_pending_op`].
+pub struct DetachedPendingOp {
+    id: u32,
+    op_name: String,
+    future: Pin<Box<dyn Future<Output = Result<WireValue, OpError>>>>,
+}
+
+impl DetachedPendingOp {
+    /// Returns the runtime-local pending op identifier matching the suspended JS Promise.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Returns the async op name (matching `OpDecl::name`).
+    pub fn op_name(&self) -> &str {
+        &self.op_name
+    }
+
+    /// Drives the detached I/O future to completion and returns `(id, result)`.
+    pub async fn wait(self) -> (u32, Result<WireValue, OpError>) {
+        (self.id, self.future.await)
+    }
+}
+
+impl std::fmt::Debug for DetachedPendingOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetachedPendingOp")
+            .field("id", &self.id)
+            .field("op_name", &self.op_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A hibernated [`JsRuntime`] serialized to portable bytes alongside tickets
+/// (and optionally detached in-flight futures) for every suspended async op.
+pub struct HibernatedRuntime {
+    bytes: Vec<u8>,
+    pending_ops: Vec<PendingIoTicket>,
+    detached_futures: Vec<DetachedPendingOp>,
+    op_state: Rc<RefCell<OpState>>,
+    heap_snapshot_bytes: usize,
+}
+
+impl HibernatedRuntime {
+    /// Portable SHA-256-authenticated hibernation image (`DDHB0001`).
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this handle and returns the portable hibernation image bytes,
+    /// dropping any detached futures and old host `OpState`.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Tickets describing all async ops that were pending at hibernation time,
+    /// sorted by `id`.
+    pub fn pending_ops(&self) -> &[PendingIoTicket] {
+        &self.pending_ops
+    }
+
+    /// Takes ownership of the detached in-flight Rust futures so the host can
+    /// drive them to completion while the isolate is dropped (or reattach them
+    /// after [`JsRuntime::wake`]).
+    pub fn take_detached_futures(&mut self) -> Vec<DetachedPendingOp> {
+        std::mem::take(&mut self.detached_futures)
+    }
+
+    /// Returns the old isolate's Rust [`OpState`] (still alive only while this
+    /// `HibernatedRuntime` or a detached future holds it) so same-process hosts
+    /// can transfer host-side I/O resources such as response body handles into
+    /// the woken runtime.
+    pub fn op_state(&self) -> Rc<RefCell<OpState>> {
+        Rc::clone(&self.op_state)
+    }
+
+    /// Byte length of the embedded Scriptw/wtime compacted GC heap snapshot.
+    pub fn heap_snapshot_bytes(&self) -> usize {
+        self.heap_snapshot_bytes
+    }
+}
+
+/// A [`JsRuntime`] restored from hibernation bytes, together with any retained
+/// [`JsValue`] handles (in the exact order passed to [`JsRuntime::hibernate`])
+/// and all suspended async ops awaiting settlement.
+pub struct WokenRuntime {
+    pub runtime: JsRuntime,
+    pub retained: Vec<JsValue>,
+    pub pending_ops: Vec<PendingIoTicket>,
+}
 
 struct PendingOp {
     id: u32,
@@ -615,6 +728,7 @@ struct RuntimeState {
     max_op_argument_bytes: usize,
     ops: Vec<OpDecl>,
     pending_ops: RefCell<FuturesUnordered<PendingOp>>,
+    pending_meta: RefCell<HashMap<u32, PendingIoTicket>>,
     next_pending_id: RefCell<u32>,
     waker: Arc<AtomicWaker>,
     loader: Rc<dyn ModuleLoader>,
@@ -674,8 +788,10 @@ struct KernelExports {
     set_max_op_arg_bytes: ScriptwJsValue,
 }
 
+const KERNEL_EXPORT_COUNT: usize = 25;
+
 impl KernelExports {
-    fn as_refs(&self) -> [&ScriptwJsValue; 25] {
+    fn as_refs(&self) -> [&ScriptwJsValue; KERNEL_EXPORT_COUNT] {
         [
             &self.init_ops,
             &self.eval_script,
@@ -969,6 +1085,7 @@ impl JsRuntime {
             max_op_argument_bytes: max_arg_bytes,
             ops,
             pending_ops: RefCell::new(FuturesUnordered::new()),
+            pending_meta: RefCell::new(HashMap::new()),
             next_pending_id: RefCell::new(1),
             waker,
             loader: module_loader.unwrap_or_else(|| Rc::new(NoModules)),
@@ -1006,16 +1123,8 @@ impl JsRuntime {
             });
         }
 
-        let (embedded, run_snapshot_export, compiled_snap) = if let Some(blob) = startup_snapshot {
-            let snap = lookup_snapshot(blob, &state.ops)?;
-            (Arc::clone(&snap.runtime), true, Some(snap))
-        } else if !ext_scripts.is_empty() {
-            let rec = SnapshotRecorder::new(ext_scripts);
-            let src = rec.generate_bundle_mjs();
-            (compile_embedded_module(&src)?, false, None)
-        } else {
-            (base_kernel_runtime()?, false, None)
-        };
+        let (embedded, run_snapshot_export, compiled_snap) =
+            resolve_embedded_runtime(&state.ops, startup_snapshot, ext_scripts)?;
 
         let (vm, interrupt) = instantiate_vm(
             &embedded,
@@ -1700,54 +1809,10 @@ impl JsRuntime {
         // 3. Deliver settled async results back to JS Promises.
         let settled_any = !settled.is_empty();
         for (id, result) in settled {
-            let str_opt = match &result {
-                Ok(val) => try_encode_str_ok(val),
-                Err(err) => Some(encode_str_err(err)),
-            };
+            self.state.pending_meta.borrow_mut().remove(&id);
             let vm = self.vm.as_mut().expect("live vm");
-            let id_v = match vm
-                .instance
-                .value(&mut vm.store, ForeignValue::Number(f64::from(id)))
-            {
-                Ok(v) => v,
-                Err(e) => return Poll::Ready(Err(map_engine_err(&self.terminated, e))),
-            };
-            if let Some(str_u16) = str_opt {
-                let str_v = match vm
-                    .instance
-                    .value(&mut vm.store, ForeignValue::StringUtf16(str_u16))
-                {
-                    Ok(v) => v,
-                    Err(e) => return Poll::Ready(Err(map_engine_err(&self.terminated, e))),
-                };
-                if let Err(err) = call_js(
-                    vm,
-                    &self.terminated,
-                    &vm.exports.settle_async_str.clone(),
-                    &[id_v, str_v],
-                ) {
-                    return Poll::Ready(Err(err));
-                }
-            } else {
-                let env_bytes = match result {
-                    Ok(val) => encode_ok_envelope(&val),
-                    Err(err) => encode_err_envelope(&err),
-                };
-                let bytes_v = match vm
-                    .instance
-                    .value(&mut vm.store, ForeignValue::Bytes(env_bytes))
-                {
-                    Ok(v) => v,
-                    Err(e) => return Poll::Ready(Err(map_engine_err(&self.terminated, e))),
-                };
-                if let Err(err) = call_js(
-                    vm,
-                    &self.terminated,
-                    &vm.exports.settle_async.clone(),
-                    &[id_v, bytes_v],
-                ) {
-                    return Poll::Ready(Err(err));
-                }
+            if let Err(err) = deliver_async_result(vm, &self.terminated, id, result) {
+                return Poll::Ready(Err(err));
             }
         }
 
@@ -1761,6 +1826,392 @@ impl JsRuntime {
         } else {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// Drains all queued JS microtasks (Promise reactions, `queueMicrotask`)
+    /// without polling pending Rust async I/O futures.
+    pub fn drain_microtasks(&mut self) -> Result<(), Error> {
+        self.pump_microtasks()
+    }
+
+    /// Inspects `value` without driving the event loop: returns `Ok(Some(v))`
+    /// if it is a fulfilled Promise (or non-Promise value), `Ok(None)` if it is
+    /// still pending, and `Err` if it rejected or the runtime was terminated.
+    pub fn try_resolve_settled(&mut self, value: &JsValue) -> Result<Option<JsValue>, Error> {
+        self.check_terminated()?;
+        let live = value.as_live()?.clone();
+        match self.promise_outcome(&live) {
+            Some(Ok(v)) => Ok(Some(JsValue::live(v))),
+            Some(Err(err)) => Err(err),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns metadata tickets for all currently unsettled async ops (sorted
+    /// by pending `id`), including ops restored from hibernation awaiting
+    /// external settlement via [`Self::settle_pending_op`].
+    pub fn pending_io_tickets(&self) -> Vec<PendingIoTicket> {
+        let mut tickets: Vec<PendingIoTicket> =
+            self.state.pending_meta.borrow().values().cloned().collect();
+        tickets.sort_by_key(|t| t.id);
+        tickets
+    }
+
+    /// Settles a suspended async op by `id` (for example after [`Self::wake`]
+    /// or after driving a [`DetachedPendingOp`] to completion while hibernated)
+    /// and drains any JS microtasks queued by resuming the awaiting Promise.
+    pub fn settle_pending_op(
+        &mut self,
+        id: u32,
+        result: Result<WireValue, OpError>,
+    ) -> Result<(), Error> {
+        self.check_terminated()?;
+        if self.state.pending_meta.borrow_mut().remove(&id).is_none() {
+            return Err(Error::new(format!("unknown pending async op id {id}")));
+        }
+        let vm = self
+            .vm
+            .as_mut()
+            .ok_or_else(|| Error::new("cannot settle pending op on a recorder-only runtime"))?;
+        deliver_async_result(vm, &self.terminated, id, result)?;
+        self.pump_microtasks()
+    }
+
+    /// Reattaches a [`DetachedPendingOp`] extracted from [`HibernatedRuntime`]
+    /// so [`Self::poll_event_loop`] / [`Self::resolve`] can drive it again.
+    pub fn reattach_pending_op(&mut self, op: DetachedPendingOp) -> Result<(), Error> {
+        self.check_terminated()?;
+        if !self.state.pending_meta.borrow().contains_key(&op.id) {
+            return Err(Error::new(format!(
+                "cannot reattach unknown pending async op id {}",
+                op.id
+            )));
+        }
+        self.state.pending_ops.borrow_mut().push(PendingOp {
+            id: op.id,
+            future: op.future,
+        });
+        self.state.waker.wake();
+        Ok(())
+    }
+
+    /// Hibernates this runtime into portable SHA-256-authenticated bytes
+    /// (`DDHB0001`), capturing the compacted Wasm/GC heap, dynamically compiled
+    /// JS modules, ES module table, `WeakMap`/`WeakSet` entries, retained
+    /// [`JsValue`] handles, and all pending async op tickets + detached futures,
+    /// then drops the underlying Wasm `Store` and GC heap immediately.
+    pub fn hibernate(mut self, retained: &[&JsValue]) -> Result<HibernatedRuntime, Error> {
+        self.check_terminated()?;
+        if self.recorder.is_some() {
+            return Err(Error::new("cannot hibernate a snapshot-recording runtime"));
+        }
+        if self.inspector_handle.get().is_some() {
+            return Err(Error::new(
+                "cannot hibernate a runtime with an active DevTools inspector",
+            ));
+        }
+        if !self.state.wasm.borrow().is_empty() {
+            return Err(Error::new(
+                "cannot hibernate a runtime with live WebAssembly JS-API handles",
+            ));
+        }
+
+        // Flush synchronous continuations so all in-flight async ops have parked.
+        self.pump_microtasks()?;
+
+        let mut retained_live = Vec::with_capacity(retained.len());
+        for val in retained {
+            retained_live.push(val.as_live()?);
+        }
+
+        let (embedded_bytes, heap_snapshot_bytes) = {
+            let vm = self
+                .vm
+                .as_mut()
+                .ok_or_else(|| Error::new("cannot hibernate runtime without a live VM"))?;
+            let export_refs = vm.exports.as_refs();
+            let mut roots = Vec::with_capacity(KERNEL_EXPORT_COUNT + retained_live.len());
+            roots.extend_from_slice(&export_refs);
+            roots.extend_from_slice(&retained_live);
+            let snap = vm
+                .instance
+                .capture_snapshot(&mut vm.store, &roots)
+                .map_err(|e| Error::new(format!("hibernate capture_snapshot failed: {e}")))?;
+            let heap_len = snap.heap_bytes_len();
+            let bytes = snap
+                .to_bytes()
+                .map_err(|e| Error::new(format!("hibernate snapshot serialize failed: {e}")))?;
+            (bytes, heap_len)
+        };
+
+        let pending_ops = self.pending_io_tickets();
+        let pending_meta_snapshot: HashMap<u32, String> = self
+            .state
+            .pending_meta
+            .borrow()
+            .iter()
+            .map(|(&id, t)| (id, t.op_name.clone()))
+            .collect();
+        let mut detached_futures: Vec<DetachedPendingOp> =
+            std::mem::take(&mut *self.state.pending_ops.borrow_mut())
+                .into_iter()
+                .map(|p| DetachedPendingOp {
+                    id: p.id,
+                    op_name: pending_meta_snapshot
+                        .get(&p.id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    future: p.future,
+                })
+                .collect();
+        detached_futures.sort_by_key(|f| f.id);
+
+        let mut out = Vec::with_capacity(embedded_bytes.len() + 1024);
+        out.extend_from_slice(HIBERNATION_MAGIC);
+        out.extend_from_slice(&HIBERNATION_VERSION.to_le_bytes());
+
+        // Op table contract.
+        out.extend_from_slice(&(self.state.ops.len() as u32).to_le_bytes());
+        for op in &self.state.ops {
+            let nb = op.name.as_bytes();
+            out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            out.extend_from_slice(nb);
+        }
+
+        // Runtime counters & limits.
+        out.extend_from_slice(&(*self.state.next_pending_id.borrow()).to_le_bytes());
+        out.extend_from_slice(&(self.state.max_op_argument_bytes as u64).to_le_bytes());
+        out.extend_from_slice(&(retained.len() as u32).to_le_bytes());
+
+        // Loaded ES module table.
+        self.state.modules.borrow().encode_bytes(&mut out);
+
+        // Suspended async op tickets (id, op_name, wire-encoded args).
+        out.extend_from_slice(&(pending_ops.len() as u32).to_le_bytes());
+        for ticket in &pending_ops {
+            out.extend_from_slice(&ticket.id.to_le_bytes());
+            let nb = ticket.op_name.as_bytes();
+            out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            out.extend_from_slice(nb);
+            let mut wire_args = Vec::with_capacity(32);
+            wire_args.extend_from_slice(&(ticket.args.len() as u32).to_le_bytes());
+            for arg in &ticket.args {
+                encode_wire(arg, &mut wire_args);
+            }
+            out.extend_from_slice(&(wire_args.len() as u32).to_le_bytes());
+            out.extend_from_slice(&wire_args);
+        }
+
+        // Inner Scriptw/wtime portable snapshot bytes.
+        out.extend_from_slice(&(embedded_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&embedded_bytes);
+
+        // Trailing SHA-256 integrity digest.
+        let digest = sha256_bytes(&out);
+        out.extend_from_slice(&digest);
+
+        let op_state = Rc::clone(&self.state.op_state);
+
+        // Release Wasm Store + GC heap immediately before returning.
+        self.vm.take();
+        drop(self);
+
+        Ok(HibernatedRuntime {
+            bytes: out,
+            pending_ops,
+            detached_futures,
+            op_state,
+            heap_snapshot_bytes,
+        })
+    }
+
+    /// Restores a [`JsRuntime`] from hibernation bytes produced by
+    /// [`Self::hibernate`], returning the live runtime, reconstructed retained
+    /// [`JsValue`]s, and pending async op tickets.
+    pub fn wake(options: RuntimeOptions, bytes: &[u8]) -> Result<WokenRuntime, Error> {
+        platform::init();
+        if bytes.len() < 8 + 4 + 32 || &bytes[..8] != HIBERNATION_MAGIC {
+            return Err(Error::new("invalid dd_v8 hibernation snapshot header"));
+        }
+        let body_end = bytes.len() - 32;
+        let expected_digest = sha256_bytes(&bytes[..body_end]);
+        if expected_digest != bytes[body_end..] {
+            return Err(Error::new(
+                "dd_v8 hibernation snapshot SHA-256 integrity check failed",
+            ));
+        }
+
+        let body = &bytes[..body_end];
+        let mut pos = 8usize;
+        fn read_exact<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], Error> {
+            let end = pos
+                .checked_add(n)
+                .ok_or_else(|| Error::new("hibernation snapshot read overflow"))?;
+            if end > buf.len() {
+                return Err(Error::new("hibernation snapshot unexpected EOF"));
+            }
+            let slice = &buf[*pos..end];
+            *pos = end;
+            Ok(slice)
+        }
+        fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32, Error> {
+            Ok(u32::from_le_bytes(
+                read_exact(buf, pos, 4)?.try_into().unwrap(),
+            ))
+        }
+        fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64, Error> {
+            Ok(u64::from_le_bytes(
+                read_exact(buf, pos, 8)?.try_into().unwrap(),
+            ))
+        }
+        fn read_string(buf: &[u8], pos: &mut usize) -> Result<String, Error> {
+            let len = read_u32(buf, pos)? as usize;
+            let raw = read_exact(buf, pos, len)?;
+            std::str::from_utf8(raw)
+                .map(ToOwned::to_owned)
+                .map_err(|_| Error::new("hibernation snapshot contains invalid UTF-8"))
+        }
+
+        let version = read_u32(body, &mut pos)?;
+        if version != HIBERNATION_VERSION {
+            return Err(Error::new(format!(
+                "unsupported dd_v8 hibernation snapshot version {version}"
+            )));
+        }
+
+        let op_count = read_u32(body, &mut pos)? as usize;
+        if op_count.saturating_mul(4) > body.len().saturating_sub(pos) {
+            return Err(Error::new(
+                "hibernation snapshot op count exceeds remaining bytes",
+            ));
+        }
+        let mut expected_op_names = Vec::with_capacity(op_count);
+        for _ in 0..op_count {
+            expected_op_names.push(read_string(body, &mut pos)?);
+        }
+
+        let RuntimeOptions {
+            ops,
+            module_loader,
+            startup_snapshot,
+            max_heap_bytes,
+            max_op_argument_bytes,
+            ext_scripts,
+        } = options;
+
+        let actual_op_names: Vec<&str> = ops.iter().map(|o| o.name).collect();
+        let expected_refs: Vec<&str> = expected_op_names.iter().map(String::as_str).collect();
+        if actual_op_names != expected_refs {
+            return Err(Error::new(format!(
+                "hibernation snapshot ops {expected_refs:?} do not match runtime ops {actual_op_names:?}"
+            )));
+        }
+
+        let next_pending_id = read_u32(body, &mut pos)?.max(1);
+        let captured_max_arg_bytes = usize::try_from(read_u64(body, &mut pos)?)
+            .map_err(|_| Error::new("hibernation snapshot max_op_argument_bytes overflow"))?;
+        let retained_count = read_u32(body, &mut pos)? as usize;
+        let module_map = ModuleMap::decode_bytes(body, &mut pos)?;
+
+        let effective_max_arg_bytes = match max_op_argument_bytes {
+            0 => captured_max_arg_bytes,
+            n => n,
+        };
+        let decode_budget = effective_max_arg_bytes
+            .max(captured_max_arg_bytes)
+            .max(serde_v8::DEFAULT_MAX_OP_ARGUMENT_BYTES);
+
+        let pending_count = read_u32(body, &mut pos)? as usize;
+        if pending_count.saturating_mul(12) > body.len().saturating_sub(pos) {
+            return Err(Error::new(
+                "hibernation snapshot pending op count exceeds remaining bytes",
+            ));
+        }
+        let mut pending_ops = Vec::with_capacity(pending_count);
+        let mut pending_meta = HashMap::with_capacity(pending_count);
+        for _ in 0..pending_count {
+            let id = read_u32(body, &mut pos)?;
+            let op_name = read_string(body, &mut pos)?;
+            let wire_len = read_u32(body, &mut pos)? as usize;
+            let wire_bytes = read_exact(body, &mut pos, wire_len)?;
+            let args = decode_wire_args(wire_bytes, decode_budget)
+                .map_err(|e| Error::new(format!("hibernation pending op args decode: {e}")))?;
+            let ticket = PendingIoTicket { id, op_name, args };
+            pending_meta.insert(id, ticket.clone());
+            pending_ops.push(ticket);
+        }
+
+        let embedded_len = usize::try_from(read_u64(body, &mut pos)?)
+            .map_err(|_| Error::new("hibernation embedded snapshot length overflow"))?;
+        let embedded_bytes = read_exact(body, &mut pos, embedded_len)?;
+        if pos != body.len() {
+            return Err(Error::new(
+                "hibernation snapshot has unexpected trailing bytes",
+            ));
+        }
+
+        let (embedded, _, _) = resolve_embedded_runtime(&ops, startup_snapshot, ext_scripts)?;
+        let engine = shared_engine()?;
+        // SAFETY: `embedded_bytes` passed outer `DDHB0001` SHA-256 verification
+        // and inner `SCWS0001`/`WTSN0001` header, bounds, fingerprint, and
+        // checksum validation.
+        let embedded_snapshot = unsafe { EmbeddedSnapshot::from_bytes(engine, embedded_bytes) }
+            .map_err(|e| Error::new(format!("hibernation embedded snapshot decode failed: {e}")))?;
+
+        let waker = Arc::new(AtomicWaker::new());
+        let terminated = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let inspector_handle = Arc::new(OnceLock::new());
+        let state = Rc::new(RuntimeState {
+            op_state: Rc::new(RefCell::new(OpState::new(Arc::clone(&waker)))),
+            max_op_argument_bytes: effective_max_arg_bytes,
+            ops,
+            pending_ops: RefCell::new(FuturesUnordered::new()),
+            pending_meta: RefCell::new(pending_meta),
+            next_pending_id: RefCell::new(next_pending_id),
+            waker,
+            loader: module_loader.unwrap_or_else(|| Rc::new(NoModules)),
+            modules: RefCell::new(module_map),
+            wasm: RefCell::new(WasmHostState::new()),
+            inspector: Arc::clone(&inspector_handle),
+            last_wire_out: RefCell::new(Vec::new()),
+            pending_bytes_fallback: RefCell::new(None),
+        });
+
+        let (mut vm, interrupt, retained) = restore_vm_from_embedded_snapshot(
+            &embedded,
+            &state,
+            max_heap_bytes,
+            &embedded_snapshot,
+            retained_count,
+        )?;
+        if state.max_op_argument_bytes != captured_max_arg_bytes {
+            let budget_v = vm
+                .instance
+                .value(
+                    &mut vm.store,
+                    ForeignValue::Number(state.max_op_argument_bytes as f64),
+                )
+                .map_err(|e| Error::new(e.to_string()))?;
+            let dummy_term = AtomicBool::new(false);
+            let set_budget_fn = vm.exports.set_max_op_arg_bytes.clone();
+            let _ = call_js(&mut vm, &dummy_term, &set_budget_fn, &[budget_v])?;
+        }
+
+        Ok(WokenRuntime {
+            runtime: Self {
+                vm: Some(vm),
+                recorder: None,
+                state,
+                terminated,
+                alive,
+                interrupt_handle: Some(interrupt),
+                inspector_handle,
+                max_heap_bytes,
+            },
+            retained,
+            pending_ops,
+        })
     }
 
     fn dispatch_inspector_messages(&mut self) -> Result<(), Error> {
@@ -1893,6 +2344,7 @@ impl Drop for JsRuntime {
         // Drop `vm` (`wasmtime::Store`) BEFORE `state` (`Rc<RuntimeState>`)!
         self.vm.take();
         self.state.pending_ops.borrow_mut().clear();
+        self.state.pending_meta.borrow_mut().clear();
         self.state.modules.borrow_mut().clear();
     }
 }
@@ -1900,6 +2352,127 @@ impl Drop for JsRuntime {
 // =========================================================================
 // Low-level Scriptw/Wasmtime Instantiation & Host Foreign Callbacks
 // =========================================================================
+
+fn resolve_embedded_runtime(
+    ops: &[OpDecl],
+    startup_snapshot: Option<&'static [u8]>,
+    ext_scripts: &'static [(&'static str, &'static str)],
+) -> Result<(Arc<EmbeddedRuntime>, bool, Option<Arc<CompiledSnapshot>>), Error> {
+    if let Some(blob) = startup_snapshot {
+        let snap = lookup_snapshot(blob, ops)?;
+        Ok((Arc::clone(&snap.runtime), true, Some(snap)))
+    } else if !ext_scripts.is_empty() {
+        let rec = SnapshotRecorder::new(ext_scripts);
+        let src = rec.generate_bundle_mjs();
+        Ok((compile_embedded_module(&src)?, false, None))
+    } else {
+        Ok((base_kernel_runtime()?, false, None))
+    }
+}
+
+fn deliver_async_result(
+    vm: &mut LiveVm,
+    terminated: &AtomicBool,
+    id: u32,
+    result: Result<WireValue, OpError>,
+) -> Result<(), Error> {
+    let str_opt = match &result {
+        Ok(val) => try_encode_str_ok(val),
+        Err(err) => Some(encode_str_err(err)),
+    };
+    let id_v = vm
+        .instance
+        .value(&mut vm.store, ForeignValue::Number(f64::from(id)))
+        .map_err(|e| map_engine_err(terminated, e))?;
+    if let Some(str_u16) = str_opt {
+        let str_v = vm
+            .instance
+            .value(&mut vm.store, ForeignValue::StringUtf16(str_u16))
+            .map_err(|e| map_engine_err(terminated, e))?;
+        call_js(
+            vm,
+            terminated,
+            &vm.exports.settle_async_str.clone(),
+            &[id_v, str_v],
+        )?;
+    } else {
+        let env_bytes = match result {
+            Ok(val) => encode_ok_envelope(&val),
+            Err(err) => encode_err_envelope(&err),
+        };
+        let bytes_v = vm
+            .instance
+            .value(&mut vm.store, ForeignValue::Bytes(env_bytes))
+            .map_err(|e| map_engine_err(terminated, e))?;
+        call_js(
+            vm,
+            terminated,
+            &vm.exports.settle_async.clone(),
+            &[id_v, bytes_v],
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_vm_from_embedded_snapshot(
+    embedded: &Arc<EmbeddedRuntime>,
+    state: &Rc<RuntimeState>,
+    max_heap_bytes: usize,
+    snapshot: &EmbeddedSnapshot,
+    retained_count: usize,
+) -> Result<(LiveVm, wasmtime::InterruptHandle, Vec<JsValue>), Error> {
+    let engine = shared_engine()?;
+    let mut store_state = embedded
+        .new_state(RealmBuilder::new().build(), StatePtr(Rc::as_ptr(state)))
+        .map_err(|e| Error::new(format!("scriptw new_state failed: {e}")))?;
+    let heap_limit = if max_heap_bytes > 0 {
+        max_heap_bytes
+    } else {
+        usize::MAX
+    };
+    *store_state.limits_mut() = wasmtime::StoreLimitsBuilder::new()
+        .memory_size(heap_limit)
+        .build();
+    let mut store = wasmtime::Store::new(engine, store_state);
+    store.limiter(|s| s.limits_mut());
+    let interrupt = store.interrupt_handle();
+
+    let mut linker = wasmtime::Linker::new(engine);
+    register_dd_foreigns(embedded, &mut linker)?;
+    embedded
+        .register(&mut store, &mut linker)
+        .map_err(|e| Error::new(format!("scriptw register failed: {e}")))?;
+    let mut instance = embedded
+        .instantiate(&mut store, &mut linker)
+        .map_err(|e| Error::new(format!("scriptw instantiate failed: {e}")))?;
+
+    let mut restored = instance
+        .restore_snapshot(&mut store, snapshot)
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("GC heap out of memory") || msg.contains("allocation too large") {
+                Error::terminated()
+            } else {
+                Error::new(format!("scriptw restore_snapshot failed: {msg}"))
+            }
+        })?;
+    let expected = KERNEL_EXPORT_COUNT + retained_count;
+    if restored.len() != expected {
+        return Err(Error::new(format!(
+            "hibernated snapshot restored {} values, expected {expected}",
+            restored.len()
+        )));
+    }
+    let retained_raw = restored.split_off(KERNEL_EXPORT_COUNT);
+    let exports = KernelExports::from_vec(restored)?;
+    let retained = retained_raw.into_iter().map(JsValue::live).collect();
+    let vm = LiveVm {
+        store,
+        instance,
+        exports,
+    };
+    Ok((vm, interrupt, retained))
+}
 
 fn lookup_snapshot(blob: &[u8], ops: &[OpDecl]) -> Result<Arc<CompiledSnapshot>, Error> {
     if blob.len() != 16 || &blob[..8] != SNAPSHOT_MAGIC {
@@ -2227,6 +2800,14 @@ fn register_dd_foreigns(
                 }
             }
             let id = state.alloc_pending_id();
+            state.pending_meta.borrow_mut().insert(
+                id,
+                PendingIoTicket {
+                    id,
+                    op_name: op.name.to_owned(),
+                    args: decoded,
+                },
+            );
             state
                 .pending_ops
                 .borrow_mut()
@@ -2347,6 +2928,14 @@ fn register_dd_foreigns(
                 }
             }
             let id = state.alloc_pending_id();
+            state.pending_meta.borrow_mut().insert(
+                id,
+                PendingIoTicket {
+                    id,
+                    op_name: op.name.to_owned(),
+                    args: decoded,
+                },
+            );
             state
                 .pending_ops
                 .borrow_mut()
@@ -2411,6 +3000,14 @@ fn register_dd_foreigns(
             }
         }
         let id = state.alloc_pending_id();
+        state.pending_meta.borrow_mut().insert(
+            id,
+            PendingIoTicket {
+                id,
+                op_name: op.name.to_owned(),
+                args: decoded.to_vec(),
+            },
+        );
         state
             .pending_ops
             .borrow_mut()

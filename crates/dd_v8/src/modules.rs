@@ -58,6 +58,16 @@ impl ModuleType {
             Self::Bytes => 3,
         }
     }
+
+    pub(crate) fn from_kind_code(code: u8) -> Result<Self, Error> {
+        match code {
+            0 => Ok(Self::JavaScript),
+            1 => Ok(Self::Json),
+            2 => Ok(Self::Text),
+            3 => Ok(Self::Bytes),
+            other => Err(Error::new(format!("invalid module kind code {other}"))),
+        }
+    }
 }
 
 impl fmt::Display for ModuleType {
@@ -168,6 +178,161 @@ impl ModuleMap {
 
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    pub(crate) fn encode_bytes(&self, out: &mut Vec<u8>) {
+        match self.main {
+            None => out.push(0),
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&(id as u32).to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&(self.modules.len() as u32).to_le_bytes());
+        for rec in &self.modules {
+            out.extend_from_slice(&(rec.id as u32).to_le_bytes());
+            let nb = rec.name.as_bytes();
+            out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            out.extend_from_slice(nb);
+            out.push(rec.module_type.kind_code() as u8);
+            out.push(u8::from(rec.is_main));
+            out.push(u8::from(rec.registered_in_js));
+            match &rec.payload {
+                CompiledPayload::String(s) => {
+                    out.push(0);
+                    let sb = s.as_bytes();
+                    out.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+                    out.extend_from_slice(sb);
+                }
+                CompiledPayload::Bytes(b) => {
+                    out.push(1);
+                    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    out.extend_from_slice(b);
+                }
+            }
+            out.extend_from_slice(&(rec.dep_ids.len() as u32).to_le_bytes());
+            for &dep in &rec.dep_ids {
+                out.extend_from_slice(&(dep as u32).to_le_bytes());
+            }
+        }
+    }
+
+    pub(crate) fn decode_bytes(buf: &[u8], pos: &mut usize) -> Result<Self, Error> {
+        fn read_exact<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], Error> {
+            let end = pos
+                .checked_add(n)
+                .ok_or_else(|| Error::new("hibernated ModuleMap read overflow"))?;
+            if end > buf.len() {
+                return Err(Error::new("hibernated ModuleMap unexpected EOF"));
+            }
+            let slice = &buf[*pos..end];
+            *pos = end;
+            Ok(slice)
+        }
+        fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32, Error> {
+            Ok(u32::from_le_bytes(
+                read_exact(buf, pos, 4)?.try_into().unwrap(),
+            ))
+        }
+        fn read_string(buf: &[u8], pos: &mut usize) -> Result<String, Error> {
+            let len = read_u32(buf, pos)? as usize;
+            let raw = read_exact(buf, pos, len)?;
+            std::str::from_utf8(raw)
+                .map(ToOwned::to_owned)
+                .map_err(|_| Error::new("hibernated ModuleMap contains invalid UTF-8"))
+        }
+
+        let main = match read_exact(buf, pos, 1)?[0] {
+            0 => None,
+            1 => Some(read_u32(buf, pos)? as ModuleId),
+            other => {
+                return Err(Error::new(format!(
+                    "hibernated ModuleMap invalid main tag {other}"
+                )));
+            }
+        };
+        let count = read_u32(buf, pos)? as usize;
+        if count.saturating_mul(16) > buf.len().saturating_sub(*pos) {
+            return Err(Error::new(
+                "hibernated ModuleMap count exceeds remaining bytes",
+            ));
+        }
+        let mut modules = Vec::with_capacity(count);
+        let mut ids = HashMap::with_capacity(count);
+        for expected_id in 0..count {
+            let id = read_u32(buf, pos)? as ModuleId;
+            if id != expected_id {
+                return Err(Error::new(format!(
+                    "hibernated ModuleMap id mismatch: expected {expected_id}, got {id}"
+                )));
+            }
+            let name = read_string(buf, pos)?;
+            let module_type = ModuleType::from_kind_code(read_exact(buf, pos, 1)?[0])?;
+            let is_main = match read_exact(buf, pos, 1)?[0] {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(Error::new(format!(
+                        "hibernated ModuleMap invalid is_main flag {other}"
+                    )));
+                }
+            };
+            let registered_in_js = match read_exact(buf, pos, 1)?[0] {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(Error::new(format!(
+                        "hibernated ModuleMap invalid registered_in_js flag {other}"
+                    )));
+                }
+            };
+            let payload = match read_exact(buf, pos, 1)?[0] {
+                0 => CompiledPayload::String(read_string(buf, pos)?),
+                1 => {
+                    let len = read_u32(buf, pos)? as usize;
+                    CompiledPayload::Bytes(read_exact(buf, pos, len)?.to_vec())
+                }
+                other => {
+                    return Err(Error::new(format!(
+                        "hibernated ModuleMap invalid payload tag {other}"
+                    )));
+                }
+            };
+            let dep_count = read_u32(buf, pos)? as usize;
+            if dep_count.saturating_mul(4) > buf.len().saturating_sub(*pos) {
+                return Err(Error::new(
+                    "hibernated ModuleMap dep_ids count exceeds remaining bytes",
+                ));
+            }
+            let mut dep_ids = Vec::with_capacity(dep_count);
+            for _ in 0..dep_count {
+                let dep = read_u32(buf, pos)? as ModuleId;
+                if dep >= count {
+                    return Err(Error::new(format!(
+                        "hibernated ModuleMap dep id {dep} out of range ({count})"
+                    )));
+                }
+                dep_ids.push(dep);
+            }
+            ids.insert((name.clone(), module_type), id);
+            modules.push(ModuleRecord {
+                id,
+                name,
+                module_type,
+                is_main,
+                payload,
+                dep_ids,
+                registered_in_js,
+            });
+        }
+        if let Some(m) = main
+            && m >= count
+        {
+            return Err(Error::new(format!(
+                "hibernated ModuleMap main id {m} out of range ({count})"
+            )));
+        }
+        Ok(Self { modules, ids, main })
     }
 }
 

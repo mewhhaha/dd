@@ -185,6 +185,82 @@ pub fn new_runtime_from_snapshot_with_heap_limit(
     new_runtime(startup_snapshot, policy, max_heap_bytes, module_registry)
 }
 
+/// Restores a hibernated worker isolate from portable `dd_v8` hibernation bytes
+/// (`DDHB0001`), re-caching `dd`'s runtime entrypoints and syncing the isolate
+/// clock to the current host time boundary.
+#[allow(dead_code)]
+pub fn wake_runtime_from_hibernation(
+    startup_snapshot: &'static [u8],
+    policy: IsolatePolicy,
+    max_heap_bytes: usize,
+    module_registry: ModuleRegistry,
+    bytes: &[u8],
+) -> Result<dd_v8::WokenRuntime> {
+    let mut woken = JsRuntime::wake(
+        RuntimeOptions {
+            ops: runtime_ops(),
+            module_loader: Some(Rc::new(RuntimeModuleLoader {
+                module_registry: module_registry.clone(),
+            })),
+            startup_snapshot: Some(startup_snapshot),
+            max_heap_bytes,
+            max_op_argument_bytes: policy.max_op_argument_bytes,
+            ext_scripts: &[],
+        },
+        bytes,
+    )
+    .map_err(runtime_error)?;
+    woken.runtime.op_state().borrow_mut().put(module_registry);
+    woken
+        .runtime
+        .set_allow_code_generation(policy.allow_code_generation);
+    cache_runtime_entrypoints(&mut woken.runtime)?;
+    sync_isolate_clock(&mut woken.runtime)?;
+    if policy.unscoped_fetch {
+        woken
+            .runtime
+            .op_state()
+            .borrow_mut()
+            .put(crate::ops::UnscopedFetch);
+    }
+    Ok(woken)
+}
+
+/// Transfers live host-side I/O handle tables (such as in-flight HTTP response
+/// bodies and active request contexts) from a hibernated isolate's `OpState`
+/// into a freshly woken isolate's `OpState`.
+#[allow(dead_code)]
+pub fn transfer_hibernated_host_state(
+    from: &Rc<std::cell::RefCell<dd_v8::OpState>>,
+    to: &Rc<std::cell::RefCell<dd_v8::OpState>>,
+) {
+    fn move_if_present<T: 'static>(src: &mut dd_v8::OpState, dst: &mut dd_v8::OpState) {
+        if let Some(value) = src.try_take::<T>() {
+            dst.put(value);
+        }
+    }
+    let mut src = from.borrow_mut();
+    let mut dst = to.borrow_mut();
+    move_if_present::<crate::ops::HttpClients>(&mut src, &mut dst);
+    move_if_present::<crate::ops::HttpResponseBodies>(&mut src, &mut dst);
+    move_if_present::<crate::ops::HttpPreparedBodies>(&mut src, &mut dst);
+    move_if_present::<crate::ops::HttpPreparedHeaders>(&mut src, &mut dst);
+    move_if_present::<crate::ops::RequestInvocationHandles>(&mut src, &mut dst);
+    move_if_present::<crate::ops::WorkerDeploymentHandles>(&mut src, &mut dst);
+    move_if_present::<crate::ops::RequestBodyStreams>(&mut src, &mut dst);
+    move_if_present::<crate::ops::ActiveRequestContextHandles>(&mut src, &mut dst);
+    move_if_present::<crate::ops::RequestSecretContexts>(&mut src, &mut dst);
+    move_if_present::<crate::ops::RuntimeExecutionLimits>(&mut src, &mut dst);
+    move_if_present::<crate::ops::IsolateEventSender>(&mut src, &mut dst);
+    move_if_present::<crate::ops::MemoryRequestScopes>(&mut src, &mut dst);
+    move_if_present::<crate::ops::MemoryCommandHandles>(&mut src, &mut dst);
+    move_if_present::<crate::ops::MemoryByteHandles>(&mut src, &mut dst);
+    move_if_present::<crate::ops::MemoryBatchHandles>(&mut src, &mut dst);
+    move_if_present::<crate::ops::MemoryReadHandles>(&mut src, &mut dst);
+    move_if_present::<crate::ops::PendingReplies>(&mut src, &mut dst);
+    move_if_present::<crate::ops::UnscopedFetch>(&mut src, &mut dst);
+}
+
 async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
     let module_id = evaluate_module(runtime, WORKER_SPECIFIER, source).await?;
     let namespace = runtime.module_namespace(module_id).map_err(runtime_error)?;

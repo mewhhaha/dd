@@ -35,6 +35,10 @@ impl WasmHostState {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.modules.is_empty() && self.instances.is_empty()
+    }
+
     pub(crate) fn dispatch(&mut self, kind: u32, payload: &[u8], max_bytes: usize) -> Vec<u8> {
         let args = match decode_wire_args(payload, max_bytes) {
             Ok(v) => v,

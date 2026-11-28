@@ -863,3 +863,332 @@ fn bare_imports_need_a_relative_prefix() {
         "Relative import path \"lodash\" not prefixed with / or ./ or ../ from \"file:///dd/a.js\""
     );
 }
+
+#[test]
+#[serial]
+fn worker_fetch_hibernates_and_resumes_across_real_http_io() {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{Semaphore, oneshot};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime should build");
+
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gated test HTTP server");
+        let address = listener.local_addr().expect("local addr");
+
+        let (step1_arrived_tx, step1_arrived_rx) = oneshot::channel::<()>();
+        let (step1_release_tx, step1_release_rx) = oneshot::channel::<()>();
+        let (step2_arrived_tx, step2_arrived_rx) = oneshot::channel::<()>();
+        let (step2_release_tx, step2_release_rx) = oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            // Hop 1: hold HTTP response open until isolate is hibernated and dropped.
+            let (mut s1, _) = listener.accept().await.expect("accept hop 1");
+            let mut buf = [0u8; 4096];
+            let n = s1.read(&mut buf).await.expect("read hop 1");
+            let req1 = String::from_utf8_lossy(&buf[..n]);
+            assert!(req1.starts_with("GET /step1 "), "unexpected hop 1: {req1}");
+            let _ = step1_arrived_tx.send(());
+            step1_release_rx.await.expect("release hop 1");
+            s1.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 14\r\nconnection: close\r\n\r\nfirst-response",
+            )
+            .await
+            .expect("write hop 1");
+            let _ = s1.shutdown().await;
+
+            // Hop 2: hold second HTTP response open until woken isolate hibernates again.
+            let (mut s2, _) = listener.accept().await.expect("accept hop 2");
+            let n2 = s2.read(&mut buf).await.expect("read hop 2");
+            let req2 = String::from_utf8_lossy(&buf[..n2]);
+            assert!(req2.starts_with("GET /step2 "), "unexpected hop 2: {req2}");
+            let _ = step2_arrived_tx.send(());
+            step2_release_rx.await.expect("release hop 2");
+            s2.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 15\r\nconnection: close\r\n\r\nsecond-response",
+            )
+            .await
+            .expect("write hop 2");
+            let _ = s2.shutdown().await;
+        });
+
+        let snapshot = build_bootstrap_snapshot()
+            .await
+            .expect("bootstrap snapshot should build");
+        let policy = IsolatePolicy::default();
+        let mut js_runtime = new_runtime_from_snapshot_with_heap_limit(
+            snapshot,
+            policy,
+            0,
+            ModuleRegistry::default(),
+        )
+        .expect("runtime 1 should start");
+
+        let completion_slot: Rc<RefCell<Option<Result<common::WorkerOutput>>>> =
+            Rc::new(RefCell::new(None));
+        let completion_sink = Rc::clone(&completion_slot);
+        {
+            let op_state_rc = js_runtime.op_state();
+            let mut op_state = op_state_rc.borrow_mut();
+            op_state.put(crate::ops::IsolateEventSender(Rc::new(move |event| {
+                if let crate::ops::IsolateEventPayload::Completion { result, .. } = event {
+                    *completion_sink.borrow_mut() = Some(result);
+                }
+                true
+            })));
+            op_state.put(crate::ops::RuntimeExecutionLimits {
+                max_request_body_bytes: 1024 * 1024,
+                max_response_body_bytes: 1024 * 1024,
+                max_isolate_heap_bytes: 0,
+                max_buffered_response_bytes: 1024 * 1024,
+                response_byte_budget: Arc::new(Semaphore::new(1024 * 1024)),
+            });
+            op_state.put(crate::ops::HttpPreparedBodies::default());
+            op_state.put(crate::ops::HttpPreparedHeaders::default());
+            op_state.put(crate::ops::RequestInvocationHandles::default());
+            op_state.put(crate::ops::WorkerDeploymentHandles::default());
+            op_state.put(crate::ops::RequestBodyStreams::default());
+            op_state.put(crate::ops::ActiveRequestContextHandles::default());
+            op_state.put(crate::ops::RequestSecretContexts::default());
+            op_state.put(crate::ops::MemoryRequestScopes::default());
+            op_state.put(crate::ops::MemoryCommandHandles::default());
+            op_state.put(crate::ops::MemoryByteHandles::default());
+            op_state.put(crate::ops::MemoryBatchHandles::default());
+            op_state.put(crate::ops::MemoryReadHandles::default());
+            op_state.put(crate::ops::PendingReplies::default());
+        }
+
+        let worker_source = format!(
+            r#"
+            export default {{
+              async fetch(request) {{
+                const key = {{ url: request.url }};
+                const meta = new WeakMap();
+                meta.set(key, {{ label: "steam-deck", arr: new Uint8Array([3, 5, 7]) }});
+                let stage = 1;
+
+                const res1 = await fetch("http://{address}/step1", {{
+                  headers: {{ "x-hop": "1" }},
+                }});
+                const body1 = await res1.text();
+                stage += 10;
+
+                const res2 = await fetch("http://{address}/step2", {{
+                  headers: {{ "x-hop": "2" }},
+                }});
+                const body2 = await res2.text();
+                stage += 100;
+
+                const saved = meta.get(key);
+                return new Response(
+                  `${{saved.label}}|${{saved.arr[2]}}|${{stage}}|${{body1}}|${{body2}}`,
+                  {{ status: 201, headers: {{ "x-hibernated": "2-hops" }} }},
+                );
+              }},
+            }};
+            "#
+        );
+        load_worker(&mut js_runtime, &worker_source)
+            .await
+            .expect("worker should load");
+        install_worker_deployment_config(
+            &mut js_runtime,
+            WorkerDeploymentPayload {
+                kv_bindings: Vec::new(),
+                memory_bindings: Vec::new(),
+                service_bindings: Vec::new(),
+            },
+        )
+        .expect("deployment config should install");
+
+        let (request_context_handle, completion_handle) = {
+            let op_state_rc = js_runtime.op_state();
+            let mut op_state = op_state_rc.borrow_mut();
+            let request_context_handle = crate::ops::register_request_secret_context(
+                &mut op_state,
+                1,
+                crate::ops::RequestExecutionContext::new(crate::ops::RequestExecutionContextInit {
+                    worker_name: "hibernate-worker".to_string(),
+                    generation: 1,
+                    service_bindings: Vec::new(),
+                    egress_allow_hosts: vec![format!("private:{address}")],
+                }),
+            );
+            let completion_handle = crate::ops::register_active_request_context(
+                &mut op_state,
+                "req-hibernate-1".to_string(),
+                "tok-1".to_string(),
+                request_context_handle,
+            );
+            (request_context_handle, completion_handle)
+        };
+
+        dispatch_worker_request(
+            &mut js_runtime,
+            WorkerDispatchRequest {
+                request_id: "req-hibernate-1",
+                request_context_handle,
+                completion_handle,
+                memory_request_scope_handle: 0,
+                request_body_stream_handle: 0,
+                stream_response: false,
+                memory_call: None,
+                request: WorkerInvocation {
+                    request_id: "req-hibernate-1".to_string(),
+                    method: "GET".to_string(),
+                    url: "http://worker/hibernate".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            },
+        )
+        .expect("dispatch worker request");
+
+        // Advance past op_http_prepare until op_http_fetch has sent GET /step1 and parked.
+        let mut arrived1 = Box::pin(step1_arrived_rx);
+        poll_fn(|cx| {
+            let _ = js_runtime.poll_event_loop(cx);
+            let has_fetch = js_runtime
+                .pending_io_tickets()
+                .iter()
+                .any(|t| t.op_name == "op_http_fetch");
+            if has_fetch && arrived1.as_mut().poll(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        // ---- SLEEP #1: serialize isolate to portable bytes and DROP runtime 1 (0 MiB RAM!) ----
+        let t_sleep1 = Instant::now();
+        let mut hib1 = js_runtime.hibernate(&[]).expect("hibernate at hop 1");
+        let sleep1_ms = t_sleep1.elapsed().as_secs_f64() * 1000.0;
+        let bytes1 = hib1.bytes().to_vec();
+        let heap1_bytes = hib1.heap_snapshot_bytes();
+        let mut detached1 = hib1.take_detached_futures();
+        assert_eq!(detached1.len(), 1);
+        assert_eq!(detached1[0].op_name(), "op_http_fetch");
+
+        // Isolate 1 is gone! Release HTTP server hop #1 and finish reqwest I/O while asleep.
+        step1_release_tx.send(()).expect("release server hop 1");
+        let (fetch1_id, fetch1_res) = detached1.remove(0).wait().await;
+        assert!(fetch1_res.is_ok(), "hop 1 fetch failed: {fetch1_res:?}");
+
+        // ---- WAKE #1 into brand-new Runtime 2 ----
+        let t_wake1 = Instant::now();
+        let mut woken2 = wake_runtime_from_hibernation(
+            snapshot,
+            policy,
+            0,
+            ModuleRegistry::default(),
+            &bytes1,
+        )
+        .expect("wake at hop 1");
+        let wake1_ms = t_wake1.elapsed().as_secs_f64() * 1000.0;
+        transfer_hibernated_host_state(&hib1.op_state(), &woken2.runtime.op_state());
+        drop(hib1);
+
+        woken2
+            .runtime
+            .settle_pending_op(fetch1_id, fetch1_res)
+            .expect("settle hop 1 fetch");
+
+        // Advance Runtime 2 through res1.text() + op_http_prepare until GET /step2 parks!
+        let mut arrived2 = Box::pin(step2_arrived_rx);
+        poll_fn(|cx| {
+            let _ = woken2.runtime.poll_event_loop(cx);
+            let has_fetch = woken2
+                .runtime
+                .pending_io_tickets()
+                .iter()
+                .any(|t| t.op_name == "op_http_fetch");
+            if has_fetch && arrived2.as_mut().poll(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        // ---- SLEEP #2: serialize Runtime 2 and DROP it completely ----
+        let t_sleep2 = Instant::now();
+        let mut hib2 = woken2.runtime.hibernate(&[]).expect("hibernate at hop 2");
+        let sleep2_ms = t_sleep2.elapsed().as_secs_f64() * 1000.0;
+        let bytes2 = hib2.bytes().to_vec();
+        let mut detached2 = hib2.take_detached_futures();
+        assert_eq!(detached2.len(), 1);
+        assert_eq!(detached2[0].op_name(), "op_http_fetch");
+
+        // Isolate 2 is gone! Release HTTP server hop #2 and finish reqwest I/O while asleep.
+        step2_release_tx.send(()).expect("release server hop 2");
+        let (fetch2_id, fetch2_res) = detached2.remove(0).wait().await;
+        assert!(fetch2_res.is_ok(), "hop 2 fetch failed: {fetch2_res:?}");
+
+        // ---- WAKE #2 into brand-new Runtime 3 and finish the worker request ----
+        let t_wake2 = Instant::now();
+        let mut woken3 = wake_runtime_from_hibernation(
+            snapshot,
+            policy,
+            0,
+            ModuleRegistry::default(),
+            &bytes2,
+        )
+        .expect("wake at hop 2");
+        let wake2_ms = t_wake2.elapsed().as_secs_f64() * 1000.0;
+        transfer_hibernated_host_state(&hib2.op_state(), &woken3.runtime.op_state());
+        drop(hib2);
+
+        woken3
+            .runtime
+            .settle_pending_op(fetch2_id, fetch2_res)
+            .expect("settle hop 2 fetch");
+        woken3
+            .runtime
+            .run_event_loop()
+            .await
+            .expect("finish worker event loop");
+
+        server_task.await.expect("server task clean");
+
+        let output = completion_slot
+            .borrow_mut()
+            .take()
+            .expect("worker completion should fire")
+            .expect("worker response should succeed");
+        assert_eq!(output.status, 201);
+        assert!(
+            output
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-hibernated") && v == "2-hops"),
+            "missing x-hibernated header: {:?}",
+            output.headers
+        );
+        assert_eq!(
+            String::from_utf8(output.body).expect("utf8 body"),
+            "steam-deck|7|111|first-response|second-response"
+        );
+
+        eprintln!(
+            "[dd worker fetch hibernation] bytes1={} ({:.2} MiB, heap={:.2} MiB) sleep1={:.2}ms wake1={:.2}ms | bytes2={} ({:.2} MiB) sleep2={:.2}ms wake2={:.2}ms",
+            bytes1.len(),
+            bytes1.len() as f64 / (1024.0 * 1024.0),
+            heap1_bytes as f64 / (1024.0 * 1024.0),
+            sleep1_ms,
+            wake1_ms,
+            bytes2.len(),
+            bytes2.len() as f64 / (1024.0 * 1024.0),
+            sleep2_ms,
+            wake2_ms,
+        );
+    });
+}
