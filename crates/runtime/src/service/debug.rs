@@ -101,6 +101,8 @@ impl WorkerPool {
                     .sort_by(|left, right| left.runtime_request_id.cmp(&right.runtime_request_id));
                 WorkerDebugIsolate {
                     id: isolate.id,
+                    hibernated: isolate.hibernated,
+                    hibernated_bytes: isolate.hibernated_bytes,
                     inflight_count: isolate.inflight_count,
                     pending_wait_until: isolate.pending_wait_until.len(),
                     active_websocket_sessions: isolate.active_websocket_sessions,

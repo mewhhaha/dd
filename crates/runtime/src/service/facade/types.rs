@@ -23,6 +23,10 @@ pub struct WorkerStats {
     pub inflight_total: usize,
     pub wait_until_total: usize,
     pub isolates_total: usize,
+    pub hibernated_isolates: usize,
+    pub hibernated_bytes: usize,
+    pub hibernate_count: u64,
+    pub wake_count: u64,
     pub spawn_count: u64,
     pub reuse_count: u64,
     pub scale_down_count: u64,
@@ -211,6 +215,8 @@ pub struct MemoryOutboxDebug {
 #[derive(Debug, Clone, Default)]
 pub struct WorkerDebugIsolate {
     pub id: u64,
+    pub hibernated: bool,
+    pub hibernated_bytes: usize,
     pub inflight_count: usize,
     pub pending_wait_until: usize,
     pub active_websocket_sessions: usize,

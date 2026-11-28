@@ -107,6 +107,51 @@ impl WorkerManager {
         self.admission.isolate_ready(&slot_starting);
     }
 
+    pub(crate) fn mark_isolate_hibernated(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        bytes: usize,
+    ) {
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return;
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|isolate| isolate.id == isolate_id)
+        else {
+            return;
+        };
+        isolate.hibernated = true;
+        isolate.hibernated_bytes = bytes;
+        pool.stats.hibernate_count = pool.stats.hibernate_count.saturating_add(1);
+        pool.log_stats("hibernated");
+    }
+
+    pub(crate) fn mark_isolate_woken(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) {
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return;
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|isolate| isolate.id == isolate_id)
+        else {
+            return;
+        };
+        isolate.hibernated = false;
+        isolate.hibernated_bytes = 0;
+        pool.stats.wake_count = pool.stats.wake_count.saturating_add(1);
+        pool.log_stats("woken");
+    }
+
     pub(crate) fn finish_wait_until(
         &mut self,
         worker_name: &str,

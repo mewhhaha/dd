@@ -5,6 +5,7 @@ use super::*;
 mod pool;
 mod selection;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 pub(super) use selection::select_dispatch_candidate;
 use std::{cell::RefCell, rc::Rc};
 
@@ -116,7 +117,7 @@ fn least_loaded_isolate_idx(
         .filter(|(_, isolate)| eligibility.accepts(isolate))
         .filter(|(_, isolate)| isolate.inflight_count < max_inflight)
         .filter(|(_, isolate)| !require_wait_until_idle || isolate.pending_wait_until.is_empty())
-        .min_by_key(|(_, isolate)| isolate.inflight_count)
+        .min_by_key(|(_, isolate)| (isolate.hibernated, isolate.inflight_count))
         .map(|(idx, _)| idx)
 }
 
@@ -129,7 +130,7 @@ fn least_loaded_isolate_any_idx(
         .enumerate()
         .filter(|(_, isolate)| isolate.startup.is_ready())
         .filter(|(_, isolate)| eligibility.accepts(isolate))
-        .min_by_key(|(_, isolate)| isolate.inflight_count)
+        .min_by_key(|(_, isolate)| (isolate.hibernated, isolate.inflight_count))
         .map(|(idx, _)| idx)
 }
 
@@ -317,6 +318,178 @@ fn runtime_event_from_isolate_payload(
     }
 }
 
+struct DetachedOpFuture {
+    op: Option<dd_v8::DetachedPendingOp>,
+}
+
+impl std::future::Future for DetachedOpFuture {
+    type Output = (u32, std::result::Result<dd_v8::WireValue, dd_v8::OpError>);
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let op = self
+            .op
+            .as_mut()
+            .expect("DetachedOpFuture polled after completion");
+        let output = std::task::ready!(op.poll_once(cx));
+        self.op = None;
+        std::task::Poll::Ready(output)
+    }
+}
+
+enum HibernatedImage {
+    Memory(Vec<u8>),
+    Disk { path: Option<PathBuf>, len: usize },
+}
+
+impl HibernatedImage {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(bytes) => bytes.len(),
+            Self::Disk { len, .. } => *len,
+        }
+    }
+
+    async fn load(mut self) -> Result<Vec<u8>> {
+        match &mut self {
+            Self::Memory(bytes) => Ok(std::mem::take(bytes)),
+            Self::Disk { path, .. } => {
+                let path = path.take().ok_or_else(|| {
+                    PlatformError::internal("hibernated disk image already taken")
+                })?;
+                let bytes = tokio::fs::read(&path).await.map_err(|error| {
+                    PlatformError::internal(format!("failed to read hibernated image: {error}"))
+                })?;
+                let _ = tokio::fs::remove_file(&path).await;
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+impl Drop for HibernatedImage {
+    fn drop(&mut self) {
+        if let Self::Disk { path, .. } = self
+            && let Some(path) = path.take()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+struct HibernatedIsolate {
+    image: HibernatedImage,
+    op_state: Rc<RefCell<dd_v8::OpState>>,
+    detached_futures: FuturesUnordered<DetachedOpFuture>,
+}
+
+enum IsolateVmState {
+    Awake {
+        runtime: Box<dd_v8::JsRuntime>,
+        gc_reclaimed_while_idle: bool,
+    },
+    Hibernated(HibernatedIsolate),
+}
+
+fn has_open_memory_transaction(runtime: &dd_v8::JsRuntime) -> bool {
+    let op_state = runtime.op_state();
+    let op_state = op_state.borrow();
+    let batch_open = op_state
+        .try_borrow::<crate::ops::MemoryBatchHandles>()
+        .is_some_and(|handles| !handles.is_empty());
+    let read_open = op_state
+        .try_borrow::<crate::ops::MemoryReadHandles>()
+        .is_some_and(|handles| !handles.is_empty());
+    let command_open = op_state
+        .try_borrow::<crate::ops::MemoryCommandHandles>()
+        .is_some_and(|handles| !handles.is_empty());
+    batch_open || read_open || command_open
+}
+
+async fn store_hibernated_image(
+    storage: IoHibernationStorage,
+    hibernation_dir: &std::path::Path,
+    isolate_id: u64,
+    bytes: Vec<u8>,
+) -> Result<HibernatedImage> {
+    match storage {
+        IoHibernationStorage::Memory => Ok(HibernatedImage::Memory(bytes)),
+        IoHibernationStorage::Disk => {
+            let len = bytes.len();
+            tokio::fs::create_dir_all(hibernation_dir)
+                .await
+                .map_err(|error| {
+                    PlatformError::internal(format!("failed to create hibernation dir: {error}"))
+                })?;
+            let path = hibernation_dir.join(format!("iso-{isolate_id}-{}.ddhb", Uuid::new_v4()));
+            tokio::fs::write(&path, &bytes).await.map_err(|error| {
+                PlatformError::internal(format!("failed to write hibernated image: {error}"))
+            })?;
+            drop(bytes);
+            dd_v8::reclaim_process_allocator_pages();
+            Ok(HibernatedImage::Disk {
+                path: Some(path),
+                len,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wake_hibernated_isolate(
+    slept: HibernatedIsolate,
+    settled: Vec<(u32, std::result::Result<dd_v8::WireValue, dd_v8::OpError>)>,
+    snapshot: &'static [u8],
+    policy: crate::engine::IsolatePolicy,
+    max_heap_bytes: usize,
+    module_registry: &crate::module_registry::ModuleRegistry,
+    thread_v8_handle: &StdMutex<Option<dd_v8::RuntimeHandle>>,
+    event_tx: &RuntimeEventSender,
+    worker_name: &str,
+    generation: u64,
+    isolate_id: u64,
+) -> Result<Box<dd_v8::JsRuntime>> {
+    let HibernatedIsolate {
+        image,
+        op_state,
+        detached_futures,
+    } = slept;
+    let bytes = image.load().await?;
+    let woken = wake_runtime_from_hibernation_with_op_state(
+        snapshot,
+        policy,
+        max_heap_bytes,
+        module_registry.clone(),
+        &bytes,
+        op_state,
+    )?;
+    drop(bytes);
+    let mut js_runtime = woken.runtime;
+    *thread_v8_handle.lock().expect("v8 handle mutex poisoned") = Some(js_runtime.handle());
+    for mut fut in detached_futures {
+        if let Some(op) = fut.op.take() {
+            js_runtime
+                .reattach_pending_op(op)
+                .map_err(|error| PlatformError::runtime(error.to_string()))?;
+        }
+    }
+    for (id, result) in settled {
+        js_runtime
+            .settle_pending_op(id, result)
+            .map_err(|error| PlatformError::runtime(error.to_string()))?;
+    }
+    let _ = event_tx
+        .send(RuntimeEvent::IsolateWoken {
+            worker_name: worker_name.to_string(),
+            generation,
+            isolate_id,
+        })
+        .await;
+    Ok(Box::new(js_runtime))
+}
+
 pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateHandle> {
     let IsolateThreadStart {
         admission,
@@ -333,6 +506,9 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         cache_store,
         open_handle_registry,
         execution_limits,
+        io_hibernate_after,
+        io_hibernate_storage,
+        hibernation_dir,
         runtime_fast_sender,
         worker_name,
         generation,
@@ -389,7 +565,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             snapshot,
                             policy,
                             execution_limits.max_isolate_heap_bytes,
-                            module_registry,
+                            module_registry.clone(),
                         ) {
                             Ok(runtime) => runtime,
                             Err(error) => {
@@ -504,77 +680,308 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             isolate_id,
                         }).await;
 
-                        let mut gc_reclaimed_while_idle = false;
+                        let mut vm_state = IsolateVmState::Awake {
+                            runtime: Box::new(js_runtime),
+                            gc_reclaimed_while_idle: false,
+                        };
                         loop {
-                            let mut made_progress = false;
-                            let mut drained_commands = 0usize;
-                            if !thread_request_control_inbox.is_empty() {
-                                if !handle_isolate_command_or_fail(
-                                    &mut js_runtime, &event_tx, &worker_name, generation,
-                                    isolate_id, IsolateCommand::DrainRequestControl,
-                                ).await { return; }
-                                made_progress = true;
-                            }
-
-
-                            while drained_commands < ISOLATE_COMMAND_DRAIN_BUDGET {
-                                match command_rx.try_recv() {
-                                    Ok(command) => {
+                            match vm_state {
+                                IsolateVmState::Awake {
+                                    mut runtime,
+                                    mut gc_reclaimed_while_idle,
+                                } => {
+                                    let mut made_progress = false;
+                                    let mut drained_commands = 0usize;
+                                    if !thread_request_control_inbox.is_empty() {
+                                        if !handle_isolate_command_or_fail(
+                                            &mut runtime, &event_tx, &worker_name, generation,
+                                            isolate_id, IsolateCommand::DrainRequestControl,
+                                        ).await { return; }
                                         made_progress = true;
-                                        drained_commands = drained_commands.saturating_add(1);
-                                        if !handle_isolate_command_or_fail(
-                                            &mut js_runtime,
-                                            &event_tx,
-                                            &worker_name,
-                                            generation,
-                                            isolate_id,
-                                            command,
-                                        )
-                                        .await
-                                        {
-                                            return;
-                                        }
-                                        if !flush_pending_isolate_events(
-                                            &pending_isolate_events,
-                                            &event_tx,
-                                        )
-                                        .await
-                                        {
-                                            return;
+                                    }
+
+                                    while drained_commands < ISOLATE_COMMAND_DRAIN_BUDGET {
+                                        match command_rx.try_recv() {
+                                            Ok(command) => {
+                                                made_progress = true;
+                                                drained_commands = drained_commands.saturating_add(1);
+                                                if !handle_isolate_command_or_fail(
+                                                    &mut runtime,
+                                                    &event_tx,
+                                                    &worker_name,
+                                                    generation,
+                                                    isolate_id,
+                                                    command,
+                                                )
+                                                .await
+                                                {
+                                                    return;
+                                                }
+                                                if !flush_pending_isolate_events(
+                                                    &pending_isolate_events,
+                                                    &event_tx,
+                                                )
+                                                .await
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                            Err(TryRecvError::Empty) => break,
+                                            Err(TryRecvError::Disconnected) => return,
                                         }
                                     }
-                                    Err(TryRecvError::Empty) => break,
-                                    Err(TryRecvError::Disconnected) => return,
-                                }
-                            }
 
-                            if let Err(error) = pump_event_loop_once(&mut js_runtime, &event_loop_waker) {
-                                let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                                    worker_name: worker_name.clone(),
-                                    generation,
-                                    isolate_id,
-                                    error,
-                                }).await;
-                                break;
-                            }
-                            if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
-                                return;
-                            }
+                                    if let Err(error) = pump_event_loop_once(&mut runtime, &event_loop_waker) {
+                                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                            worker_name: worker_name.clone(),
+                                            generation,
+                                            isolate_id,
+                                            error,
+                                        }).await;
+                                        break;
+                                    }
+                                    if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                        return;
+                                    }
 
-                            if made_progress {
-                                gc_reclaimed_while_idle = false;
-                                continue;
-                            }
-
-                            if !gc_reclaimed_while_idle {
-                                tokio::select! {
-                                    command = command_rx.recv() => {
-                                        gc_reclaimed_while_idle = false;
-                                        let Some(command) = command else {
-                                            return;
+                                    if made_progress || !thread_request_control_inbox.is_empty() {
+                                        vm_state = IsolateVmState::Awake {
+                                            runtime,
+                                            gc_reclaimed_while_idle: false,
                                         };
+                                        continue;
+                                    }
+
+                                    let hibernate_delay = io_hibernate_after.filter(|_| {
+                                        runtime.pending_io_count() > 0
+                                            && runtime.can_hibernate()
+                                            && !has_open_memory_transaction(&runtime)
+                                    });
+
+                                    if let Some(delay) = hibernate_delay {
+                                        tokio::select! {
+                                            command = command_rx.recv() => {
+                                                let Some(command) = command else {
+                                                    return;
+                                                };
+                                                if !handle_isolate_command_or_fail(
+                                                    &mut runtime,
+                                                    &event_tx,
+                                                    &worker_name,
+                                                    generation,
+                                                    isolate_id,
+                                                    command,
+                                                )
+                                                .await
+                                                {
+                                                    return;
+                                                }
+                                                if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                                    return;
+                                                }
+                                                vm_state = IsolateVmState::Awake {
+                                                    runtime,
+                                                    gc_reclaimed_while_idle: false,
+                                                };
+                                            }
+                                            _ = event_loop_notify.notified() => {
+                                                vm_state = IsolateVmState::Awake {
+                                                    runtime,
+                                                    gc_reclaimed_while_idle: false,
+                                                };
+                                            }
+                                            _ = thread_request_control_inbox.ready.notified() => {
+                                                vm_state = IsolateVmState::Awake {
+                                                    runtime,
+                                                    gc_reclaimed_while_idle: false,
+                                                };
+                                            }
+                                            _ = tokio::time::sleep(delay) => {
+                                                clear_runtime_entrypoints(&mut runtime);
+                                                let hib = match (*runtime).hibernate(&[]) {
+                                                    Ok(hib) => hib,
+                                                    Err(error) => {
+                                                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                                            worker_name: worker_name.clone(),
+                                                            generation,
+                                                            isolate_id,
+                                                            error: PlatformError::runtime(error.to_string()),
+                                                        }).await;
+                                                        return;
+                                                    }
+                                                };
+                                                *thread_v8_handle.lock().expect("v8 handle mutex poisoned") = None;
+                                                let (bytes, detached, op_state, _heap_bytes) = hib.into_parts();
+                                                let image = match store_hibernated_image(
+                                                    io_hibernate_storage,
+                                                    &hibernation_dir,
+                                                    isolate_id,
+                                                    bytes,
+                                                ).await {
+                                                    Ok(image) => image,
+                                                    Err(error) => {
+                                                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                                            worker_name: worker_name.clone(),
+                                                            generation,
+                                                            isolate_id,
+                                                            error,
+                                                        }).await;
+                                                        return;
+                                                    }
+                                                };
+                                                let image_bytes = image.len();
+                                                let detached_futures = FuturesUnordered::new();
+                                                for op in detached {
+                                                    detached_futures.push(DetachedOpFuture { op: Some(op) });
+                                                }
+                                                let _ = event_tx.send(RuntimeEvent::IsolateHibernated {
+                                                    worker_name: worker_name.clone(),
+                                                    generation,
+                                                    isolate_id,
+                                                    bytes: image_bytes,
+                                                }).await;
+                                                vm_state = IsolateVmState::Hibernated(HibernatedIsolate {
+                                                    image,
+                                                    op_state,
+                                                    detached_futures,
+                                                });
+                                            }
+                                        }
+                                    } else if !gc_reclaimed_while_idle {
+                                        tokio::select! {
+                                            command = command_rx.recv() => {
+                                                gc_reclaimed_while_idle = false;
+                                                let Some(command) = command else {
+                                                    return;
+                                                };
+                                                if !handle_isolate_command_or_fail(
+                                                    &mut runtime,
+                                                    &event_tx,
+                                                    &worker_name,
+                                                    generation,
+                                                    isolate_id,
+                                                    command,
+                                                )
+                                                .await
+                                                {
+                                                    return;
+                                                }
+                                                if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                                    return;
+                                                }
+                                            }
+                                            _ = event_loop_notify.notified() => {
+                                                gc_reclaimed_while_idle = false;
+                                            }
+                                            _ = thread_request_control_inbox.ready.notified() => {
+                                                gc_reclaimed_while_idle = false;
+                                            }
+                                            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                                                runtime.reclaim_inactive_gc_space();
+                                                gc_reclaimed_while_idle = true;
+                                            }
+                                        }
+                                        vm_state = IsolateVmState::Awake {
+                                            runtime,
+                                            gc_reclaimed_while_idle,
+                                        };
+                                    } else {
+                                        tokio::select! {
+                                            command = command_rx.recv() => {
+                                                gc_reclaimed_while_idle = false;
+                                                let Some(command) = command else {
+                                                    return;
+                                                };
+                                                if !handle_isolate_command_or_fail(
+                                                    &mut runtime,
+                                                    &event_tx,
+                                                    &worker_name,
+                                                    generation,
+                                                    isolate_id,
+                                                    command,
+                                                )
+                                                .await
+                                                {
+                                                    return;
+                                                }
+                                                if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                                    return;
+                                                }
+                                            }
+                                            _ = event_loop_notify.notified() => {
+                                                gc_reclaimed_while_idle = false;
+                                            }
+                                            _ = thread_request_control_inbox.ready.notified() => {
+                                                gc_reclaimed_while_idle = false;
+                                            }
+                                        }
+                                        vm_state = IsolateVmState::Awake {
+                                            runtime,
+                                            gc_reclaimed_while_idle,
+                                        };
+                                    }
+                                }
+                                IsolateVmState::Hibernated(mut slept) => {
+                                    enum WakeTrigger {
+                                        IoSettled(Vec<(u32, std::result::Result<dd_v8::WireValue, dd_v8::OpError>)>),
+                                        Command(IsolateCommand),
+                                        ControlInbox,
+                                    }
+                                    let trigger = tokio::select! {
+                                        Some(done) = slept.detached_futures.next(), if !slept.detached_futures.is_empty() => {
+                                            let mut settled = vec![done];
+                                            while let Some(Some(extra)) = slept.detached_futures.next().now_or_never() {
+                                                settled.push(extra);
+                                            }
+                                            WakeTrigger::IoSettled(settled)
+                                        }
+                                        command = command_rx.recv() => {
+                                            let Some(command) = command else {
+                                                return;
+                                            };
+                                            WakeTrigger::Command(command)
+                                        }
+                                        _ = thread_request_control_inbox.ready.notified() => {
+                                            WakeTrigger::ControlInbox
+                                        }
+                                    };
+                                    let (settled, pending_command) = match trigger {
+                                        WakeTrigger::IoSettled(settled) => (settled, None),
+                                        WakeTrigger::Command(command) => (Vec::new(), Some(command)),
+                                        WakeTrigger::ControlInbox => (Vec::new(), None),
+                                    };
+                                    let mut runtime = match wake_hibernated_isolate(
+                                        slept,
+                                        settled,
+                                        snapshot,
+                                        policy,
+                                        execution_limits.max_isolate_heap_bytes,
+                                        &module_registry,
+                                        &thread_v8_handle,
+                                        &event_tx,
+                                        &worker_name,
+                                        generation,
+                                        isolate_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(runtime) => runtime,
+                                        Err(error) => {
+                                            let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                                worker_name: worker_name.clone(),
+                                                generation,
+                                                isolate_id,
+                                                error,
+                                            }).await;
+                                            return;
+                                        }
+                                    };
+                                    if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                        return;
+                                    }
+                                    if let Some(command) = pending_command {
                                         if !handle_isolate_command_or_fail(
-                                            &mut js_runtime,
+                                            &mut runtime,
                                             &event_tx,
                                             &worker_name,
                                             generation,
@@ -589,46 +996,10 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                                             return;
                                         }
                                     }
-                                    _ = event_loop_notify.notified() => {
-                                        gc_reclaimed_while_idle = false;
-                                    }
-                                    _ = thread_request_control_inbox.ready.notified() => {
-                                        gc_reclaimed_while_idle = false;
-                                    }
-                                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                                        js_runtime.reclaim_inactive_gc_space();
-                                        gc_reclaimed_while_idle = true;
-                                    }
-                                }
-                            } else {
-                                tokio::select! {
-                                    command = command_rx.recv() => {
-                                        gc_reclaimed_while_idle = false;
-                                        let Some(command) = command else {
-                                            return;
-                                        };
-                                        if !handle_isolate_command_or_fail(
-                                            &mut js_runtime,
-                                            &event_tx,
-                                            &worker_name,
-                                            generation,
-                                            isolate_id,
-                                            command,
-                                        )
-                                        .await
-                                        {
-                                            return;
-                                        }
-                                        if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
-                                            return;
-                                        }
-                                    }
-                                    _ = event_loop_notify.notified() => {
-                                        gc_reclaimed_while_idle = false;
-                                    }
-                                    _ = thread_request_control_inbox.ready.notified() => {
-                                        gc_reclaimed_while_idle = false;
-                                    }
+                                    vm_state = IsolateVmState::Awake {
+                                        runtime,
+                                        gc_reclaimed_while_idle: false,
+                                    };
                                 }
                             }
                         }
@@ -655,6 +1026,8 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         startup: IsolateStartup::Starting {
             started_at: Instant::now(),
         },
+        hibernated: false,
+        hibernated_bytes: 0,
         internal_rescue: false,
         inflight_count: 0,
         active_websocket_sessions: 0,

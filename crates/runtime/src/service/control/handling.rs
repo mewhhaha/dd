@@ -388,6 +388,21 @@ impl WorkerManager {
                 self.mark_isolate_ready(&worker_name, generation, isolate_id);
                 self.dispatch_pool(&worker_name, generation, event_tx);
             }
+            RuntimeEvent::IsolateHibernated {
+                worker_name,
+                generation,
+                isolate_id,
+                bytes,
+            } => {
+                self.mark_isolate_hibernated(&worker_name, generation, isolate_id, bytes);
+            }
+            RuntimeEvent::IsolateWoken {
+                worker_name,
+                generation,
+                isolate_id,
+            } => {
+                self.mark_isolate_woken(&worker_name, generation, isolate_id);
+            }
             RuntimeEvent::IsolateFailed {
                 worker_name,
                 generation,

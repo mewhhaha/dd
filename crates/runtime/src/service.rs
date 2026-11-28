@@ -19,9 +19,9 @@ use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheS
 use crate::control_store::{ControlDeployment, ControlStore};
 use crate::engine::{
     WorkerDispatchRequest, abort_worker_request_handle, build_bootstrap_snapshot,
-    dispatch_worker_request, drain_request_control_queue, ensure_v8_flags,
-    install_worker_deployment_config, new_runtime_from_snapshot_with_heap_limit,
-    pump_event_loop_once,
+    clear_runtime_entrypoints, dispatch_worker_request, drain_request_control_queue,
+    ensure_v8_flags, install_worker_deployment_config, new_runtime_from_snapshot_with_heap_limit,
+    pump_event_loop_once, wake_runtime_from_hibernation_with_op_state,
 };
 use crate::kv::KvStore;
 use crate::memory::{
@@ -81,12 +81,12 @@ type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
 type AssetCatalogSnapshot = Arc<ArcSwap<HashMap<String, Arc<AssetCatalogEntry>>>>;
 pub(crate) use self::control::{RuntimeCommand, RuntimeFastCommandSender};
 pub use self::facade::{
-    FrontCacheDeployment, InvokeRequestBodyReceiver, MemoryOutboxDebug, MemorySchedulerDebug,
-    MemoryShardDebug, PublicRouteAssetResolution, RuntimeAdminSnapshot, RuntimeCheckpointResult,
-    RuntimeConfig, RuntimeReadiness, RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, RuntimeWorkerStatus, WebSocketFrameLease, WebSocketFrameOutput,
-    WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate, WorkerDebugRequest, WorkerStats,
-    WorkerStreamBody, WorkerStreamOutput,
+    FrontCacheDeployment, InvokeRequestBodyReceiver, IoHibernationStorage, MemoryOutboxDebug,
+    MemorySchedulerDebug, MemoryShardDebug, PublicRouteAssetResolution, RuntimeAdminSnapshot,
+    RuntimeCheckpointResult, RuntimeConfig, RuntimeReadiness, RuntimeRestoreFailure,
+    RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, RuntimeWorkerStatus,
+    WebSocketFrameLease, WebSocketFrameOutput, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
+    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };
 use self::inspector::InspectorRegistry;
 pub use self::inspector::{InspectorMode, InspectorSession, InspectorTarget};

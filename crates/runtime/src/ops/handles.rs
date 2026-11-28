@@ -137,6 +137,11 @@ impl<T: OwnedHandle> OwnedHandleTable<T> {
     pub(crate) fn usage(&self, owner: u32) -> usize {
         self.usage.get(&owner).copied().unwrap_or(0)
     }
+
+    /// Returns `true` when no request currently holds a handle in this table.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.usage.is_empty()
+    }
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ impl WorkerManager {
             memory_outbox_drain_sender,
             cache_store,
             config,
+            hibernation_dir,
             control_store,
             module_registry,
             runtime_fast_sender,
@@ -32,6 +33,7 @@ impl WorkerManager {
         let next_memory_entity_epoch = memory_store.owner_epoch_floor();
         Self {
             config,
+            hibernation_dir,
             control_store,
             module_registry,
             bootstrap_snapshot,

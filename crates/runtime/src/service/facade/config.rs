@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Storage backend for automatically hibernated `DDHB0001` isolate images.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IoHibernationStorage {
+    /// Keep zstd-compressed hibernation images in RAM (~1 MiB vs ~7 MiB live).
+    #[default]
+    Memory,
+    /// Spill zstd-compressed hibernation images to `store_dir/hibernation/`
+    /// (0 MiB live Wasm/GC RAM while parked on async I/O).
+    Disk,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub min_isolates: usize,
@@ -47,6 +58,12 @@ pub struct RuntimeConfig {
     pub kv_profile_enabled: bool,
     pub memory_profile_enabled: bool,
     pub temporary_worker_ttl: Duration,
+    /// Automatically hibernate an isolate that remains parked waiting on async
+    /// I/O (such as slow `fetch` or timers) for at least this duration. Set to
+    /// `None` to disable automatic I/O hibernation.
+    pub io_hibernate_after: Option<Duration>,
+    /// Where automatically hibernated `DDHB0001` images live while asleep.
+    pub io_hibernate_storage: IoHibernationStorage,
 }
 
 impl Default for RuntimeConfig {
@@ -86,6 +103,8 @@ impl Default for RuntimeConfig {
             kv_profile_enabled: false,
             memory_profile_enabled: false,
             temporary_worker_ttl: Duration::from_secs(60 * 60),
+            io_hibernate_after: Some(Duration::from_millis(250)),
+            io_hibernate_storage: IoHibernationStorage::Memory,
         }
     }
 }

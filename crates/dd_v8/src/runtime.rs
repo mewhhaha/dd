@@ -51,7 +51,10 @@ static PRECOMPILED_KERNEL_STORAGE: PageAligned<
 )));
 const SNAPSHOT_MAGIC: &[u8; 8] = b"DDSW0001";
 const HIBERNATION_MAGIC: &[u8; 8] = b"DDHB0001";
-const HIBERNATION_VERSION: u32 = 1;
+const HIBERNATION_VERSION_RAW: u32 = 1;
+const HIBERNATION_VERSION_ZSTD: u32 = 2;
+const DEFAULT_HIBERNATION_ZSTD_LEVEL: i32 = 1;
+const MAX_HIBERNATION_DECOMPRESSED_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct RuntimeOptions {
@@ -613,6 +616,23 @@ pub struct PendingIoTicket {
     pub args: Vec<WireValue>,
 }
 
+/// Compression mode applied to portable `DDHB0001` hibernation images.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HibernationCompression {
+    /// Uncompressed `DDHB0001` v1 payload.
+    None,
+    /// Zstandard-compressed `DDHB0001` v2 payload (default: level 1).
+    Zstd { level: i32 },
+}
+
+impl Default for HibernationCompression {
+    fn default() -> Self {
+        Self::Zstd {
+            level: DEFAULT_HIBERNATION_ZSTD_LEVEL,
+        }
+    }
+}
+
 /// An in-flight Rust future detached from a [`JsRuntime`] when it hibernated.
 ///
 /// The host may await this future while the isolate is dropped (using 0 bytes of
@@ -634,6 +654,12 @@ impl DetachedPendingOp {
     /// Returns the async op name (matching `OpDecl::name`).
     pub fn op_name(&self) -> &str {
         &self.op_name
+    }
+
+    /// Polls the underlying detached future once without consuming `self`.
+    pub fn poll_once(&mut self, cx: &mut Context<'_>) -> Poll<(u32, Result<WireValue, OpError>)> {
+        let res = std::task::ready!(self.future.as_mut().poll(cx));
+        Poll::Ready((self.id, res))
     }
 
     /// Drives the detached I/O future to completion and returns `(id, result)`.
@@ -671,6 +697,16 @@ impl HibernatedRuntime {
     /// dropping any detached futures and old host `OpState`.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    /// Consumes this handle and returns `(bytes, detached_futures, op_state, heap_snapshot_bytes)`.
+    pub fn into_parts(self) -> (Vec<u8>, Vec<DetachedPendingOp>, Rc<RefCell<OpState>>, usize) {
+        (
+            self.bytes,
+            self.detached_futures,
+            self.op_state,
+            self.heap_snapshot_bytes,
+        )
     }
 
     /// Tickets describing all async ops that were pending at hibernation time,
@@ -1847,6 +1883,23 @@ impl JsRuntime {
         }
     }
 
+    /// Returns the number of currently unsettled async ops (both live and
+    /// restored from hibernation).
+    pub fn pending_io_count(&self) -> usize {
+        self.state.pending_meta.borrow().len()
+    }
+
+    /// Returns `true` when this runtime can currently be serialized via
+    /// [`Self::hibernate`] (live VM, not terminated, no snapshot recorder, no
+    /// DevTools inspector, and no live WebAssembly JS-API handles).
+    pub fn can_hibernate(&self) -> bool {
+        !self.terminated.load(Ordering::Acquire)
+            && self.recorder.is_none()
+            && self.inspector_handle.get().is_none()
+            && self.state.wasm.borrow().is_empty()
+            && self.vm.is_some()
+    }
+
     /// Returns metadata tickets for all currently unsettled async ops (sorted
     /// by pending `id`), including ops restored from hibernation awaiting
     /// external settlement via [`Self::settle_pending_op`].
@@ -1896,11 +1949,23 @@ impl JsRuntime {
     }
 
     /// Hibernates this runtime into portable SHA-256-authenticated bytes
-    /// (`DDHB0001`), capturing the compacted Wasm/GC heap, dynamically compiled
-    /// JS modules, ES module table, `WeakMap`/`WeakSet` entries, retained
-    /// [`JsValue`] handles, and all pending async op tickets + detached futures,
-    /// then drops the underlying Wasm `Store` and GC heap immediately.
-    pub fn hibernate(mut self, retained: &[&JsValue]) -> Result<HibernatedRuntime, Error> {
+    /// (`DDHB0001`, zstd-compressed v2 by default), capturing the compacted
+    /// Wasm/GC heap, dynamically compiled JS modules, ES module table,
+    /// `WeakMap`/`WeakSet` entries, retained [`JsValue`] handles, and all
+    /// pending async op tickets + detached futures, then drops the underlying
+    /// Wasm `Store` and GC heap immediately.
+    pub fn hibernate(self, retained: &[&JsValue]) -> Result<HibernatedRuntime, Error> {
+        self.hibernate_with_compression(retained, HibernationCompression::default())
+    }
+
+    /// Like [`Self::hibernate`], with explicit [`HibernationCompression`]
+    /// control (`None` produces raw v1 `DDHB0001`; `Zstd` produces compressed
+    /// v2 `DDHB0001`).
+    pub fn hibernate_with_compression(
+        mut self,
+        retained: &[&JsValue],
+        compression: HibernationCompression,
+    ) -> Result<HibernatedRuntime, Error> {
         self.check_terminated()?;
         if self.recorder.is_some() {
             return Err(Error::new("cannot hibernate a snapshot-recording runtime"));
@@ -1944,6 +2009,9 @@ impl JsRuntime {
             (bytes, heap_len)
         };
 
+        // Release Wasm Store + GC heap BEFORE encoding/compressing to minimize peak RSS.
+        self.vm.take();
+
         let pending_ops = self.pending_io_tickets();
         let pending_meta_snapshot: HashMap<u32, String> = self
             .state
@@ -1966,55 +2034,85 @@ impl JsRuntime {
                 .collect();
         detached_futures.sort_by_key(|f| f.id);
 
-        let mut out = Vec::with_capacity(embedded_bytes.len() + 1024);
-        out.extend_from_slice(HIBERNATION_MAGIC);
-        out.extend_from_slice(&HIBERNATION_VERSION.to_le_bytes());
+        // Encode metadata prefix (~few KiB) separately so we never duplicate the multi-MiB
+        // `embedded_bytes` buffer when compressing.
+        let mut meta_prefix = Vec::with_capacity(1024);
 
         // Op table contract.
-        out.extend_from_slice(&(self.state.ops.len() as u32).to_le_bytes());
+        meta_prefix.extend_from_slice(&(self.state.ops.len() as u32).to_le_bytes());
         for op in &self.state.ops {
             let nb = op.name.as_bytes();
-            out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
-            out.extend_from_slice(nb);
+            meta_prefix.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            meta_prefix.extend_from_slice(nb);
         }
 
         // Runtime counters & limits.
-        out.extend_from_slice(&(*self.state.next_pending_id.borrow()).to_le_bytes());
-        out.extend_from_slice(&(self.state.max_op_argument_bytes as u64).to_le_bytes());
-        out.extend_from_slice(&(retained.len() as u32).to_le_bytes());
+        meta_prefix.extend_from_slice(&(*self.state.next_pending_id.borrow()).to_le_bytes());
+        meta_prefix.extend_from_slice(&(self.state.max_op_argument_bytes as u64).to_le_bytes());
+        meta_prefix.extend_from_slice(&(retained.len() as u32).to_le_bytes());
 
         // Loaded ES module table.
-        self.state.modules.borrow().encode_bytes(&mut out);
+        self.state.modules.borrow().encode_bytes(&mut meta_prefix);
 
         // Suspended async op tickets (id, op_name, wire-encoded args).
-        out.extend_from_slice(&(pending_ops.len() as u32).to_le_bytes());
+        meta_prefix.extend_from_slice(&(pending_ops.len() as u32).to_le_bytes());
         for ticket in &pending_ops {
-            out.extend_from_slice(&ticket.id.to_le_bytes());
+            meta_prefix.extend_from_slice(&ticket.id.to_le_bytes());
             let nb = ticket.op_name.as_bytes();
-            out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
-            out.extend_from_slice(nb);
+            meta_prefix.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            meta_prefix.extend_from_slice(nb);
             let mut wire_args = Vec::with_capacity(32);
             wire_args.extend_from_slice(&(ticket.args.len() as u32).to_le_bytes());
             for arg in &ticket.args {
                 encode_wire(arg, &mut wire_args);
             }
-            out.extend_from_slice(&(wire_args.len() as u32).to_le_bytes());
-            out.extend_from_slice(&wire_args);
+            meta_prefix.extend_from_slice(&(wire_args.len() as u32).to_le_bytes());
+            meta_prefix.extend_from_slice(&wire_args);
         }
 
-        // Inner Scriptw/wtime portable snapshot bytes.
-        out.extend_from_slice(&(embedded_bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(&embedded_bytes);
+        // Length prefix for inner Scriptw/wtime portable snapshot bytes.
+        meta_prefix.extend_from_slice(&(embedded_bytes.len() as u64).to_le_bytes());
+        let raw_body_len = meta_prefix.len() + embedded_bytes.len();
 
-        // Trailing SHA-256 integrity digest.
+        let mut out = match compression {
+            HibernationCompression::None => {
+                let mut out = Vec::with_capacity(8 + 4 + raw_body_len + 32);
+                out.extend_from_slice(HIBERNATION_MAGIC);
+                out.extend_from_slice(&HIBERNATION_VERSION_RAW.to_le_bytes());
+                out.extend_from_slice(&meta_prefix);
+                out.extend_from_slice(&embedded_bytes);
+                out
+            }
+            HibernationCompression::Zstd { level } => {
+                use std::io::Write as _;
+                let mut out = Vec::with_capacity((raw_body_len / 4).max(64 * 1024));
+                out.extend_from_slice(HIBERNATION_MAGIC);
+                out.extend_from_slice(&HIBERNATION_VERSION_ZSTD.to_le_bytes());
+                out.extend_from_slice(&(raw_body_len as u64).to_le_bytes());
+                let mut encoder = zstd::stream::write::Encoder::new(out, level)
+                    .map_err(|e| Error::new(format!("hibernate zstd encoder init failed: {e}")))?;
+                encoder
+                    .write_all(&meta_prefix)
+                    .and_then(|()| encoder.write_all(&embedded_bytes))
+                    .map_err(|e| Error::new(format!("hibernate zstd compress failed: {e}")))?;
+                let mut out = encoder
+                    .finish()
+                    .map_err(|e| Error::new(format!("hibernate zstd finish failed: {e}")))?;
+                out.reserve_exact(32);
+                out
+            }
+        };
+        drop(embedded_bytes);
+        drop(meta_prefix);
+
+        // Trailing SHA-256 integrity digest over header + payload.
         let digest = sha256_bytes(&out);
         out.extend_from_slice(&digest);
+        out.shrink_to_fit();
 
         let op_state = Rc::clone(&self.state.op_state);
-
-        // Release Wasm Store + GC heap immediately before returning.
-        self.vm.take();
         drop(self);
+        reclaim_process_allocator_pages();
 
         Ok(HibernatedRuntime {
             bytes: out,
@@ -2026,9 +2124,30 @@ impl JsRuntime {
     }
 
     /// Restores a [`JsRuntime`] from hibernation bytes produced by
-    /// [`Self::hibernate`], returning the live runtime, reconstructed retained
-    /// [`JsValue`]s, and pending async op tickets.
+    /// [`Self::hibernate`] (supporting both v1 raw and v2 zstd images),
+    /// returning the live runtime, reconstructed retained [`JsValue`]s, and
+    /// pending async op tickets.
     pub fn wake(options: RuntimeOptions, bytes: &[u8]) -> Result<WokenRuntime, Error> {
+        Self::wake_inner(options, bytes, None)
+    }
+
+    /// Like [`Self::wake`], but reuses an existing host [`OpState`] (for
+    /// same-process sleep/wake cycles so all host-side resource tables and
+    /// concurrently in-flight [`DetachedPendingOp`] futures keep pointing to
+    /// the exact same live `OpState`).
+    pub fn wake_with_op_state(
+        options: RuntimeOptions,
+        bytes: &[u8],
+        op_state: Rc<RefCell<OpState>>,
+    ) -> Result<WokenRuntime, Error> {
+        Self::wake_inner(options, bytes, Some(op_state))
+    }
+
+    fn wake_inner(
+        options: RuntimeOptions,
+        bytes: &[u8],
+        existing_op_state: Option<Rc<RefCell<OpState>>>,
+    ) -> Result<WokenRuntime, Error> {
         platform::init();
         if bytes.len() < 8 + 4 + 32 || &bytes[..8] != HIBERNATION_MAGIC {
             return Err(Error::new("invalid dd_v8 hibernation snapshot header"));
@@ -2041,8 +2160,44 @@ impl JsRuntime {
             ));
         }
 
-        let body = &bytes[..body_end];
-        let mut pos = 8usize;
+        let header_and_payload = &bytes[..body_end];
+        let version = u32::from_le_bytes(header_and_payload[8..12].try_into().unwrap());
+        let decoded_payload: std::borrow::Cow<'_, [u8]> = match version {
+            HIBERNATION_VERSION_RAW => std::borrow::Cow::Borrowed(&header_and_payload[12..]),
+            HIBERNATION_VERSION_ZSTD => {
+                if header_and_payload.len() < 20 {
+                    return Err(Error::new("hibernation snapshot unexpected EOF"));
+                }
+                let uncompressed_len =
+                    u64::from_le_bytes(header_and_payload[12..20].try_into().unwrap());
+                let uncompressed_len = usize::try_from(uncompressed_len)
+                    .map_err(|_| Error::new("hibernation snapshot decompressed length overflow"))?;
+                if uncompressed_len > MAX_HIBERNATION_DECOMPRESSED_BYTES {
+                    return Err(Error::new(format!(
+                        "hibernation snapshot decompressed size {uncompressed_len} exceeds limit {MAX_HIBERNATION_DECOMPRESSED_BYTES}"
+                    )));
+                }
+                let decompressed =
+                    zstd::bulk::decompress(&header_and_payload[20..], uncompressed_len).map_err(
+                        |e| Error::new(format!("hibernation snapshot zstd decompress failed: {e}")),
+                    )?;
+                if decompressed.len() != uncompressed_len {
+                    return Err(Error::new(format!(
+                        "hibernation snapshot zstd length mismatch: expected {uncompressed_len}, got {}",
+                        decompressed.len()
+                    )));
+                }
+                std::borrow::Cow::Owned(decompressed)
+            }
+            other => {
+                return Err(Error::new(format!(
+                    "unsupported dd_v8 hibernation snapshot version {other}"
+                )));
+            }
+        };
+
+        let body = decoded_payload.as_ref();
+        let mut pos = 0usize;
         fn read_exact<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], Error> {
             let end = pos
                 .checked_add(n)
@@ -2070,13 +2225,6 @@ impl JsRuntime {
             std::str::from_utf8(raw)
                 .map(ToOwned::to_owned)
                 .map_err(|_| Error::new("hibernation snapshot contains invalid UTF-8"))
-        }
-
-        let version = read_u32(body, &mut pos)?;
-        if version != HIBERNATION_VERSION {
-            return Err(Error::new(format!(
-                "unsupported dd_v8 hibernation snapshot version {version}"
-            )));
         }
 
         let op_count = read_u32(body, &mut pos)? as usize;
@@ -2162,8 +2310,15 @@ impl JsRuntime {
         let terminated = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let inspector_handle = Arc::new(OnceLock::new());
+        let op_state = match existing_op_state {
+            Some(existing) => {
+                existing.borrow_mut().waker = Arc::clone(&waker);
+                existing
+            }
+            None => Rc::new(RefCell::new(OpState::new(Arc::clone(&waker)))),
+        };
         let state = Rc::new(RuntimeState {
-            op_state: Rc::new(RefCell::new(OpState::new(Arc::clone(&waker)))),
+            op_state,
             max_op_argument_bytes: effective_max_arg_bytes,
             ops,
             pending_ops: RefCell::new(FuturesUnordered::new()),
@@ -2353,11 +2508,13 @@ impl Drop for JsRuntime {
 // Low-level Scriptw/Wasmtime Instantiation & Host Foreign Callbacks
 // =========================================================================
 
+type ResolvedEmbeddedRuntime = (Arc<EmbeddedRuntime>, bool, Option<Arc<CompiledSnapshot>>);
+
 fn resolve_embedded_runtime(
     ops: &[OpDecl],
     startup_snapshot: Option<&'static [u8]>,
     ext_scripts: &'static [(&'static str, &'static str)],
-) -> Result<(Arc<EmbeddedRuntime>, bool, Option<Arc<CompiledSnapshot>>), Error> {
+) -> Result<ResolvedEmbeddedRuntime, Error> {
     if let Some(blob) = startup_snapshot {
         let snap = lookup_snapshot(blob, ops)?;
         Ok((Arc::clone(&snap.runtime), true, Some(snap)))
@@ -3669,6 +3826,48 @@ fn register_dd_foreigns(
         .map_err(|e| Error::new(format!("register_foreign inspector_op: {e}")))?;
 
     Ok(())
+}
+
+/// Hints the glibc allocator on Linux to return freed heap pages (`MADV_DONTNEED`)
+/// to the kernel after dropping a hibernated isolate's Wasm/GC/snapshot buffers.
+/// Concurrent callers coalesce lock-free so only one thread trims at a time and
+/// the tail of any burst is always reclaimed.
+pub fn reclaim_process_allocator_pages() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+
+        static TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+        static TRIM_PENDING: AtomicBool = AtomicBool::new(false);
+
+        TRIM_PENDING.store(true, Ordering::Release);
+        if TRIM_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            TRIM_PENDING.store(false, Ordering::Release);
+            // SAFETY: glibc `malloc_trim(0)` is thread-safe and returns unused
+            // heap pages across arenas back to the OS.
+            unsafe {
+                let _ = malloc_trim(0);
+            }
+            TRIM_IN_PROGRESS.store(false, Ordering::Release);
+            if !TRIM_PENDING.load(Ordering::Acquire) {
+                break;
+            }
+            if TRIM_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
 }
 
 fn wire_to_u64(v: Option<&WireValue>) -> u64 {

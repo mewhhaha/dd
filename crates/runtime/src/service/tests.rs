@@ -29,6 +29,7 @@ mod examples;
 mod fixtures;
 mod globals;
 mod hardening;
+mod hibernation;
 mod host_fetch;
 mod inspector;
 mod internal_trace;

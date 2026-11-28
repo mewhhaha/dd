@@ -158,6 +158,17 @@ pub(in crate::service) enum RuntimeEvent {
         generation: u64,
         isolate_id: u64,
     },
+    IsolateHibernated {
+        worker_name: String,
+        generation: u64,
+        isolate_id: u64,
+        bytes: usize,
+    },
+    IsolateWoken {
+        worker_name: String,
+        generation: u64,
+        isolate_id: u64,
+    },
     IsolateFailed {
         worker_name: String,
         generation: u64,

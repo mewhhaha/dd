@@ -1,6 +1,6 @@
 use dd_v8::{
-    JsRuntime, ModuleCode, ModuleLoader, ModuleSource, ModuleType, OpDecl, OpError, OpState,
-    RuntimeOptions, WireValue, op_async,
+    HibernationCompression, JsRuntime, ModuleCode, ModuleLoader, ModuleSource, ModuleType, OpDecl,
+    OpError, OpState, RuntimeOptions, WireValue, op_async,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -306,4 +306,176 @@ async fn hibernate_detaches_and_reattaches_live_futures() {
         rt2.value_to_string(&resolved).expect("stringify"),
         "42:woke-up"
     );
+}
+
+#[tokio::test]
+async fn hibernate_zstd_compresses_sharply_and_v1_raw_remains_decodable() {
+    let make_rt = || {
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            ops: test_ops(),
+            ..Default::default()
+        })
+        .expect("create runtime");
+        let p = rt
+            .execute_with_ops(
+                "<cmp>",
+                r#"
+                return (async () => {
+                  const arr = new Array(256).fill("dd-hibernation-compressible-payload");
+                  const r = await ops.op_slow_io("cmp");
+                  return `${arr.length}:${r}`;
+                })();
+                "#,
+            )
+            .expect("run");
+        rt.drain_microtasks().expect("drain");
+        (rt, p)
+    };
+
+    let (rt_raw, p_raw) = make_rt();
+    let hib_raw = rt_raw
+        .hibernate_with_compression(&[&p_raw], HibernationCompression::None)
+        .expect("raw hibernate");
+    let ticket_raw = hib_raw.pending_ops()[0].id;
+    let raw_bytes = hib_raw.into_bytes();
+    assert_eq!(&raw_bytes[8..12], &1u32.to_le_bytes());
+
+    let (rt_zstd, p_zstd) = make_rt();
+    let hib_zstd = rt_zstd
+        .hibernate_with_compression(&[&p_zstd], HibernationCompression::Zstd { level: 1 })
+        .expect("zstd hibernate");
+    let ticket_zstd = hib_zstd.pending_ops()[0].id;
+    let zstd_bytes = hib_zstd.into_bytes();
+    assert_eq!(&zstd_bytes[8..12], &2u32.to_le_bytes());
+
+    assert!(
+        zstd_bytes.len() * 2 < raw_bytes.len(),
+        "expected zstd ({} B) to be <50% of raw ({} B)",
+        zstd_bytes.len(),
+        raw_bytes.len()
+    );
+
+    // Both v1 raw and v2 zstd must wake cleanly.
+    for (bytes, ticket_id, tag) in [
+        (raw_bytes, ticket_raw, "raw"),
+        (zstd_bytes, ticket_zstd, "zstd"),
+    ] {
+        let mut woken = JsRuntime::wake(
+            RuntimeOptions {
+                ops: test_ops(),
+                ..Default::default()
+            },
+            &bytes,
+        )
+        .expect("wake");
+        let p = woken.retained.into_iter().next().unwrap();
+        woken
+            .runtime
+            .settle_pending_op(ticket_id, Ok(WireValue::String(tag.to_string())))
+            .expect("settle");
+        let val = woken
+            .runtime
+            .try_resolve_settled(&p)
+            .expect("resolve")
+            .expect("settled");
+        assert_eq!(
+            woken.runtime.value_to_string(&val).expect("str"),
+            format!("256:{tag}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn wake_with_op_state_preserves_concurrent_in_flight_ops() {
+    struct SharedLog(Vec<String>);
+
+    async fn op_logged_gate(state: Rc<RefCell<OpState>>, key: String) -> Result<String, OpError> {
+        let rx = state
+            .borrow_mut()
+            .try_borrow_mut::<GateState>()
+            .and_then(|g| g.channels.remove(&key))
+            .expect("missing gate");
+        let val = rx.await.expect("gate send").expect("gate ok");
+        state
+            .borrow_mut()
+            .borrow_mut::<SharedLog>()
+            .0
+            .push(format!("{key}={val}"));
+        Ok(val)
+    }
+
+    let ops_fn = || vec![op_async!(op_logged_gate)];
+    let (tx1, rx1) = oneshot::channel::<Result<String, String>>();
+    let (tx2, rx2) = oneshot::channel::<Result<String, String>>();
+
+    let mut rt1 = JsRuntime::new(RuntimeOptions {
+        ops: ops_fn(),
+        ..Default::default()
+    })
+    .expect("rt1");
+    {
+        let mut channels = HashMap::new();
+        channels.insert("a".to_string(), rx1);
+        channels.insert("b".to_string(), rx2);
+        let os = rt1.op_state();
+        let mut os = os.borrow_mut();
+        os.put(GateState { channels });
+        os.put(SharedLog(Vec::new()));
+    }
+
+    let p1 = rt1
+        .execute_with_ops(
+            "<par>",
+            r#"
+            return Promise.all([ops.op_logged_gate("a"), ops.op_logged_gate("b")])
+              .then(([a, b]) => `${a}+${b}`);
+            "#,
+        )
+        .expect("start");
+    rt1.drain_microtasks().expect("drain");
+    assert_eq!(rt1.pending_io_count(), 2);
+
+    // Hibernate while BOTH ops are in-flight.
+    let (bytes, mut detached, op_state, _) = rt1.hibernate(&[&p1]).expect("hib").into_parts();
+    assert_eq!(detached.len(), 2);
+
+    // Complete ONLY op "a" while asleep!
+    tx1.send(Ok("first".to_string())).expect("send a");
+    let first_fut = detached.remove(0);
+    let (id1, res1) = first_fut.wait().await;
+
+    // Wake reusing the EXACT SAME OpState and reattach op "b" (which still holds Rc<RefCell<OpState>>).
+    let mut woken = JsRuntime::wake_with_op_state(
+        RuntimeOptions {
+            ops: ops_fn(),
+            ..Default::default()
+        },
+        &bytes,
+        Rc::clone(&op_state),
+    )
+    .expect("wake_with_op_state");
+    let p2 = woken.retained.into_iter().next().unwrap();
+    for rem in detached {
+        woken.runtime.reattach_pending_op(rem).expect("reattach b");
+    }
+    woken
+        .runtime
+        .settle_pending_op(id1, res1)
+        .expect("settle a");
+
+    // Now complete op "b" AFTER wake — it must write into the exact same live OpState!
+    tx2.send(Ok("second".to_string())).expect("send b");
+    let resolved = woken.runtime.resolve(p2).await.expect("resolve");
+    assert_eq!(
+        woken.runtime.value_to_string(&resolved).expect("str"),
+        "first+second"
+    );
+    let logged = woken
+        .runtime
+        .op_state()
+        .borrow()
+        .borrow::<SharedLog>()
+        .0
+        .clone();
+    assert_eq!(logged, vec!["a=first".to_string(), "b=second".to_string()]);
 }

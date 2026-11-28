@@ -86,6 +86,13 @@ impl WorkerPool {
             .values()
             .filter(|isolate_id| !self.isolate_indices.contains_key(isolate_id))
             .count();
+        let hibernated_isolates = self.isolates.iter().filter(|i| i.hibernated).count();
+        let hibernated_bytes = self
+            .isolates
+            .iter()
+            .filter(|i| i.hibernated)
+            .map(|i| i.hibernated_bytes)
+            .sum();
         WorkerStats {
             generation: self.generation,
             public: self.is_public,
@@ -96,6 +103,10 @@ impl WorkerPool {
             inflight_total: activity.inflight_total,
             wait_until_total: activity.wait_until_total,
             isolates_total: self.isolates.len(),
+            hibernated_isolates,
+            hibernated_bytes,
+            hibernate_count: self.stats.hibernate_count,
+            wake_count: self.stats.wake_count,
             spawn_count: self.stats.spawn_count,
             reuse_count: self.stats.reuse_count,
             scale_down_count: self.stats.scale_down_count,

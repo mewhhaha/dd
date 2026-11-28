@@ -125,6 +125,18 @@ struct Cli {
         env = "DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES"
     )]
     memory_snapshot_cache_max_bytes: Option<usize>,
+
+    #[arg(
+        long = "runtime-io-hibernate-after-ms",
+        env = "DD_RUNTIME_IO_HIBERNATE_AFTER_MS"
+    )]
+    runtime_io_hibernate_after_ms: Option<u64>,
+
+    #[arg(
+        long = "runtime-io-hibernate-storage",
+        env = "DD_RUNTIME_IO_HIBERNATE_STORAGE"
+    )]
+    runtime_io_hibernate_storage: Option<String>,
 }
 
 #[tokio::main]
@@ -210,6 +222,28 @@ async fn main() -> Result<()> {
             .runtime
             .storage
             .memory_snapshot_cache_max_bytes = value;
+    }
+    if let Some(ms) = cli.runtime_io_hibernate_after_ms {
+        server_config.runtime.runtime.io_hibernate_after = if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        };
+    }
+    if let Some(storage) = cli.runtime_io_hibernate_storage.as_deref() {
+        server_config.runtime.runtime.io_hibernate_storage = match storage
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "memory" => runtime::IoHibernationStorage::Memory,
+            "disk" => runtime::IoHibernationStorage::Disk,
+            other => {
+                return Err(PlatformError::bad_request(format!(
+                    "invalid DD_RUNTIME_IO_HIBERNATE_STORAGE {other:?}; expected \"memory\" or \"disk\""
+                )));
+            }
+        };
     }
 
     let result = dd_server::run(server_config).await;
@@ -400,6 +434,10 @@ mod tests {
             "2048",
             "--memory-snapshot-cache-max-bytes",
             "33554432",
+            "--runtime-io-hibernate-after-ms",
+            "150",
+            "--runtime-io-hibernate-storage",
+            "disk",
         ])
         .expect("runtime flags should parse");
 
@@ -410,6 +448,8 @@ mod tests {
         assert_eq!(cli.memory_outbox_max_concurrent_shards, Some(4));
         assert_eq!(cli.memory_snapshot_cache_max_entries, Some(2048));
         assert_eq!(cli.memory_snapshot_cache_max_bytes, Some(33_554_432));
+        assert_eq!(cli.runtime_io_hibernate_after_ms, Some(150));
+        assert_eq!(cli.runtime_io_hibernate_storage.as_deref(), Some("disk"));
     }
 
     #[cfg(feature = "otel")]

@@ -185,10 +185,17 @@ pub fn new_runtime_from_snapshot_with_heap_limit(
     new_runtime(startup_snapshot, policy, max_heap_bytes, module_registry)
 }
 
+/// Clears cached JS runtime entrypoints from `OpState` before hibernating so no
+/// stale `JsValue` handle outlives the dropped Wasm `Store`.
+pub fn clear_runtime_entrypoints(runtime: &mut JsRuntime) {
+    let op_state = runtime.op_state();
+    let _ = op_state.borrow_mut().try_take::<RuntimeEntrypoints>();
+}
+
 /// Restores a hibernated worker isolate from portable `dd_v8` hibernation bytes
 /// (`DDHB0001`), re-caching `dd`'s runtime entrypoints and syncing the isolate
 /// clock to the current host time boundary.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn wake_runtime_from_hibernation(
     startup_snapshot: &'static [u8],
     policy: IsolatePolicy,
@@ -223,6 +230,38 @@ pub fn wake_runtime_from_hibernation(
             .borrow_mut()
             .put(crate::ops::UnscopedFetch);
     }
+    Ok(woken)
+}
+
+/// Like [`wake_runtime_from_hibernation`], reusing the existing host `OpState`
+/// so all host resource tables and concurrently in-flight `DetachedPendingOp`
+/// futures stay bound to the same live `OpState` across sleep/wake cycles.
+pub fn wake_runtime_from_hibernation_with_op_state(
+    startup_snapshot: &'static [u8],
+    policy: IsolatePolicy,
+    max_heap_bytes: usize,
+    module_registry: ModuleRegistry,
+    bytes: &[u8],
+    op_state: Rc<std::cell::RefCell<dd_v8::OpState>>,
+) -> Result<dd_v8::WokenRuntime> {
+    let mut woken = JsRuntime::wake_with_op_state(
+        RuntimeOptions {
+            ops: runtime_ops(),
+            module_loader: Some(Rc::new(RuntimeModuleLoader { module_registry })),
+            startup_snapshot: Some(startup_snapshot),
+            max_heap_bytes,
+            max_op_argument_bytes: policy.max_op_argument_bytes,
+            ext_scripts: &[],
+        },
+        bytes,
+        op_state,
+    )
+    .map_err(runtime_error)?;
+    woken
+        .runtime
+        .set_allow_code_generation(policy.allow_code_generation);
+    cache_runtime_entrypoints(&mut woken.runtime)?;
+    sync_isolate_clock(&mut woken.runtime)?;
     Ok(woken)
 }
 

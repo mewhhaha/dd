@@ -603,6 +603,7 @@ pub(super) async fn run_runtime_coordinator(start: RuntimeThreadStart) {
         memory_outbox_drain_sender,
         cache_store,
         config,
+        hibernation_dir: storage.store_dir.join("hibernation"),
         control_store,
         module_registry,
         runtime_fast_sender,
