@@ -174,6 +174,172 @@ pub(in crate::ops) fn op_test_memory_batch_begin_fail(
     state.put(MemoryBatchBeginFailure { storage, message });
 }
 
+/// Result of the fused `op_memory_atomic_begin` op:
+/// - `Ready(lease_handle, batch_handle, now_ms, perf_ms)` encodes as a 4-num fast tuple.
+/// - `Failed(lease_handle, 0, now_ms, perf_ms, is_storage_u8, message)` keeps `lease_handle`
+///   alive across `failMemoryEntry` so live memory sockets close under the active scope.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(in crate::ops) enum MemoryAtomicBeginResult {
+    Ready(u32, u32, u64, f64),
+    Failed(u32, u32, u64, f64, u8, String),
+}
+
+/// Fused lease acquisition + committed snapshot batch begin for `stub.atomic(cb)` without
+/// an idempotency key, avoiding a separate async Wasm<->Rust roundtrip for `op_memory_batch_begin`.
+pub(in crate::ops) async fn op_memory_atomic_begin(
+    state: Rc<RefCell<OpState>>,
+    request_context_handle: u32,
+    binding: String,
+    key: String,
+) -> std::result::Result<MemoryAtomicBeginResult, OpError> {
+    if request_context_handle == 0 {
+        return Err(OpError::new(
+            "memory batch begin requires request_context_handle",
+        ));
+    }
+    if binding.is_empty() || key.is_empty() || binding.len() + key.len() > 1024 {
+        return Err(js_error(PlatformError::bad_request(format!(
+            "memory lease requires binding and key within 1024 bytes; got {} and {} bytes",
+            binding.len(),
+            key.len()
+        ))));
+    }
+    let (store, namespace, canceled, canceled_notify) = {
+        let op_state = state.borrow();
+        let request = op_state
+            .borrow::<RequestSecretContexts>()
+            .get(request_context_handle)
+            .ok_or_else(|| {
+                js_error(PlatformError::runtime(
+                    "memory lease request is unavailable",
+                ))
+            })?;
+        let worker = &op_state.borrow::<WorkerCacheNamespace>().0;
+        (
+            op_state.borrow::<MemoryStore>().clone(),
+            crate::memory::worker_namespace(worker, &binding),
+            Arc::clone(&request.canceled),
+            Arc::clone(&request.canceled_notify),
+        )
+    };
+    let cancellation = canceled_notify.notified();
+    tokio::pin!(cancellation);
+    cancellation.as_mut().enable();
+    if canceled.load(Ordering::SeqCst) {
+        return Err(js_error(PlatformError::runtime(
+            "memory lease request was canceled",
+        )));
+    }
+    let lease = tokio::select! {
+        biased;
+        _ = &mut cancellation => {
+            return Err(js_error(PlatformError::runtime("memory lease request was canceled")));
+        }
+        result = store.acquire_lease(&namespace, &key) => result.map_err(js_error)?,
+    };
+    if canceled.load(Ordering::SeqCst) {
+        return Err(js_error(PlatformError::runtime(
+            "memory lease request was canceled",
+        )));
+    }
+    let owner_epoch = lease.owner_epoch();
+    let lease_handle = state
+        .borrow_mut()
+        .borrow_mut::<MemoryRequestScopes>()
+        .insert(MemoryRequestScope {
+            namespace: binding,
+            memory_key: key.clone(),
+            owner_epoch,
+            request_context_handle,
+            lease: Some(Arc::clone(&lease)),
+        });
+
+    #[cfg(test)]
+    if let Some(failure) = state.borrow_mut().try_take::<MemoryBatchBeginFailure>() {
+        let time = current_time_boundary();
+        return Ok(MemoryAtomicBeginResult::Failed(
+            lease_handle,
+            0,
+            time.now_ms,
+            time.perf_ms,
+            u8::from(failure.storage),
+            failure.message,
+        ));
+    }
+
+    let started = Instant::now();
+    let snapshot = match store.snapshot(&namespace, &key).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let time = current_time_boundary();
+            return Ok(MemoryAtomicBeginResult::Failed(
+                lease_handle,
+                0,
+                time.now_ms,
+                time.perf_ms,
+                1,
+                error.to_string(),
+            ));
+        }
+    };
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    store.record_profile(MemoryProfileMetricKind::OpSnapshot, elapsed_us, 1);
+    store.record_profile(MemoryProfileMetricKind::JsTxnBegin, elapsed_us, 1);
+
+    if canceled.load(Ordering::SeqCst) {
+        let time = current_time_boundary();
+        return Ok(MemoryAtomicBeginResult::Failed(
+            lease_handle,
+            0,
+            time.now_ms,
+            time.perf_ms,
+            0,
+            "memory transaction request was canceled".to_string(),
+        ));
+    }
+
+    let batch = MemoryBatchHandle {
+        request_context_handle,
+        namespace,
+        memory_key: key,
+        owner_epoch,
+        _lease: Some(lease),
+        command_handle: 0,
+        snapshot,
+        staged_bytes: 0,
+        accepted: false,
+        command_result: None,
+        mutations: Vec::new(),
+        effects: Vec::new(),
+    };
+    let batch_handle = match state
+        .borrow_mut()
+        .borrow_mut::<MemoryBatchHandles>()
+        .insert(batch, MEMORY_MAX_BATCH_HANDLES_PER_REQUEST)
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            let time = current_time_boundary();
+            return Ok(MemoryAtomicBeginResult::Failed(
+                lease_handle,
+                0,
+                time.now_ms,
+                time.perf_ms,
+                0,
+                error.to_string(),
+            ));
+        }
+    };
+    let time = current_time_boundary();
+    Ok(MemoryAtomicBeginResult::Ready(
+        lease_handle,
+        batch_handle,
+        time.now_ms,
+        time.perf_ms,
+    ))
+}
+
 /// Opens a batch on the entry's committed snapshot, for an atomic callback
 /// under the entry's transaction lease.
 pub(in crate::ops) async fn op_memory_batch_begin(
@@ -443,6 +609,31 @@ pub(super) fn close_memory_command_for_committed_batch(
             .borrow_mut::<MemoryCommandHandles>()
             .remove(batch.command_handle);
     }
+}
+
+/// Commits the batch (unless read-only) and unconditionally releases `lease_handle`
+/// before returning, avoiding a separate `op_memory_request_scope_close` roundtrip.
+pub(in crate::ops) async fn op_memory_batch_apply_and_close(
+    state: Rc<RefCell<OpState>>,
+    batch_handle: u32,
+    lease_handle: u32,
+) -> std::result::Result<(bool, usize, bool, u64, f64), OpError> {
+    struct ScopeCloseGuard {
+        state: Rc<RefCell<OpState>>,
+        lease_handle: u32,
+    }
+    impl Drop for ScopeCloseGuard {
+        fn drop(&mut self) {
+            if self.lease_handle > 0 {
+                clear_memory_request_scope(&mut self.state.borrow_mut(), self.lease_handle);
+            }
+        }
+    }
+    let _guard = ScopeCloseGuard {
+        state: Rc::clone(&state),
+        lease_handle,
+    };
+    op_memory_batch_apply(state, batch_handle).await
 }
 
 /// Commits the batch, unless it is read-only and has nothing to commit.

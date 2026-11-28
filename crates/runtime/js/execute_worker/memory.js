@@ -108,6 +108,34 @@ class MemoryStub {
     }
     const context = copyRequestContext(currentRequestContext());
     return asyncContext.run(context, async () => {
+      if (idempotencyKey.length === 0) {
+        const beginRes = await op_memory_atomic_begin(
+          activeRequestContextHandle(), namespace, memoryKey,
+        );
+        const leaseHandle = beginRes[0];
+        context.memoryRequestScopeHandle = leaseHandle;
+        try {
+          const entry = ensureMemoryEntry(namespace, memoryKey);
+          context.memoryEntry = entry;
+          setTime(beginRes[2], beginRes[3]);
+          const batchHandle = beginRes[1];
+          if (batchHandle === 0) {
+            const err = new Error(beginRes[5]);
+            if (beginRes[4] === 1) {
+              memoryStorageFailures.add(err);
+              return await failMemoryEntry(entry, err);
+            }
+            throw err;
+          }
+          return await runMemoryTxnWithBatch(entry, callback, 0, batchHandle, leaseHandle);
+        } finally {
+          if (context.memoryRequestScopeHandle > 0) {
+            const h = context.memoryRequestScopeHandle;
+            context.memoryRequestScopeHandle = 0;
+            op_memory_request_scope_close(h);
+          }
+        }
+      }
       const leaseHandle = await op_memory_lease_acquire(
         activeRequestContextHandle(), namespace, memoryKey,
       );
@@ -116,12 +144,10 @@ class MemoryStub {
       try {
         const entry = ensureMemoryEntry(namespace, memoryKey);
         context.memoryEntry = entry;
-        if (idempotencyKey.length > 0) {
-          const command = await beginMemoryCommand(entry, idempotencyKey);
-          commandHandle = command.handle;
-          if (command.hit) {
-            return decodeMemoryCommandResult(command.value);
-          }
+        const command = await beginMemoryCommand(entry, idempotencyKey);
+        commandHandle = command.handle;
+        if (command.hit) {
+          return decodeMemoryCommandResult(command.value);
         }
         return await executeMemoryTransaction(entry, callback, commandHandle);
       } finally {

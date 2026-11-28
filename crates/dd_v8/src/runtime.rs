@@ -19,7 +19,7 @@ use crate::wasm_api::WasmHostState;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::task::AtomicWaker;
 use scriptw_engine::{
-    CompileOptions, EmbeddedEvaluation, EmbeddedInstance, EmbeddedRuntime,
+    CompileOptions, EmbeddedEvaluation, EmbeddedInstance, EmbeddedRuntime, EmbeddedSnapshot,
     Engine as ScriptwCompiler, ForeignValue, JsCompletion, JsPromiseState,
     JsValue as ScriptwJsValue, NativeCompilationPolicy, RealmBuilder, WasmStoreState,
     configure_wasm_runtime,
@@ -161,6 +161,10 @@ static SNAPSHOTS: LazyLock<Mutex<HashMap<u64, Arc<CompiledSnapshot>>>> =
 struct CompiledSnapshot {
     runtime: Arc<EmbeddedRuntime>,
     op_names: Vec<String>,
+    /// Pre-warmed binary GC heap snapshot plus the `max_op_argument_bytes` baked into it.
+    /// Restoring into a fresh Store takes ~0.5 ms via `memcpy` + pointer rebase instead of
+    /// replaying `dd_bootstrap.wtmn` JS (~15 ms).
+    heap_snapshot: OnceLock<(usize, Arc<EmbeddedSnapshot>)>,
 }
 
 fn shared_engine() -> Result<&'static wasmtime::Engine, Error> {
@@ -292,6 +296,18 @@ fn dd_foreign_registry() -> Result<ForeignModuleRegistry, Error> {
                     ForeignResultType::StringUtf16,
                 )
                 .map_err(|e| Error::new(format!("foreign decl start_async_u32: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "start_async_u32_2",
+                    "dd",
+                    "start_async_u32_2",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl start_async_u32_2: {e}")))?,
                 ForeignFunctionDeclaration::new(
                     "start_async_u32_str2",
                     "dd",
@@ -655,6 +671,74 @@ struct KernelExports {
     module_namespace: ScriptwJsValue,
     make_array: ScriptwJsValue,
     push_array: ScriptwJsValue,
+    set_max_op_arg_bytes: ScriptwJsValue,
+}
+
+impl KernelExports {
+    fn as_refs(&self) -> [&ScriptwJsValue; 25] {
+        [
+            &self.init_ops,
+            &self.eval_script,
+            &self.eval_with_ops,
+            &self.eval_function,
+            &self.call_function,
+            &self.call_u32,
+            &self.call_f64_2,
+            &self.get_prop,
+            &self.to_string,
+            &self.describe_error,
+            &self.set_internals,
+            &self.get_internals,
+            &self.set_allow_codegen,
+            &self.set_inspector_enabled,
+            &self.dbg_eval_global,
+            &self.wire_to_js,
+            &self.js_to_wire,
+            &self.settle_async,
+            &self.settle_async_str,
+            &self.register_module,
+            &self.eval_module,
+            &self.module_namespace,
+            &self.make_array,
+            &self.push_array,
+            &self.set_max_op_arg_bytes,
+        ]
+    }
+
+    fn from_vec(vals: Vec<ScriptwJsValue>) -> Result<Self, Error> {
+        let mut it = vals.into_iter();
+        let mut next = || {
+            it.next()
+                .ok_or_else(|| Error::new("snapshot restored fewer kernel exports than expected"))
+        };
+        Ok(Self {
+            init_ops: next()?,
+            eval_script: next()?,
+            eval_with_ops: next()?,
+            eval_function: next()?,
+            call_function: next()?,
+            call_u32: next()?,
+            call_f64_2: next()?,
+            get_prop: next()?,
+            to_string: next()?,
+            describe_error: next()?,
+            set_internals: next()?,
+            get_internals: next()?,
+            set_allow_codegen: next()?,
+            set_inspector_enabled: next()?,
+            dbg_eval_global: next()?,
+            wire_to_js: next()?,
+            js_to_wire: next()?,
+            settle_async: next()?,
+            settle_async_str: next()?,
+            register_module: next()?,
+            eval_module: next()?,
+            module_namespace: next()?,
+            make_array: next()?,
+            push_array: next()?,
+            set_max_op_arg_bytes: next()?,
+        })
+    }
 }
 
 struct LiveVm {
@@ -898,7 +982,8 @@ impl JsRuntime {
         if will_snapshot {
             let (vm, interrupt) = if ext_scripts.is_empty() {
                 let embedded = base_kernel_runtime()?;
-                let (mut vm, interrupt) = instantiate_vm(&embedded, &state, max_heap_bytes, false)?;
+                let (mut vm, interrupt) =
+                    instantiate_vm(&embedded, &state, max_heap_bytes, false, None)?;
                 // Mirror V8's SnapshotCreator behavior where globalThis.queueMicrotask
                 // is absent during snapshot construction (ops.op_queue_microtask is used).
                 let n = str_val(&mut vm, "<snapshot-init>")?;
@@ -921,19 +1006,24 @@ impl JsRuntime {
             });
         }
 
-        let (embedded, run_snapshot_export) = if let Some(blob) = startup_snapshot {
+        let (embedded, run_snapshot_export, compiled_snap) = if let Some(blob) = startup_snapshot {
             let snap = lookup_snapshot(blob, &state.ops)?;
-            (Arc::clone(&snap.runtime), true)
+            (Arc::clone(&snap.runtime), true, Some(snap))
         } else if !ext_scripts.is_empty() {
             let rec = SnapshotRecorder::new(ext_scripts);
             let src = rec.generate_bundle_mjs();
-            (compile_embedded_module(&src)?, false)
+            (compile_embedded_module(&src)?, false, None)
         } else {
-            (base_kernel_runtime()?, false)
+            (base_kernel_runtime()?, false, None)
         };
 
-        let (vm, interrupt) =
-            instantiate_vm(&embedded, &state, max_heap_bytes, run_snapshot_export)?;
+        let (vm, interrupt) = instantiate_vm(
+            &embedded,
+            &state,
+            max_heap_bytes,
+            run_snapshot_export,
+            compiled_snap.as_deref(),
+        )?;
 
         Ok(Self {
             vm: Some(vm),
@@ -1199,12 +1289,7 @@ impl JsRuntime {
             .instance
             .value(&mut vm.store, ForeignValue::Number(f64::from(arg)))
             .map_err(|e| Error::new(e.to_string()))?;
-        let val = call_js(
-            vm,
-            &self.terminated,
-            &vm.exports.call_u32.clone(),
-            &[fn_v, arg_v],
-        )?;
+        let val = call_js(vm, &self.terminated, &fn_v, &[arg_v])?;
         Ok(JsValue::live(val))
     }
 
@@ -1226,11 +1311,57 @@ impl JsRuntime {
             .instance
             .value(&mut vm.store, ForeignValue::Number(b))
             .map_err(|e| Error::new(e.to_string()))?;
+        let val = call_js(vm, &self.terminated, &fn_v, &[a_v, b_v])?;
+        Ok(JsValue::live(val))
+    }
+
+    /// Direct zero-JSON dispatch for simple HTTP worker invocations (no headers,
+    /// no request body, no stream, no memory call), bypassing `HttpPreparedHeaders`,
+    /// `HttpPreparedBodies`, `RequestInvocationHandles`, and `op_request_invocation_take`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_execute_worker_direct(
+        &mut self,
+        function: &JsValue,
+        request_context_handle: u32,
+        completion_handle: u32,
+        memory_request_scope_handle: u32,
+        max_response_body_bytes: usize,
+        max_request_body_bytes: usize,
+        now_ms: u64,
+        perf_ms: f64,
+        method_code: u32,
+        request_id: &str,
+        url: &str,
+        input_request_id: &str,
+    ) -> Result<JsValue, Error> {
+        self.check_terminated()?;
+        let fn_v = function.as_live()?.clone();
+        let vm = self.vm.as_mut().expect("live vm");
+        let num = |vm: &mut LiveVm, x: f64| -> Result<ScriptwJsValue, Error> {
+            vm.instance
+                .value(&mut vm.store, ForeignValue::Number(x))
+                .map_err(|e| Error::new(e.to_string()))
+        };
+        let a0 = num(vm, f64::from(request_context_handle))?;
+        let a1 = num(vm, f64::from(completion_handle))?;
+        let a2 = num(vm, f64::from(memory_request_scope_handle))?;
+        let a3 = num(vm, max_response_body_bytes as f64)?;
+        let a4 = num(vm, max_request_body_bytes as f64)?;
+        let a5 = num(vm, now_ms as f64)?;
+        let a6 = num(vm, perf_ms)?;
+        let a7 = num(vm, f64::from(method_code))?;
+        let a8 = str_val(vm, request_id)?;
+        let a9 = str_val(vm, url)?;
+        let a10 = if input_request_id == request_id {
+            a8.clone()
+        } else {
+            str_val(vm, input_request_id)?
+        };
         let val = call_js(
             vm,
             &self.terminated,
-            &vm.exports.call_f64_2.clone(),
-            &[fn_v, a_v, b_v],
+            &fn_v,
+            &[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10],
         )?;
         Ok(JsValue::live(val))
     }
@@ -1706,17 +1837,7 @@ impl JsRuntime {
             .take()
             .ok_or_else(|| Error::new("runtime was not created with new_for_snapshot"))?;
         let bundle_src = recorder.generate_bundle_mjs();
-        let is_precompiled = has_precompiled_bundle(bundle_source_sha256(&bundle_src));
         let runtime = compile_embedded_module(&bundle_src)?;
-
-        // Validate dynamically-compiled snapshots immediately inside a throwaway Store
-        // (catches JS bootstrap errors eagerly). Build-time precompiled bundles skip this
-        // eager instantiation so idle servers avoid faulting bootstrap code pages until a
-        // worker actually starts.
-        if !is_precompiled {
-            let (test_vm, _) = instantiate_vm(&runtime, &self.state, self.max_heap_bytes, true)?;
-            drop(test_vm);
-        }
 
         let op_names: Vec<String> = self
             .state
@@ -1724,11 +1845,29 @@ impl JsRuntime {
             .iter()
             .map(|op| op.name.to_string())
             .collect();
+        let compiled = Arc::new(CompiledSnapshot {
+            runtime: Arc::clone(&runtime),
+            op_names,
+            heap_snapshot: OnceLock::new(),
+        });
+
+        // Pre-warm the compacted StoreSnapshot once per process so even the very first
+        // isolate (and `cold-start/deploy` round 1) restores in ~1.5 ms instead of
+        // replaying bootstrap JS. Also validates dynamically-compiled snapshots eagerly.
+        let (test_vm, _) = instantiate_vm(
+            &runtime,
+            &self.state,
+            self.max_heap_bytes,
+            true,
+            Some(&compiled),
+        )?;
+        drop(test_vm);
+
         let snap_id = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
         SNAPSHOTS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(snap_id, Arc::new(CompiledSnapshot { runtime, op_names }));
+            .insert(snap_id, compiled);
 
         let mut blob = Vec::with_capacity(16);
         blob.extend_from_slice(SNAPSHOT_MAGIC);
@@ -1788,6 +1927,7 @@ fn instantiate_vm(
     state: &Rc<RuntimeState>,
     max_heap_bytes: usize,
     run_snapshot_export: bool,
+    compiled_snap: Option<&CompiledSnapshot>,
 ) -> Result<(LiveVm, wasmtime::InterruptHandle), Error> {
     let engine = shared_engine()?;
     let mut store_state = embedded
@@ -1813,6 +1953,44 @@ fn instantiate_vm(
     let mut instance = embedded
         .instantiate(&mut store, &mut linker)
         .map_err(|e| Error::new(format!("scriptw instantiate failed: {e}")))?;
+
+    // Fast path: restore compacted post-bootstrap GC heap + globals/tables/memories directly
+    // via `StoreSnapshot` (~0.5 ms) instead of re-executing `initialize()` + `__dd_run_snapshot`.
+    if run_snapshot_export
+        && let Some(snap_holder) = compiled_snap
+        && let Some((captured_budget, heap_snap)) = snap_holder.heap_snapshot.get()
+    {
+        let restored = instance
+            .restore_snapshot(&mut store, heap_snap)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("GC heap out of memory") || msg.contains("allocation too large") {
+                    Error::terminated()
+                } else {
+                    Error::new(format!("scriptw restore_snapshot failed: {msg}"))
+                }
+            })?;
+        let exports = KernelExports::from_vec(restored)?;
+        let mut vm = LiveVm {
+            store,
+            instance,
+            exports,
+        };
+        if state.max_op_argument_bytes != *captured_budget {
+            let budget_v = vm
+                .instance
+                .value(
+                    &mut vm.store,
+                    ForeignValue::Number(state.max_op_argument_bytes as f64),
+                )
+                .map_err(|e| Error::new(e.to_string()))?;
+            let dummy_term = AtomicBool::new(false);
+            let set_budget_fn = vm.exports.set_max_op_arg_bytes.clone();
+            let _ = call_js(&mut vm, &dummy_term, &set_budget_fn, &[budget_v])?;
+        }
+        return Ok((vm, interrupt));
+    }
+
     match instance
         .initialize(&mut store)
         .map_err(|e| Error::new(format!("scriptw initialize failed: {e}")))?
@@ -1864,6 +2042,7 @@ fn instantiate_vm(
         module_namespace: get_exp(&mut store, "__dd_module_namespace")?,
         make_array: get_exp(&mut store, "__dd_make_array")?,
         push_array: get_exp(&mut store, "__dd_push_array")?,
+        set_max_op_arg_bytes: get_exp(&mut store, "__dd_set_max_op_arg_bytes")?,
     };
 
     let init_fn = if run_snapshot_export {
@@ -1898,10 +2077,22 @@ fn instantiate_vm(
         &init_fn,
         &[specs_v, budget_v, async_ctx_v],
     )?;
-    // Compact one-time bootstrap garbage immediately so fresh isolates do not pin dead
-    // initialization pages in RSS.
+    // Drop temporary init handles before snapshotting/compacting so only live post-bootstrap
+    // objects remain in the compacted Old Space heap.
+    drop(init_fn);
     if run_snapshot_export {
-        let _ = vm.store.gc(None);
+        if let Some(snap_holder) = compiled_snap {
+            let export_refs = vm.exports.as_refs();
+            if let Ok(captured) = vm.instance.capture_snapshot(&mut vm.store, &export_refs) {
+                let _ = snap_holder
+                    .heap_snapshot
+                    .set((state.max_op_argument_bytes, Arc::new(captured)));
+            } else {
+                let _ = vm.store.gc(None);
+            }
+        } else {
+            let _ = vm.store.gc(None);
+        }
     }
 
     Ok((vm, interrupt))
@@ -2430,6 +2621,32 @@ fn register_dd_foreigns(
         .map_err(|e| Error::new(format!("register_foreign start_async_u32: {e}")))?;
 
     embedded
+        .register_foreign(linker, "dd", "start_async_u32_2", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::Number(a0),
+                ForeignValue::Number(a1),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            let decoded = [WireValue::I32(*a0 as i32), WireValue::I32(*a1 as i32)];
+            Ok(ForeignValue::StringUtf16(dispatch_async_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign start_async_u32_2: {e}")))?;
+
+    embedded
         .register_foreign(linker, "dd", "start_async_u32_str2", |caller, args| {
             let [
                 ForeignValue::Number(op_id_f),
@@ -2902,10 +3119,7 @@ fn encode_pause_step(step: PauseStep) -> wasmtime::Result<ForeignValue> {
 
 fn str_val(vm: &mut LiveVm, s: &str) -> Result<ScriptwJsValue, Error> {
     vm.instance
-        .value(
-            &mut vm.store,
-            ForeignValue::StringUtf16(s.encode_utf16().collect()),
-        )
+        .value_str(&mut vm.store, s)
         .map_err(|e| Error::new(e.to_string()))
 }
 

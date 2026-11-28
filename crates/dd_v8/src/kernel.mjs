@@ -11,6 +11,7 @@ import {
   call_sync_u32_str_str,
   call_sync_resp_inline,
   start_async_u32,
+  start_async_u32_2,
   start_async_u32_str2,
   start_async_str2,
   start_async_str3,
@@ -927,11 +928,25 @@ function _encodeWireVal(w, rootVal, startDepth) {
     const depth = f.depth;
     if (_encodeWireLeaf(w, val)) continue;
 
-    const buf = _bufferBytes(val);
-    if (buf !== null) {
+    const parts = _bufferViewParts(val);
+    if (parts !== null) {
       w.u8(TAG_BYTES);
-      w.u32(buf.length);
-      w.bytes(buf);
+      if (parts.len === 0 || !parts.buf) {
+        w.u32(0);
+      } else {
+        let view = null;
+        try {
+          view = new _Uint8Array(parts.buf, parts.off, parts.len);
+        } catch {
+          view = null;
+        }
+        if (view === null || view.length === 0) {
+          w.u32(0);
+        } else {
+          w.u32(view.length);
+          w.bytes(view);
+        }
+      }
       continue;
     }
     if (depth > 128 || _call(_SetHas, ancestors, val)) {
@@ -1128,15 +1143,13 @@ function _encodeWireArgs(args) {
         }
       }
       const res = _sharedWireBuf.finish();
-      // Copy out if buffer grew huge so scratch doesn't retain giant allocations.
+      // Detach giant scratch buffers so `_sharedWireBuf` does not retain them,
+      // without allocating a duplicate multi-GiB copy while both live on the heap.
       if (_sharedWireBuf.buf.length > 65536) {
-        const copy = new _Uint8Array(res.length);
-        _call(_TASet, copy, res);
         const freshAb = new _ArrayBuffer(4096);
         _sharedWireBuf.ab = freshAb;
         _sharedWireBuf.buf = new _Uint8Array(freshAb);
         _sharedWireBuf.dv = new _DataView(freshAb);
-        return copy;
       }
       return res;
     } finally {
@@ -1416,6 +1429,17 @@ function _decodeStrValue(resp) {
       _Number(_call(_StrSlice, resp, 1, c1)),
       _Number(_call(_StrSlice, resp, c1 + 1, c2)),
       _Number(_call(_StrSlice, resp, c2 + 1)),
+    ];
+  }
+  if (tag === "4") { // [num, num, num, num]
+    const c1 = _call(_StrIndexOf, resp, ",", 1);
+    const c2 = _call(_StrIndexOf, resp, ",", c1 + 1);
+    const c3 = _call(_StrIndexOf, resp, ",", c2 + 1);
+    return [
+      _Number(_call(_StrSlice, resp, 1, c1)),
+      _Number(_call(_StrSlice, resp, c1 + 1, c2)),
+      _Number(_call(_StrSlice, resp, c2 + 1, c3)),
+      _Number(_call(_StrSlice, resp, c3 + 1)),
     ];
   }
   if (tag === "5") { // [bool, num, bool, num, num]
@@ -2544,7 +2568,9 @@ function _makeAsyncOp(opId, name) {
         } else if (n === 2) {
           const a0 = arguments[0];
           const a1 = arguments[1];
-          if (typeof a0 === "string" && typeof a1 === "string" && (a0.length + a1.length) * 2 <= _maxOpArgBytes) {
+          if (_isI32(a0) && _isI32(a1)) {
+            resp = start_async_u32_2(opId, a0, a1);
+          } else if (typeof a0 === "string" && typeof a1 === "string" && (a0.length + a1.length) * 2 <= _maxOpArgBytes) {
             resp = start_async_str2(opId, a0, a1);
           }
         } else if (n === 3) {
@@ -2700,6 +2726,10 @@ function _makeRawBufferOp(opId, name) {
   };
   _ObjectDefineProperty(fn, "name", { value: name, configurable: true });
   return fn;
+}
+
+export function __dd_set_max_op_arg_bytes(maxArgBytes) {
+  if (maxArgBytes > 0) _maxOpArgBytes = maxArgBytes;
 }
 
 export function __dd_init_ops(opSpecsJson, maxArgBytes, asyncContextFn) {

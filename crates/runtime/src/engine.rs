@@ -210,6 +210,7 @@ struct RuntimeEntrypoints {
     install_worker: JsValue,
     install_worker_deployment_handle: JsValue,
     execute_worker_handle: JsValue,
+    execute_worker_direct: JsValue,
     abort_worker_request_handle: JsValue,
     drain_request_control_queue: JsValue,
     set_time: JsValue,
@@ -261,6 +262,7 @@ fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
             "installWorkerDeploymentHandle",
         )?,
         execute_worker_handle: internal_function(runtime, &dd, "executeWorkerHandle")?,
+        execute_worker_direct: internal_function(runtime, &dd, "executeWorkerDirect")?,
         abort_worker_request_handle: internal_function(runtime, &dd, "abortWorkerRequestHandle")?,
         drain_request_control_queue: internal_function(
             runtime,
@@ -285,6 +287,19 @@ pub struct WorkerDispatchRequest<'a> {
     pub request: WorkerInvocation,
 }
 
+fn direct_method_code(method: &str) -> Option<u32> {
+    match method {
+        "GET" => Some(0),
+        "POST" => Some(1),
+        "HEAD" => Some(2),
+        "PUT" => Some(3),
+        "DELETE" => Some(4),
+        "PATCH" => Some(5),
+        "OPTIONS" => Some(6),
+        _ => None,
+    }
+}
+
 pub fn dispatch_worker_request(
     runtime: &mut JsRuntime,
     dispatch: WorkerDispatchRequest<'_>,
@@ -299,6 +314,50 @@ pub fn dispatch_worker_request(
         memory_call,
         mut request,
     } = dispatch;
+
+    // Fast path for simple HTTP invocations (no memory call, no headers, no body,
+    // no streaming, standard HTTP method): bypass all 3 Rust HashMaps, skip
+    // `op_request_invocation_take`, and eliminate 16-field JSON serialize + parse.
+    if memory_call.is_none()
+        && request.headers.is_empty()
+        && request.body.is_empty()
+        && request_body_stream_handle == 0
+        && !stream_response
+        && let Some(method_code) = direct_method_code(&request.method)
+    {
+        let (max_response_body_bytes, max_request_body_bytes, execute_direct) = {
+            let op_state = runtime.op_state();
+            let op_state = op_state.borrow();
+            let limits = op_state.borrow::<crate::ops::RuntimeExecutionLimits>();
+            let entrypoints = op_state.borrow::<RuntimeEntrypoints>();
+            (
+                limits.max_response_body_bytes,
+                limits.max_request_body_bytes,
+                entrypoints.execute_worker_direct.clone(),
+            )
+        };
+        let time = crate::ops::current_time_boundary();
+        runtime
+            .call_execute_worker_direct(
+                &execute_direct,
+                request_context_handle,
+                completion_handle,
+                memory_request_scope_handle,
+                max_response_body_bytes,
+                max_request_body_bytes,
+                time.now_ms,
+                time.perf_ms,
+                method_code,
+                request_id,
+                &request.url,
+                &request.request_id,
+            )
+            .map_err(|e| {
+                PlatformError::runtime(format!("runtime entrypoint executeWorkerDirect threw: {e}"))
+            })?;
+        return Ok(());
+    }
+
     let request_handle = {
         let op_state = runtime.op_state();
         let mut op_state = op_state.borrow_mut();

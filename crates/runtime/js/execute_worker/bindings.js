@@ -297,35 +297,18 @@ const workerEnv = (worker, deployment) => {
   return env;
 };
 
-const executeMemoryTransaction = async (
+const runMemoryTxnWithBatch = async (
   entry,
   callback,
   commandHandle,
+  batchHandle,
+  closeLeaseHandle,
 ) => {
-  let txn;
+  const txn = new MemoryTxn(entry, batchHandle);
   const current = currentRequestContext();
   const previousMemoryEntry = current.memoryEntry;
   const previousSocketRuntimeProvider = current.socketRuntimeProvider;
   try {
-    const beginPending = op_memory_batch_begin(
-      activeRequestContextHandle(),
-      memoryScopedScopeHandle(entry),
-      entry.binding,
-      entry.memoryKey,
-      commandHandle,
-    );
-    let beginRes;
-    try {
-      beginRes = await beginPending;
-    } catch (error) {
-      syncFrozenTimeNow();
-      if (isMemoryStorageFailure(error)) {
-        return await failMemoryEntry(entry, error);
-      }
-      throw error;
-    }
-    setTime(beginRes[1], beginRes[2]);
-    txn = new MemoryTxn(entry, beginRes[0]);
     let socketRuntime = null;
     const ensureSocketRuntime = () => {
       if (socketRuntime === null) {
@@ -352,14 +335,22 @@ const executeMemoryTransaction = async (
     if (commandHandle > 0) {
       setMemoryBatchCommandResult(txn, await encodeMemoryCommandResult(value));
     }
-    const batchHandle = txn.batchHandle;
+    const handle = txn.batchHandle;
     txn.batchHandle = 0;
     let applyRes;
     try {
-      applyRes = await op_memory_batch_apply(batchHandle);
+      applyRes = closeLeaseHandle > 0
+        ? await op_memory_batch_apply_and_close(handle, closeLeaseHandle)
+        : await op_memory_batch_apply(handle);
     } catch (error) {
+      if (closeLeaseHandle > 0 && current.memoryRequestScopeHandle === closeLeaseHandle) {
+        current.memoryRequestScopeHandle = 0;
+      }
       syncFrozenTimeNow();
       throw error;
+    }
+    if (closeLeaseHandle > 0 && current.memoryRequestScopeHandle === closeLeaseHandle) {
+      current.memoryRequestScopeHandle = 0;
     }
     setTime(applyRes[3], applyRes[4]);
     if (applyRes[0] === true && applyRes[2] === true) {
@@ -371,6 +362,32 @@ const executeMemoryTransaction = async (
     current.memoryEntry = previousMemoryEntry;
     current.socketRuntimeProvider = previousSocketRuntimeProvider;
   }
+};
+
+const executeMemoryTransaction = async (
+  entry,
+  callback,
+  commandHandle,
+) => {
+  const beginPending = op_memory_batch_begin(
+    activeRequestContextHandle(),
+    memoryScopedScopeHandle(entry),
+    entry.binding,
+    entry.memoryKey,
+    commandHandle,
+  );
+  let beginRes;
+  try {
+    beginRes = await beginPending;
+  } catch (error) {
+    syncFrozenTimeNow();
+    if (isMemoryStorageFailure(error)) {
+      return await failMemoryEntry(entry, error);
+    }
+    throw error;
+  }
+  setTime(beginRes[1], beginRes[2]);
+  return await runMemoryTxnWithBatch(entry, callback, commandHandle, beginRes[0], 0);
 };
 
 const buildWakeEvent = (memoryCall, stub) => {
@@ -901,6 +918,33 @@ dd.executeWorkerHandle = (requestHandle) => {
   const bodyHandle = descriptor[6];
   const body = bodyHandle > 0 ? op_http_body_take(bodyHandle) : EMPTY_BYTES;
   executeWorker(new WorkerInvocation(descriptor, body));
+};
+
+dd.executeWorkerDirect = (
+  requestContextHandle,
+  completionHandle,
+  memoryRequestScopeHandle,
+  maxResponseBodyBytes,
+  maxRequestBodyBytes,
+  nowMs,
+  perfMs,
+  methodCode,
+  requestId,
+  url,
+  inputRequestId,
+) => {
+  setTime(nowMs, perfMs);
+  executeWorker(new DirectWorkerInvocation(
+    requestId,
+    requestContextHandle,
+    completionHandle,
+    memoryRequestScopeHandle,
+    maxResponseBodyBytes,
+    maxRequestBodyBytes,
+    DIRECT_METHODS[methodCode],
+    url,
+    inputRequestId,
+  ));
 };
 
 const listOf = (input) => (ArrayIsArray(input) ? input : []);

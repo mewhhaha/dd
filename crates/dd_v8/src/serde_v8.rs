@@ -448,6 +448,7 @@ pub fn try_encode_str_ok(val: &WireValue) -> Option<Vec<u16>> {
             // Fast zero-JSON-parse encodings for the hottest fixed-shape tuples:
             //   '2': [num, num] (op_response_complete_inline)
             //   '3': [num, num, num] (op_memory_batch_begin)
+            //   '4': [num, num, num, num] (op_memory_atomic_begin)
             //   '5': [bool, num, bool, num, num] (op_memory_batch_apply)
             if items.len() == 2
                 && matches!(items[0], WireValue::I32(_) | WireValue::F64(_))
@@ -476,6 +477,28 @@ pub fn try_encode_str_ok(val: &WireValue) -> Option<Vec<u16>> {
                         s.push(',');
                         if write_wire_num(&items[2], &mut s) {
                             return Some(str_to_utf16(&s));
+                        }
+                    }
+                }
+                return None;
+            }
+            if items.len() == 4
+                && matches!(items[0], WireValue::I32(_) | WireValue::F64(_))
+                && matches!(items[1], WireValue::I32(_) | WireValue::F64(_))
+                && matches!(items[2], WireValue::I32(_) | WireValue::F64(_))
+                && matches!(items[3], WireValue::I32(_) | WireValue::F64(_))
+            {
+                let mut s = String::with_capacity(64);
+                s.push('4');
+                if write_wire_num(&items[0], &mut s) {
+                    s.push(',');
+                    if write_wire_num(&items[1], &mut s) {
+                        s.push(',');
+                        if write_wire_num(&items[2], &mut s) {
+                            s.push(',');
+                            if write_wire_num(&items[3], &mut s) {
+                                return Some(str_to_utf16(&s));
+                            }
                         }
                     }
                 }

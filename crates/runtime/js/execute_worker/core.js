@@ -184,8 +184,10 @@ const {
   op_kv_list,
   op_kv_put,
   op_kv_put_bytes,
+  op_memory_atomic_begin,
   op_memory_batch_accept,
   op_memory_batch_apply,
+  op_memory_batch_apply_and_close,
   op_memory_batch_begin,
   op_memory_batch_close,
   op_memory_batch_command_result_set,
@@ -233,6 +235,8 @@ const ignoreRejection = (promise) => {
 const ONCE = ObjectFreeze({ __proto__: null, once: true });
 const FOR_STORAGE = ObjectFreeze({ __proto__: null, forStorage: true });
 const EMPTY_BYTES = new Uint8Array(0);
+const EMPTY_HEADERS = ObjectFreeze([]);
+const DIRECT_METHODS = ObjectFreeze(["GET", "POST", "HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"]);
 
 /** A handle number from an op result or descriptor: a non-negative integer. */
 const toHandle = (value) => MathMax(0, MathTrunc(Number(value ?? 0) || 0));
@@ -257,6 +261,33 @@ const WorkerInvocation = record(function WorkerInvocation(d, body) {
   this.url = d[12];
   this.input_request_id = d[13];
   this.body = body;
+});
+// Direct zero-JSON invocation record matching WorkerInvocation's exact field order.
+const DirectWorkerInvocation = record(function DirectWorkerInvocation(
+  requestId,
+  requestContextHandle,
+  completionHandle,
+  memoryRequestScopeHandle,
+  maxResponseBodyBytes,
+  maxRequestBodyBytes,
+  method,
+  url,
+  inputRequestId,
+) {
+  this.request_id = requestId;
+  this.request_context_handle = requestContextHandle;
+  this.completion_handle = completionHandle;
+  this.memory_request_scope_handle = memoryRequestScopeHandle;
+  this.memory_call = null;
+  this.request_body_stream_handle = 0;
+  this.headers = EMPTY_HEADERS;
+  this.stream_response = false;
+  this.max_response_body_bytes = maxResponseBodyBytes;
+  this.max_request_body_bytes = maxRequestBodyBytes;
+  this.method = method;
+  this.url = url;
+  this.input_request_id = inputRequestId;
+  this.body = EMPTY_BYTES;
 });
 // The store asyncContext carries for a request. memory.js runs each memory
 // call under a copy with its own memory scope. The request's handles here
