@@ -504,6 +504,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             isolate_id,
                         }).await;
 
+                        let mut gc_reclaimed_while_idle = false;
                         loop {
                             let mut made_progress = false;
                             let mut drained_commands = 0usize;
@@ -561,32 +562,74 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             }
 
                             if made_progress {
+                                gc_reclaimed_while_idle = false;
                                 continue;
                             }
 
-                            tokio::select! {
-                                command = command_rx.recv() => {
-                                    let Some(command) = command else {
-                                        return;
-                                    };
-                                    if !handle_isolate_command_or_fail(
-                                        &mut js_runtime,
-                                        &event_tx,
-                                        &worker_name,
-                                        generation,
-                                        isolate_id,
-                                        command,
-                                    )
-                                    .await
-                                    {
-                                        return;
+                            if !gc_reclaimed_while_idle {
+                                tokio::select! {
+                                    command = command_rx.recv() => {
+                                        gc_reclaimed_while_idle = false;
+                                        let Some(command) = command else {
+                                            return;
+                                        };
+                                        if !handle_isolate_command_or_fail(
+                                            &mut js_runtime,
+                                            &event_tx,
+                                            &worker_name,
+                                            generation,
+                                            isolate_id,
+                                            command,
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                        if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                            return;
+                                        }
                                     }
-                                    if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
-                                        return;
+                                    _ = event_loop_notify.notified() => {
+                                        gc_reclaimed_while_idle = false;
+                                    }
+                                    _ = thread_request_control_inbox.ready.notified() => {
+                                        gc_reclaimed_while_idle = false;
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                                        js_runtime.reclaim_inactive_gc_space();
+                                        gc_reclaimed_while_idle = true;
                                     }
                                 }
-                                _ = event_loop_notify.notified() => {}
-                                _ = thread_request_control_inbox.ready.notified() => {}
+                            } else {
+                                tokio::select! {
+                                    command = command_rx.recv() => {
+                                        gc_reclaimed_while_idle = false;
+                                        let Some(command) = command else {
+                                            return;
+                                        };
+                                        if !handle_isolate_command_or_fail(
+                                            &mut js_runtime,
+                                            &event_tx,
+                                            &worker_name,
+                                            generation,
+                                            isolate_id,
+                                            command,
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                        if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                            return;
+                                        }
+                                    }
+                                    _ = event_loop_notify.notified() => {
+                                        gc_reclaimed_while_idle = false;
+                                    }
+                                    _ = thread_request_control_inbox.ready.notified() => {
+                                        gc_reclaimed_while_idle = false;
+                                    }
+                                }
                             }
                         }
                     } => {},

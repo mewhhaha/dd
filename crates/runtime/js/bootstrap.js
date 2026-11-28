@@ -53,8 +53,6 @@ const {
   ByteLengthQueuingStrategy,
   CloseEvent,
   CountQueuingStrategy,
-  Crypto,
-  CryptoKey,
   CustomEvent,
   DOMException,
   ErrorEvent,
@@ -74,7 +72,6 @@ const {
   ReadableStreamDefaultReader,
   Request,
   Response,
-  SubtleCrypto,
   TextDecoder,
   TextDecoderStream,
   TextEncoder,
@@ -82,7 +79,6 @@ const {
   TransformStream,
   TransformStreamDefaultController,
   URL,
-  URLPattern,
   URLSearchParams,
   WritableStream,
   WritableStreamDefaultController,
@@ -162,6 +158,22 @@ const define = (name, value, enumerable = false) => {
   });
 };
 
+const defineLazy = (name, load) => {
+  ObjectDefineProperty(globalThis, name, {
+    __proto__: null,
+    get() {
+      const value = load();
+      define(name, value);
+      return value;
+    },
+    set(value) {
+      define(name, value);
+    },
+    enumerable: false,
+    configurable: true,
+  });
+};
+
 const requireRuntimeFunction = (name, value) => {
   if (typeof value !== "function") {
     throw new Error(`dd bootstrap is missing the web class ${name}`);
@@ -175,7 +187,6 @@ const RuntimeFormData = requireRuntimeFunction("FormData", FormData);
 const RuntimeRequest = requireRuntimeFunction("Request", Request);
 const RuntimeURL = requireRuntimeFunction("URL", URL);
 const RuntimeURLSearchParams = requireRuntimeFunction("URLSearchParams", URLSearchParams);
-const RuntimeURLPattern = requireRuntimeFunction("URLPattern", URLPattern);
 const RuntimeBlob = requireRuntimeFunction("Blob", Blob);
 const RuntimeFile = requireRuntimeFunction("File", File);
 const RuntimeReadableStream = requireRuntimeFunction("ReadableStream", ReadableStream);
@@ -493,9 +504,9 @@ function ensureConsoleGlobal() {
 }
 
 function ensureCryptoGlobals() {
-  define("Crypto", Crypto);
-  define("CryptoKey", CryptoKey);
-  define("SubtleCrypto", SubtleCrypto);
+  defineLazy("Crypto", () => dd.web.Crypto);
+  defineLazy("CryptoKey", () => dd.web.CryptoKey);
+  defineLazy("SubtleCrypto", () => dd.web.SubtleCrypto);
   ObjectDefineProperty(globalThis, "crypto", {
     __proto__: null,
     get() {
@@ -671,7 +682,7 @@ define("Request", RuntimeRequest);
 define("Response", RuntimeResponse);
 define("URL", RuntimeURL);
 define("URLSearchParams", RuntimeURLSearchParams);
-define("URLPattern", RuntimeURLPattern);
+defineLazy("URLPattern", () => dd.web.URLPattern);
 define("Blob", RuntimeBlob);
 define("File", RuntimeFile);
 define("FormData", RuntimeFormData);

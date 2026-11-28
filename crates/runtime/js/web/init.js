@@ -23,8 +23,20 @@ const {
   Uint8Array,
   uncurryThis,
 } = primordials;
-const cryptoRuntime = core.loadExtScript("ext:vendor/crypto/00_crypto.js");
-const { Crypto, CryptoKey, SubtleCrypto } = cryptoRuntime;
+let loadedCryptoRuntime = null;
+function loadCryptoRuntime() {
+  if (loadedCryptoRuntime === null) {
+    loadedCryptoRuntime = core.loadExtScript("ext:vendor/crypto/00_crypto.js");
+  }
+  return loadedCryptoRuntime;
+}
+let loadedUrlPattern = null;
+function loadUrlPattern() {
+  if (loadedUrlPattern === null) {
+    loadedUrlPattern = core.loadExtScript("ext:vendor/web/01_urlpattern.js").URLPattern;
+  }
+  return loadedUrlPattern;
+}
 const {
   CloseEvent,
   CustomEvent,
@@ -72,7 +84,6 @@ const {
 } = core.loadExtScript("ext:vendor/web/08_text_encoding.js");
 const { Blob, File } = core.loadExtScript("ext:vendor/web/09_file.js");
 const { URL, URLSearchParams } = core.loadExtScript("ext:vendor/web/00_url.js");
-const { URLPattern } = core.loadExtScript("ext:vendor/web/01_urlpattern.js");
 const { performance } = core.loadExtScript("ext:vendor/web/15_performance.js");
 const { Headers } = core.loadExtScript("ext:vendor/fetch/20_headers.js");
 const { FormData } = core.loadExtScript("ext:vendor/fetch/21_formdata.js");
@@ -306,8 +317,6 @@ const ddRuntime = {
   ByteLengthQueuingStrategy,
   CloseEvent,
   CountQueuingStrategy,
-  Crypto,
-  CryptoKey,
   CustomEvent,
   DOMException,
   ErrorEvent,
@@ -327,7 +336,6 @@ const ddRuntime = {
   ReadableStreamDefaultReader,
   Request,
   Response,
-  SubtleCrypto,
   TextDecoder,
   TextDecoderStream,
   TextEncoder,
@@ -335,7 +343,6 @@ const ddRuntime = {
   TransformStream,
   TransformStreamDefaultController,
   URL,
-  URLPattern,
   URLSearchParams,
   WritableStream,
   WritableStreamDefaultController,
@@ -346,9 +353,29 @@ const ddRuntime = {
   structuredClone,
 };
 
+ObjectDefineProperty(ddRuntime, "Crypto", {
+  __proto__: null,
+  get: () => loadCryptoRuntime().Crypto,
+  enumerable: true,
+});
+ObjectDefineProperty(ddRuntime, "CryptoKey", {
+  __proto__: null,
+  get: () => loadCryptoRuntime().CryptoKey,
+  enumerable: true,
+});
+ObjectDefineProperty(ddRuntime, "SubtleCrypto", {
+  __proto__: null,
+  get: () => loadCryptoRuntime().SubtleCrypto,
+  enumerable: true,
+});
 ObjectDefineProperty(ddRuntime, "crypto", {
   __proto__: null,
-  get: () => cryptoRuntime.crypto,
+  get: () => loadCryptoRuntime().crypto,
+  enumerable: true,
+});
+ObjectDefineProperty(ddRuntime, "URLPattern", {
+  __proto__: null,
+  get: () => loadUrlPattern(),
   enumerable: true,
 });
 

@@ -5,6 +5,16 @@ import {
   start_async,
   call_sync_str,
   start_async_str,
+  call_sync_0,
+  call_sync_u32,
+  call_sync_u32_str,
+  call_sync_u32_str_str,
+  call_sync_resp_inline,
+  start_async_u32,
+  start_async_u32_str2,
+  start_async_str2,
+  start_async_str3,
+  start_async_u32_2_str2_u32,
   utf8_encode,
   utf8_decode,
   load_module,
@@ -97,6 +107,7 @@ const _StrCharCodeAt = String.prototype.charCodeAt;
 const _StrFromCharCode = String.fromCharCode;
 const _StrStartsWith = String.prototype.startsWith;
 const _StrSlice = String.prototype.slice;
+const _StrIndexOf = String.prototype.indexOf;
 const _NumberValueOf = Number.prototype.valueOf;
 const _StringValueOf = String.prototype.valueOf;
 const _BooleanValueOf = Boolean.prototype.valueOf;
@@ -1337,17 +1348,89 @@ function _decodeStrErr(resp) {
   return _buildErrorParts(parts[0], parts[1], parts[2]);
 }
 
+function _isI32(v) {
+  return typeof v === "number" && (v | 0) === v && (v !== 0 || 1 / v > 0);
+}
+
+function _flattenHeaderPairs(headers) {
+  if (typeof headers !== "object" || headers === null || _isProxy(headers) || !_ArrayIsArray(headers)) {
+    return null;
+  }
+  let len;
+  try { len = headers.length; } catch { return null; }
+  if (len === 0) return "";
+  if (len > 64) return null;
+  let out = "";
+  for (let i = 0; i < len; i++) {
+    let desc;
+    try { desc = _ObjectGetOwnPropertyDescriptor(headers, i); } catch { return null; }
+    if (!desc || desc.get || desc.set) return null;
+    const item = desc.value;
+    if (!item || typeof item !== "object" || _isProxy(item) || !_ArrayIsArray(item)) return null;
+    let ilen;
+    try { ilen = item.length; } catch { return null; }
+    if (ilen !== 2) return null;
+    let d0, d1;
+    try {
+      d0 = _ObjectGetOwnPropertyDescriptor(item, 0);
+      d1 = _ObjectGetOwnPropertyDescriptor(item, 1);
+    } catch {
+      return null;
+    }
+    if (!d0 || d0.get || d0.set || typeof d0.value !== "string") return null;
+    if (!d1 || d1.get || d1.set || typeof d1.value !== "string") return null;
+    const k = d0.value;
+    const v = d1.value;
+    if (_call(_StrIndexOf, k, "\0") !== -1 || _call(_StrIndexOf, v, "\0") !== -1) return null;
+    out = i === 0 ? `${k}\0${v}` : `${out}\0${k}\0${v}`;
+  }
+  return out;
+}
+
 function _decodeStrValue(resp) {
-  const tag = _call(_StrCharCodeAt, resp, 0);
-  if (tag === 117) return undefined; // 'u'
-  if (tag === 110) return null;      // 'n'
-  if (tag === 116) return true;      // 't'
-  if (tag === 102) return false;     // 'f'
-  if (tag === 105) return _Number(_call(_StrSlice, resp, 1)) | 0; // 'i'
-  if (tag === 100) return _Number(_call(_StrSlice, resp, 1));     // 'd'
-  if (tag === 115) return _call(_StrSlice, resp, 1);              // 's'
-  if (tag === 106) return _JSONParse(_call(_StrSlice, resp, 1));  // 'j'
-  if (tag === 101) throw _decodeStrErr(resp);                     // 'e'
+  const tag = resp[0];
+  if (tag === "u") return undefined;
+  if (tag === "n") return null;
+  if (tag === "t") return true;
+  if (tag === "f") return false;
+  if (tag === "i") return _Number(_call(_StrSlice, resp, 1)) | 0;
+  if (tag === "d") return _Number(_call(_StrSlice, resp, 1));
+  if (tag === "s") return _call(_StrSlice, resp, 1);
+  if (tag === "m") { // { text, encoding: "utf8" }
+    return { text: _call(_StrSlice, resp, 1), encoding: "utf8" };
+  }
+  if (tag === "r") { // { text, value_handle: 0, encoding: "utf8" }
+    return { text: _call(_StrSlice, resp, 1), value_handle: 0, encoding: "utf8" };
+  }
+  if (tag === "2") { // [num, num]
+    const c1 = _call(_StrIndexOf, resp, ",", 1);
+    return [
+      _Number(_call(_StrSlice, resp, 1, c1)),
+      _Number(_call(_StrSlice, resp, c1 + 1)),
+    ];
+  }
+  if (tag === "3") { // [num, num, num]
+    const c1 = _call(_StrIndexOf, resp, ",", 1);
+    const c2 = _call(_StrIndexOf, resp, ",", c1 + 1);
+    return [
+      _Number(_call(_StrSlice, resp, 1, c1)),
+      _Number(_call(_StrSlice, resp, c1 + 1, c2)),
+      _Number(_call(_StrSlice, resp, c2 + 1)),
+    ];
+  }
+  if (tag === "5") { // [bool, num, bool, num, num]
+    const c2 = _call(_StrIndexOf, resp, ",", 3);
+    const c4 = _call(_StrIndexOf, resp, ",", c2 + 3);
+    return [
+      resp[1] === "1",
+      _Number(_call(_StrSlice, resp, 3, c2)),
+      resp[c2 + 1] === "1",
+      _Number(_call(_StrSlice, resp, c2 + 3, c4)),
+      _Number(_call(_StrSlice, resp, c4 + 1)),
+    ];
+  }
+  if (tag === "j") return _JSONParse(_call(_StrSlice, resp, 1));
+  if (tag === "e") throw _decodeStrErr(resp);
   throw new _Error(`unknown str envelope tag ${tag}`);
 }
 
@@ -2337,20 +2420,87 @@ function _makeSyncOp(opId, name) {
       if (!env.ok) throw env.error;
       _call(_TASet, new _Uint8Array(ab, off, len), env.value);
     };
+  } else if (name === "op_response_complete_inline") {
+    fn = function op_response_complete_inline(comp, reqCtx, memScope, status, headers, body, finish) {
+      if (
+        arguments.length === 7
+        && _isI32(comp)
+        && _isI32(reqCtx)
+        && _isI32(memScope)
+        && _isI32(status)
+        && typeof body === "string"
+        && typeof finish === "boolean"
+      ) {
+        const flat = _flattenHeaderPairs(headers);
+        if (flat !== null && (flat.length + body.length) * 2 <= _maxOpArgBytes) {
+          const resp = call_sync_resp_inline(opId, comp, reqCtx, memScope, status, flat, body, finish ? 1 : 0);
+          const tag = resp[0];
+          if (tag !== "F" && tag !== "B") {
+            return _decodeStrValue(resp);
+          }
+        }
+      }
+      const n = arguments.length;
+      const jsonArgs = _tryEncodeStrArgs(arguments, n);
+      if (jsonArgs !== null) {
+        const resp = call_sync_str(opId, jsonArgs);
+        const tag = resp[0];
+        if (tag === "B") {
+          return _decodeSyncResult(call_sync(0x7fffffff, _emptyArgsWire));
+        }
+        if (tag !== "F") {
+          return _decodeStrValue(resp);
+        }
+      }
+      const args = new _Array(n);
+      for (let i = 0; i < n; i++) args[i] = arguments[i];
+      return _decodeSyncResult(call_sync(opId, _encodeWireArgs(args)));
+    };
   } else {
     let useBinary = false;
     fn = function () {
       const n = arguments.length;
       if (!useBinary) {
-        const jsonArgs = _tryEncodeStrArgs(arguments, n);
-        if (jsonArgs !== null) {
-          const resp = call_sync_str(opId, jsonArgs);
-          const tag = _call(_StrCharCodeAt, resp, 0);
-          if (tag === 66) { // 'B' binary fallback (op returned Bytes/BigInt/etc.)
+        let resp = null;
+        if (n === 0) {
+          resp = call_sync_0(opId);
+        } else if (n === 1) {
+          const a0 = arguments[0];
+          if (_isI32(a0)) {
+            resp = call_sync_u32(opId, a0);
+          }
+        } else if (n === 2) {
+          const a0 = arguments[0];
+          const a1 = arguments[1];
+          if (_isI32(a0) && typeof a1 === "string" && a1.length * 2 <= _maxOpArgBytes) {
+            resp = call_sync_u32_str(opId, a0, a1);
+          }
+        } else if (n === 3) {
+          const a0 = arguments[0];
+          const a1 = arguments[1];
+          const a2 = arguments[2];
+          if (
+            _isI32(a0)
+            && typeof a1 === "string"
+            && typeof a2 === "string"
+            && (a1.length + a2.length) * 2 <= _maxOpArgBytes
+          ) {
+            resp = call_sync_u32_str_str(opId, a0, a1, a2);
+          }
+        }
+        if (resp === null) {
+          const jsonArgs = _tryEncodeStrArgs(arguments, n);
+          if (jsonArgs !== null) {
+            resp = call_sync_str(opId, jsonArgs);
+          }
+        }
+        if (resp !== null) {
+          const tag = resp[0];
+          if (tag === "B") { // binary fallback (op returned Bytes/BigInt/etc.)
             useBinary = true;
             return _decodeSyncResult(call_sync(0x7fffffff, _emptyArgsWire));
           }
-          if (tag !== 70) { // 'F' retry via binary (e.g. lone surrogate in string arg)
+          if (tag !== "F") { // retry via binary (e.g. lone surrogate in string arg)
             return _decodeStrValue(resp);
           }
         }
@@ -2386,23 +2536,72 @@ function _makeAsyncOp(opId, name) {
     if (!useBinary) {
       let resp;
       try {
-        const jsonArgs = _tryEncodeStrArgs(arguments, n);
-        if (jsonArgs !== null) {
-          resp = start_async_str(opId, jsonArgs);
+        if (n === 1) {
+          const a0 = arguments[0];
+          if (_isI32(a0)) {
+            resp = start_async_u32(opId, a0);
+          }
+        } else if (n === 2) {
+          const a0 = arguments[0];
+          const a1 = arguments[1];
+          if (typeof a0 === "string" && typeof a1 === "string" && (a0.length + a1.length) * 2 <= _maxOpArgBytes) {
+            resp = start_async_str2(opId, a0, a1);
+          }
+        } else if (n === 3) {
+          const a0 = arguments[0];
+          const a1 = arguments[1];
+          const a2 = arguments[2];
+          if (
+            _isI32(a0)
+            && typeof a1 === "string"
+            && typeof a2 === "string"
+            && (a1.length + a2.length) * 2 <= _maxOpArgBytes
+          ) {
+            resp = start_async_u32_str2(opId, a0, a1, a2);
+          } else if (
+            typeof a0 === "string"
+            && typeof a1 === "string"
+            && typeof a2 === "string"
+            && (a0.length + a1.length + a2.length) * 2 <= _maxOpArgBytes
+          ) {
+            resp = start_async_str3(opId, a0, a1, a2);
+          }
+        } else if (n === 5) {
+          const a0 = arguments[0];
+          const a1 = arguments[1];
+          const a2 = arguments[2];
+          const a3 = arguments[3];
+          const a4 = arguments[4];
+          if (
+            _isI32(a0)
+            && _isI32(a1)
+            && typeof a2 === "string"
+            && typeof a3 === "string"
+            && _isI32(a4)
+            && (a2.length + a3.length) * 2 <= _maxOpArgBytes
+          ) {
+            resp = start_async_u32_2_str2_u32(opId, a0, a1, a2, a3, a4);
+          }
+        }
+        if (resp === undefined) {
+          const jsonArgs = _tryEncodeStrArgs(arguments, n);
+          if (jsonArgs !== null) {
+            resp = start_async_str(opId, jsonArgs);
+          }
         }
       } catch (e) {
         return _PromiseReject(e);
       }
       if (resp !== undefined) {
-        const tag = _call(_StrCharCodeAt, resp, 0);
-        if (tag === 112) { // 'p' pending
+        const tag = resp[0];
+        if (tag === "p") { // pending
           const id = _Number(_call(_StrSlice, resp, 1)) >>> 0;
           let resolveFn, rejectFn;
           const p = new _Promise((res, rej) => { resolveFn = res; rejectFn = rej; });
           _call(_MapSet, _pendingAsyncOps, id, { resolve: resolveFn, reject: rejectFn, promise: p });
           return p;
         }
-        if (tag === 66) { // 'B' binary fallback
+        if (tag === "B") { // binary fallback
           useBinary = true;
           try {
             return _PromiseResolve(_decodeSyncResult(call_sync(0x7fffffff, _emptyArgsWire)));
@@ -2410,10 +2609,10 @@ function _makeAsyncOp(opId, name) {
             return _PromiseReject(e);
           }
         }
-        if (tag === 101) { // 'e'
+        if (tag === "e") {
           return _PromiseReject(_decodeStrErr(resp));
         }
-        if (tag !== 70) { // 'F' retry via binary (e.g. lone surrogate in string arg)
+        if (tag !== "F") { // retry via binary (e.g. lone surrogate in string arg)
           try {
             return _PromiseResolve(_decodeStrValue(resp));
           } catch (e) {
@@ -2589,7 +2788,7 @@ export function __dd_settle_async_str(pendingId, resp) {
   const rec = _call(_MapGet, _pendingAsyncOps, pendingId);
   if (!rec) return;
   _call(_MapDelete, _pendingAsyncOps, pendingId);
-  if (_call(_StrCharCodeAt, resp, 0) === 101) { // 'e'
+  if (resp[0] === "e") {
     rec.reject(_decodeStrErr(resp));
     return;
   }

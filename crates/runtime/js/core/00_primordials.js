@@ -55,247 +55,255 @@
   const applyBind = bind.bind(apply);
   primordials.applyBind = applyBind;
 
-  // Methods that accept a variable number of arguments, and thus it's useful to
-  // also create `${prefix}${key}Apply`, which uses `Function.prototype.apply`,
-  // instead of `Function.prototype.call`, and thus doesn't require iterator
-  // destructuring.
-  const varargsMethods = [
-    // 'ArrayPrototypeConcat' is omitted, because it performs the spread
-    // on its own for arrays and array-likes with a truthy
-    // @@isConcatSpreadable symbol property.
-    "ArrayOf",
-    "ArrayPrototypePush",
-    "ArrayPrototypeUnshift",
-    // 'FunctionPrototypeCall' is omitted, since there's 'ReflectApply'
-    // and 'FunctionPrototypeApply'.
-    "MathHypot",
-    "MathMax",
-    "MathMin",
-    "StringPrototypeConcat",
-    "TypedArrayOf",
-  ];
+  const getGetter = (proto, key) => {
+    const desc = ReflectGetOwnPropertyDescriptor(proto, key);
+    return desc && desc.get ? uncurryThis(desc.get) : undefined;
+  };
+  const maybeUncurry = (fn) => (typeof fn === "function" ? uncurryThis(fn) : undefined);
 
-  function getNewKey(key) {
-    return typeof key === "symbol"
-      ? `Symbol${key.description[7].toUpperCase()}${key.description.slice(8)}`
-      : `${key[0].toUpperCase()}${key.slice(1)}`;
-  }
+  const TypedArray = Reflect.getPrototypeOf(Uint8Array);
+  const TypedArrayPrototype = TypedArray.prototype;
+  const ArrayIteratorPrototype = Reflect.getPrototypeOf(Array.prototype[Symbol.iterator]());
+  const SetIteratorPrototype = Reflect.getPrototypeOf(new Set()[Symbol.iterator]());
+  const MapIteratorPrototype = Reflect.getPrototypeOf(new Map()[Symbol.iterator]());
+  const StringIteratorPrototype = Reflect.getPrototypeOf(String.prototype[Symbol.iterator]());
+  const AsyncGeneratorPrototype = Reflect.getPrototypeOf(async function* () {}).prototype;
 
-  function copyAccessor(dest, prefix, key, { enumerable, get, set }) {
-    ReflectDefineProperty(dest, `${prefix}Get${key}`, {
-      __proto__: null,
-      value: uncurryThis(get),
-      enumerable,
-    });
-    if (set !== undefined) {
-      ReflectDefineProperty(dest, `${prefix}Set${key}`, {
-        __proto__: null,
-        value: uncurryThis(set),
-        enumerable,
-      });
-    }
-  }
+  // Directly capture every built-in and uncurried prototype method used by the
+  // runtime and vendored web scripts without reflecting ~1,000 unused keys and
+  // allocating ~800 dead BoundFunctions on every isolate cold start.
+  primordials.globalThis = globalThis;
+  primordials.Proxy = Proxy;
+  primordials.isNaN = isNaN;
+  primordials.decodeURI = decodeURI;
+  primordials.decodeURIComponent = decodeURIComponent;
+  primordials.encodeURI = encodeURI;
+  primordials.encodeURIComponent = encodeURIComponent;
 
-  function copyPropsRenamed(src, dest, prefix) {
-    for (const key of ReflectOwnKeys(src)) {
-      const newKey = getNewKey(key);
-      const desc = ReflectGetOwnPropertyDescriptor(src, key);
-      if ("get" in desc) {
-        copyAccessor(dest, prefix, newKey, desc);
-      } else {
-        const name = `${prefix}${newKey}`;
-        ReflectDefineProperty(dest, name, { __proto__: null, ...desc });
-        if (varargsMethods.includes(name)) {
-          ReflectDefineProperty(dest, `${name}Apply`, {
-            __proto__: null,
-            // `src` is bound as the `this` so that the static `this` points
-            // to the object it was defined on,
-            // e.g.: `ArrayOfApply` gets a `this` of `Array`:
-            value: applyBind(desc.value, src),
-          });
-        }
-      }
-    }
-  }
+  primordials.AggregateError = AggregateError;
+  primordials.Array = Array;
+  primordials.ArrayBuffer = ArrayBuffer;
+  primordials.BigInt = BigInt;
+  primordials.BigInt64Array = BigInt64Array;
+  primordials.BigUint64Array = BigUint64Array;
+  primordials.Boolean = Boolean;
+  primordials.DataView = DataView;
+  primordials.Date = Date;
+  primordials.Error = Error;
+  primordials.EvalError = EvalError;
+  primordials.FinalizationRegistry = FinalizationRegistry;
+  primordials.Float32Array = Float32Array;
+  primordials.Float64Array = Float64Array;
+  primordials.Function = Function;
+  primordials.Int16Array = Int16Array;
+  primordials.Int32Array = Int32Array;
+  primordials.Int8Array = Int8Array;
+  primordials.Map = Map;
+  primordials.Number = Number;
+  const _Promise = globalThis.Promise;
+  primordials.Object = Object;
+  primordials.Promise = _Promise;
+  primordials.RangeError = RangeError;
+  primordials.ReferenceError = ReferenceError;
+  primordials.RegExp = RegExp;
+  primordials.Set = Set;
+  primordials.String = String;
+  primordials.Symbol = Symbol;
+  primordials.SyntaxError = SyntaxError;
+  primordials.TypeError = TypeError;
+  primordials.URIError = URIError;
+  primordials.Uint16Array = Uint16Array;
+  primordials.Uint32Array = Uint32Array;
+  primordials.Uint8Array = Uint8Array;
+  primordials.Uint8ClampedArray = Uint8ClampedArray;
+  primordials.WeakMap = WeakMap;
+  primordials.WeakRef = WeakRef;
+  primordials.WeakSet = WeakSet;
+  primordials.TypedArray = TypedArray;
 
-  function copyPropsRenamedBound(src, dest, prefix) {
-    for (const key of ReflectOwnKeys(src)) {
-      const newKey = getNewKey(key);
-      const desc = ReflectGetOwnPropertyDescriptor(src, key);
-      if ("get" in desc) {
-        copyAccessor(dest, prefix, newKey, desc);
-      } else {
-        const { value } = desc;
-        if (typeof value === "function") {
-          desc.value = value.bind(src);
-        }
+  primordials.ArrayIteratorPrototype = ArrayIteratorPrototype;
+  primordials.AsyncGeneratorPrototype = AsyncGeneratorPrototype;
+  primordials.ErrorPrototype = Error.prototype;
+  primordials.ObjectPrototype = Object.prototype;
+  primordials.PromisePrototype = _Promise.prototype;
+  primordials.TypeErrorPrototype = TypeError.prototype;
 
-        const name = `${prefix}${newKey}`;
-        ReflectDefineProperty(dest, name, { __proto__: null, ...desc });
-        if (varargsMethods.includes(name)) {
-          ReflectDefineProperty(dest, `${name}Apply`, {
-            __proto__: null,
-            value: applyBind(value, src),
-          });
-        }
-      }
-    }
-  }
+  // Static methods & constants
+  primordials.ArrayBufferIsView = ArrayBuffer.isView;
+  primordials.ArrayFrom = Array.from;
+  primordials.ArrayIsArray = Array.isArray;
+  primordials.BigIntAsIntN = BigInt.asIntN;
+  primordials.BigIntAsUintN = BigInt.asUintN;
+  primordials.DateNow = Date.now;
+  primordials.ErrorCaptureStackTrace = Error.captureStackTrace;
+  primordials.JSONParse = JSON.parse;
+  primordials.JSONStringify = JSON.stringify;
+  primordials.MathCeil = Math.ceil;
+  primordials.MathFloor = Math.floor;
+  primordials.MathFround = Math.fround;
+  primordials.MathMax = Math.max;
+  primordials.MathMin = Math.min;
+  primordials.MathPow = Math.pow;
+  primordials.MathRandom = Math.random;
+  primordials.MathRound = Math.round;
+  primordials.MathTrunc = Math.trunc;
+  primordials.NumberIsFinite = Number.isFinite;
+  primordials.NumberIsInteger = Number.isInteger;
+  primordials.NumberIsNaN = Number.isNaN;
+  primordials.NumberMAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+  primordials.NumberMIN_SAFE_INTEGER = Number.MIN_SAFE_INTEGER;
+  primordials.NumberParseFloat = Number.parseFloat;
+  primordials.NumberParseInt = Number.parseInt;
+  primordials.ObjectAssign = Object.assign;
+  primordials.ObjectCreate = Object.create;
+  primordials.ObjectDefineProperties = Object.defineProperties;
+  primordials.ObjectDefineProperty = Object.defineProperty;
+  primordials.ObjectEntries = Object.entries;
+  primordials.ObjectFreeze = Object.freeze;
+  primordials.ObjectFromEntries = Object.fromEntries;
+  primordials.ObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  primordials.ObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+  primordials.ObjectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+  primordials.ObjectGetPrototypeOf = Object.getPrototypeOf;
+  primordials.ObjectHasOwn = Object.hasOwn;
+  primordials.ObjectIs = Object.is;
+  primordials.ObjectKeys = Object.keys;
+  primordials.ObjectSetPrototypeOf = Object.setPrototypeOf;
+  primordials.PromiseReject = _Promise.reject.bind(_Promise);
+  primordials.PromiseResolve = _Promise.resolve.bind(_Promise);
+  primordials.ReflectApply = Reflect.apply;
+  primordials.ReflectConstruct = Reflect.construct;
+  primordials.ReflectDefineProperty = ReflectDefineProperty;
+  primordials.ReflectGetOwnPropertyDescriptor = ReflectGetOwnPropertyDescriptor;
+  primordials.ReflectGetPrototypeOf = Reflect.getPrototypeOf;
+  primordials.ReflectHas = Reflect.has;
+  primordials.ReflectOwnKeys = ReflectOwnKeys;
+  primordials.StringFromCharCode = String.fromCharCode;
+  primordials.SymbolAsyncIterator = Symbol.asyncIterator;
+  primordials.SymbolFor = Symbol.for;
+  primordials.SymbolIterator = Symbol.iterator;
+  primordials.SymbolToStringTag = Symbol.toStringTag;
 
-  function copyPrototype(src, dest, prefix) {
-    for (const key of ReflectOwnKeys(src)) {
-      const newKey = getNewKey(key);
-      const desc = ReflectGetOwnPropertyDescriptor(src, key);
-      if ("get" in desc) {
-        copyAccessor(dest, prefix, newKey, desc);
-      } else {
-        const { value } = desc;
-        if (typeof value === "function") {
-          desc.value = uncurryThis(value);
-        }
+  // Uncurried prototype methods & accessors
+  primordials.ArrayBufferPrototypeGetByteLength = getGetter(ArrayBuffer.prototype, "byteLength");
+  primordials.ArrayBufferPrototypeGetDetached = getGetter(ArrayBuffer.prototype, "detached");
+  primordials.ArrayBufferPrototypeSlice = uncurryThis(ArrayBuffer.prototype.slice);
+  primordials.ArrayBufferPrototypeTransferToFixedLength = maybeUncurry(
+    ArrayBuffer.prototype.transferToFixedLength,
+  );
 
-        const name = `${prefix}${newKey}`;
-        ReflectDefineProperty(dest, name, { __proto__: null, ...desc });
-        if (varargsMethods.includes(name)) {
-          ReflectDefineProperty(dest, `${name}Apply`, {
-            __proto__: null,
-            value: applyBind(value),
-          });
-        }
-      }
-    }
-  }
+  primordials.ArrayPrototypeConcat = uncurryThis(Array.prototype.concat);
+  primordials.ArrayPrototypeEvery = uncurryThis(Array.prototype.every);
+  primordials.ArrayPrototypeFilter = uncurryThis(Array.prototype.filter);
+  primordials.ArrayPrototypeFind = uncurryThis(Array.prototype.find);
+  primordials.ArrayPrototypeForEach = uncurryThis(Array.prototype.forEach);
+  primordials.ArrayPrototypeIncludes = uncurryThis(Array.prototype.includes);
+  primordials.ArrayPrototypeIndexOf = uncurryThis(Array.prototype.indexOf);
+  primordials.ArrayPrototypeJoin = uncurryThis(Array.prototype.join);
+  primordials.ArrayPrototypeMap = uncurryThis(Array.prototype.map);
+  primordials.ArrayPrototypePop = uncurryThis(Array.prototype.pop);
+  primordials.ArrayPrototypePush = uncurryThis(Array.prototype.push);
+  primordials.ArrayPrototypeSlice = uncurryThis(Array.prototype.slice);
+  primordials.ArrayPrototypeSome = uncurryThis(Array.prototype.some);
+  primordials.ArrayPrototypeSort = uncurryThis(Array.prototype.sort);
+  primordials.ArrayPrototypeSplice = uncurryThis(Array.prototype.splice);
+  primordials.ArrayPrototypeUnshift = uncurryThis(Array.prototype.unshift);
 
-  // Create copies of configurable value properties of the global object
-  [
-    "Proxy",
-    "globalThis",
-  ].forEach((name) => {
-    primordials[name] = globalThis[name];
-  });
+  primordials.AsyncGeneratorPrototypeNext = uncurryThis(AsyncGeneratorPrototype.next);
 
-  // Create copy of isNaN
-  primordials[isNaN.name] = isNaN;
+  primordials.BigIntPrototypeToString = uncurryThis(BigInt.prototype.toString);
+  primordials.BigIntPrototypeValueOf = uncurryThis(BigInt.prototype.valueOf);
+  primordials.BooleanPrototypeValueOf = uncurryThis(Boolean.prototype.valueOf);
 
-  // Create copies of URI handling functions
-  [
-    decodeURI,
-    decodeURIComponent,
-    encodeURI,
-    encodeURIComponent,
-  ].forEach((fn) => {
-    primordials[fn.name] = fn;
-  });
+  primordials.DataViewPrototypeGetBuffer = getGetter(DataView.prototype, "buffer");
+  primordials.DataViewPrototypeGetByteLength = getGetter(DataView.prototype, "byteLength");
+  primordials.DataViewPrototypeGetByteOffset = getGetter(DataView.prototype, "byteOffset");
 
-  // Create copies of the namespace objects
-  [
-    "JSON",
-    "Math",
-    "Proxy",
-    "Reflect",
-  ].forEach((name) => {
-    copyPropsRenamed(globalThis[name], primordials, name);
-  });
+  primordials.DatePrototypeGetTime = uncurryThis(Date.prototype.getTime);
+  primordials.DatePrototypeToISOString = uncurryThis(Date.prototype.toISOString);
 
-  // Create copies of intrinsic objects
-  [
-    "AggregateError",
-    "Array",
-    "ArrayBuffer",
-    "BigInt",
-    "BigInt64Array",
-    "BigUint64Array",
-    "Boolean",
-    "DataView",
-    "Date",
-    "Error",
-    "EvalError",
-    "FinalizationRegistry",
-    "Float32Array",
-    "Float64Array",
-    "Function",
-    "Int16Array",
-    "Int32Array",
-    "Int8Array",
-    "Map",
-    "Number",
-    "Object",
-    "RangeError",
-    "ReferenceError",
-    "RegExp",
-    "Set",
-    "String",
-    "Symbol",
-    "SyntaxError",
-    "TypeError",
-    "URIError",
-    "Uint16Array",
-    "Uint32Array",
-    "Uint8Array",
-    "Uint8ClampedArray",
-    "WeakMap",
-    "WeakRef",
-    "WeakSet",
-  ].forEach((name) => {
-    const original = globalThis[name];
-    primordials[name] = original;
-    copyPropsRenamed(original, primordials, name);
-    copyPrototype(original.prototype, primordials, `${name}Prototype`);
-  });
+  primordials.FunctionPrototypeApply = uncurryThis(Function.prototype.apply);
+  primordials.FunctionPrototypeBind = uncurryThis(Function.prototype.bind);
+  primordials.FunctionPrototypeCall = uncurryThis(Function.prototype.call);
+  primordials.FunctionPrototypeToString = uncurryThis(Function.prototype.toString);
 
-  // Create copies of intrinsic objects that require a valid `this` to call
-  // static methods.
-  // Refs: https://www.ecma-international.org/ecma-262/#sec-promise.all
-  [
-    "Promise",
-  ].forEach((name) => {
-    const original = globalThis[name];
-    primordials[name] = original;
-    copyPropsRenamedBound(original, primordials, name);
-    copyPrototype(original.prototype, primordials, `${name}Prototype`);
-  });
+  primordials.MapIteratorPrototypeNext = uncurryThis(MapIteratorPrototype.next);
+  primordials.MapPrototypeDelete = uncurryThis(Map.prototype.delete);
+  primordials.MapPrototypeForEach = uncurryThis(Map.prototype.forEach);
+  primordials.MapPrototypeGet = uncurryThis(Map.prototype.get);
+  primordials.MapPrototypeGetSize = getGetter(Map.prototype, "size");
+  primordials.MapPrototypeHas = uncurryThis(Map.prototype.has);
+  primordials.MapPrototypeSet = uncurryThis(Map.prototype.set);
+  primordials.MapPrototypeSymbolIterator = uncurryThis(Map.prototype[Symbol.iterator]);
 
-  // Create copies of abstract intrinsic objects that are not directly exposed
-  // on the global object.
-  // Refs: https://tc39.es/ecma262/#sec-%typedarray%-intrinsic-object
-  [
-    { name: "TypedArray", original: Reflect.getPrototypeOf(Uint8Array) },
-    {
-      name: "ArrayIterator",
-      original: {
-        prototype: Reflect.getPrototypeOf(Array.prototype[Symbol.iterator]()),
-      },
-    },
-    {
-      name: "SetIterator",
-      original: {
-        prototype: Reflect.getPrototypeOf(new Set()[Symbol.iterator]()),
-      },
-    },
-    {
-      name: "MapIterator",
-      original: {
-        prototype: Reflect.getPrototypeOf(new Map()[Symbol.iterator]()),
-      },
-    },
-    {
-      name: "StringIterator",
-      original: {
-        prototype: Reflect.getPrototypeOf(String.prototype[Symbol.iterator]()),
-      },
-    },
-    { name: "Generator", original: Reflect.getPrototypeOf(function* () {}) },
-    {
-      name: "AsyncGenerator",
-      original: Reflect.getPrototypeOf(async function* () {}),
-    },
-  ].forEach(({ name, original }) => {
-    primordials[name] = original;
-    // The static %TypedArray% methods require a valid `this`, but can't be bound,
-    // as they need a subclass constructor as the receiver:
-    copyPrototype(original, primordials, name);
-    copyPrototype(original.prototype, primordials, `${name}Prototype`);
-  });
+  primordials.NumberPrototypeToFixed = uncurryThis(Number.prototype.toFixed);
+  primordials.NumberPrototypeToString = uncurryThis(Number.prototype.toString);
+  primordials.NumberPrototypeValueOf = uncurryThis(Number.prototype.valueOf);
+
+  primordials.ObjectPrototypeHasOwnProperty = uncurryThis(Object.prototype.hasOwnProperty);
+  primordials.ObjectPrototypeIsPrototypeOf = uncurryThis(Object.prototype.isPrototypeOf);
+  primordials.ObjectPrototypePropertyIsEnumerable = uncurryThis(
+    Object.prototype.propertyIsEnumerable,
+  );
+
+  primordials.PromisePrototypeThen = uncurryThis(_Promise.prototype.then);
+
+  primordials.RegExpPrototypeExec = uncurryThis(RegExp.prototype.exec);
+  primordials.RegExpPrototypeTest = uncurryThis(RegExp.prototype.test);
+  primordials.RegExpPrototypeToString = uncurryThis(RegExp.prototype.toString);
+
+  primordials.SetIteratorPrototypeNext = uncurryThis(SetIteratorPrototype.next);
+  primordials.SetPrototypeAdd = uncurryThis(Set.prototype.add);
+  primordials.SetPrototypeDelete = uncurryThis(Set.prototype.delete);
+  primordials.SetPrototypeForEach = uncurryThis(Set.prototype.forEach);
+  primordials.SetPrototypeGetSize = getGetter(Set.prototype, "size");
+  primordials.SetPrototypeSymbolIterator = uncurryThis(Set.prototype[Symbol.iterator]);
+
+  primordials.StringIteratorPrototypeNext = uncurryThis(StringIteratorPrototype.next);
+  primordials.StringPrototypeCharAt = uncurryThis(String.prototype.charAt);
+  primordials.StringPrototypeCharCodeAt = uncurryThis(String.prototype.charCodeAt);
+  primordials.StringPrototypeCodePointAt = uncurryThis(String.prototype.codePointAt);
+  primordials.StringPrototypeIncludes = uncurryThis(String.prototype.includes);
+  primordials.StringPrototypeIndexOf = uncurryThis(String.prototype.indexOf);
+  primordials.StringPrototypeLocaleCompare = uncurryThis(String.prototype.localeCompare);
+  primordials.StringPrototypeMatch = uncurryThis(String.prototype.match);
+  primordials.StringPrototypePadEnd = uncurryThis(String.prototype.padEnd);
+  primordials.StringPrototypePadStart = uncurryThis(String.prototype.padStart);
+  primordials.StringPrototypeRepeat = uncurryThis(String.prototype.repeat);
+  primordials.StringPrototypeReplace = uncurryThis(String.prototype.replace);
+  primordials.StringPrototypeReplaceAll = uncurryThis(String.prototype.replaceAll);
+  primordials.StringPrototypeSlice = uncurryThis(String.prototype.slice);
+  primordials.StringPrototypeSplit = uncurryThis(String.prototype.split);
+  primordials.StringPrototypeStartsWith = uncurryThis(String.prototype.startsWith);
+  primordials.StringPrototypeSubstring = uncurryThis(String.prototype.substring);
+  primordials.StringPrototypeSymbolIterator = uncurryThis(String.prototype[Symbol.iterator]);
+  primordials.StringPrototypeToLowerCase = uncurryThis(String.prototype.toLowerCase);
+  primordials.StringPrototypeToUpperCase = uncurryThis(String.prototype.toUpperCase);
+  primordials.StringPrototypeToWellFormed = maybeUncurry(String.prototype.toWellFormed);
+  primordials.StringPrototypeTrim = uncurryThis(String.prototype.trim);
+  primordials.StringPrototypeValueOf = uncurryThis(String.prototype.valueOf);
+
+  primordials.SymbolPrototypeGetDescription = getGetter(Symbol.prototype, "description");
+  primordials.SymbolPrototypeToString = uncurryThis(Symbol.prototype.toString);
+  primordials.SymbolPrototypeValueOf = uncurryThis(Symbol.prototype.valueOf);
+
+  primordials.TypedArrayPrototypeGetBuffer = getGetter(TypedArrayPrototype, "buffer");
+  primordials.TypedArrayPrototypeGetByteLength = getGetter(TypedArrayPrototype, "byteLength");
+  primordials.TypedArrayPrototypeGetByteOffset = getGetter(TypedArrayPrototype, "byteOffset");
+  primordials.TypedArrayPrototypeGetLength = getGetter(TypedArrayPrototype, "length");
+  primordials.TypedArrayPrototypeGetSymbolToStringTag = getGetter(
+    TypedArrayPrototype,
+    Symbol.toStringTag,
+  );
+  primordials.TypedArrayPrototypeJoin = uncurryThis(TypedArrayPrototype.join);
+  primordials.TypedArrayPrototypeSet = uncurryThis(TypedArrayPrototype.set);
+  primordials.TypedArrayPrototypeSlice = uncurryThis(TypedArrayPrototype.slice);
+  primordials.TypedArrayPrototypeSubarray = uncurryThis(TypedArrayPrototype.subarray);
+
+  primordials.WeakMapPrototypeGet = uncurryThis(WeakMap.prototype.get);
+  primordials.WeakMapPrototypeHas = uncurryThis(WeakMap.prototype.has);
+  primordials.WeakMapPrototypeSet = uncurryThis(WeakMap.prototype.set);
+  primordials.WeakRefPrototypeDeref = uncurryThis(WeakRef.prototype.deref);
 
   const {
     ArrayPrototypeForEach,

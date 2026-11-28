@@ -244,6 +244,18 @@ pub fn str_to_utf16(s: &str) -> Vec<u16> {
     }
 }
 
+/// Fast UTF-16 -> UTF-8 conversion with an ASCII fast path; returns `None` on
+/// lone surrogates so callers can fall back to the binary wire path.
+#[inline]
+pub fn utf16_to_string_strict(units: &[u16]) -> Option<String> {
+    if units.iter().all(|&u| u < 0x80) {
+        let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+        // SAFETY: all bytes are < 0x80 (valid UTF-8).
+        return Some(unsafe { String::from_utf8_unchecked(bytes) });
+    }
+    String::from_utf16(units).ok()
+}
+
 /// Decodes a JSON array encoded as UTF-16 code units into `Vec<WireValue>`.
 pub fn decode_json_args(units: &[u16], max_bytes: usize) -> Result<Vec<WireValue>> {
     if units.len().saturating_mul(2) > max_bytes {
@@ -293,34 +305,109 @@ fn json_to_wire(v: serde_json::Value) -> WireValue {
     }
 }
 
-fn wire_to_json(val: &WireValue) -> Option<serde_json::Value> {
+fn write_json_str(s: &str, out: &mut String) {
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            0x08 => Some("\\b"),
+            0x0c => Some("\\f"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x00..=0x1f => None,
+            _ => continue,
+        };
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        if let Some(e) = esc {
+            out.push_str(e);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "\\u{b:04x}");
+        }
+        start = i + 1;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
+    }
+    out.push('"');
+}
+
+fn write_wire_num(val: &WireValue, out: &mut String) -> bool {
+    use std::fmt::Write;
     match val {
-        WireValue::Null => Some(serde_json::Value::Null),
-        WireValue::Bool(b) => Some(serde_json::Value::Bool(*b)),
-        WireValue::I32(n) => Some(serde_json::Value::Number(serde_json::Number::from(*n))),
+        WireValue::I32(n) => {
+            let _ = write!(out, "{n}");
+            true
+        }
         WireValue::F64(x) => {
             if !x.is_finite() || (*x == 0.0 && x.is_sign_negative()) {
-                return None;
+                return false;
             }
-            serde_json::Number::from_f64(*x).map(serde_json::Value::Number)
+            let Some(num) = serde_json::Number::from_f64(*x) else {
+                return false;
+            };
+            let _ = write!(out, "{num}");
+            true
         }
-        WireValue::String(s) => Some(serde_json::Value::String(s.clone())),
+        _ => false,
+    }
+}
+
+fn write_wire_json(val: &WireValue, out: &mut String) -> bool {
+    match val {
+        WireValue::Null => {
+            out.push_str("null");
+            true
+        }
+        WireValue::Bool(true) => {
+            out.push_str("true");
+            true
+        }
+        WireValue::Bool(false) => {
+            out.push_str("false");
+            true
+        }
+        WireValue::I32(_) | WireValue::F64(_) => write_wire_num(val, out),
+        WireValue::String(s) => {
+            write_json_str(s, out);
+            true
+        }
         WireValue::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(wire_to_json(item)?);
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                if !write_wire_json(item, out) {
+                    return false;
+                }
             }
-            Some(serde_json::Value::Array(out))
+            out.push(']');
+            true
         }
         WireValue::Object(entries) => {
-            let mut map = serde_json::Map::with_capacity(entries.len());
-            for (k, v) in entries {
-                map.insert(k.clone(), wire_to_json(v)?);
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_str(k, out);
+                out.push(':');
+                if !write_wire_json(v, out) {
+                    return false;
+                }
             }
-            Some(serde_json::Value::Object(map))
+            out.push('}');
+            true
         }
         WireValue::Undefined | WireValue::BigInt(_) | WireValue::Bytes(_) | WireValue::Error(_) => {
-            None
+            false
         }
     }
 }
@@ -357,17 +444,120 @@ pub fn try_encode_str_ok(val: &WireValue) -> Option<Vec<u16>> {
             }
             Some(out)
         }
-        WireValue::Array(_) | WireValue::Object(_) => {
-            let jv = wire_to_json(val)?;
-            let json = serde_json::to_string(&jv).ok()?;
-            let mut out = Vec::with_capacity(1 + json.len());
-            out.push(u16::from(b'j'));
-            if json.is_ascii() {
-                out.extend(json.as_bytes().iter().map(|&b| u16::from(b)));
-            } else {
-                out.extend(json.encode_utf16());
+        WireValue::Array(items) => {
+            // Fast zero-JSON-parse encodings for the hottest fixed-shape tuples:
+            //   '2': [num, num] (op_response_complete_inline)
+            //   '3': [num, num, num] (op_memory_batch_begin)
+            //   '5': [bool, num, bool, num, num] (op_memory_batch_apply)
+            if items.len() == 2
+                && matches!(items[0], WireValue::I32(_) | WireValue::F64(_))
+                && matches!(items[1], WireValue::I32(_) | WireValue::F64(_))
+            {
+                let mut s = String::with_capacity(40);
+                s.push('2');
+                if write_wire_num(&items[0], &mut s) {
+                    s.push(',');
+                    if write_wire_num(&items[1], &mut s) {
+                        return Some(str_to_utf16(&s));
+                    }
+                }
+                return None;
             }
-            Some(out)
+            if items.len() == 3
+                && matches!(items[0], WireValue::I32(_) | WireValue::F64(_))
+                && matches!(items[1], WireValue::I32(_) | WireValue::F64(_))
+                && matches!(items[2], WireValue::I32(_) | WireValue::F64(_))
+            {
+                let mut s = String::with_capacity(56);
+                s.push('3');
+                if write_wire_num(&items[0], &mut s) {
+                    s.push(',');
+                    if write_wire_num(&items[1], &mut s) {
+                        s.push(',');
+                        if write_wire_num(&items[2], &mut s) {
+                            return Some(str_to_utf16(&s));
+                        }
+                    }
+                }
+                return None;
+            }
+            if let [
+                WireValue::Bool(b0),
+                n1 @ (WireValue::I32(_) | WireValue::F64(_)),
+                WireValue::Bool(b2),
+                n3 @ (WireValue::I32(_) | WireValue::F64(_)),
+                n4 @ (WireValue::I32(_) | WireValue::F64(_)),
+            ] = items.as_slice()
+            {
+                let mut s = String::with_capacity(64);
+                s.push('5');
+                s.push(if *b0 { '1' } else { '0' });
+                s.push(',');
+                if write_wire_num(n1, &mut s) {
+                    s.push(',');
+                    s.push(if *b2 { '1' } else { '0' });
+                    s.push(',');
+                    if write_wire_num(n3, &mut s) {
+                        s.push(',');
+                        if write_wire_num(n4, &mut s) {
+                            return Some(str_to_utf16(&s));
+                        }
+                    }
+                }
+                return None;
+            }
+            let mut json = String::with_capacity(128);
+            json.push('j');
+            if !write_wire_json(val, &mut json) {
+                return None;
+            }
+            Some(str_to_utf16(&json))
+        }
+        WireValue::Object(entries) => {
+            // Fast zero-JSON-parse encoding for `{ text, encoding: "utf8" }`
+            // (hot path of op_memory_read_get and op_memory_batch_get).
+            if let [(k0, WireValue::String(text)), (k1, WireValue::String(enc))] =
+                entries.as_slice()
+                && k0 == "text"
+                && k1 == "encoding"
+                && enc == "utf8"
+            {
+                let mut out = Vec::with_capacity(1 + text.len());
+                out.push(u16::from(b'm'));
+                if text.is_ascii() {
+                    out.extend(text.as_bytes().iter().map(|&b| u16::from(b)));
+                } else {
+                    out.extend(text.encode_utf16());
+                }
+                return Some(out);
+            }
+            // Fast zero-JSON-parse encoding for `{ text, value_handle: 0, encoding: "utf8" }`
+            // (hot path of op_memory_batch_get and op_kv_get).
+            if let [
+                (k0, WireValue::String(text)),
+                (k1, WireValue::I32(0)),
+                (k2, WireValue::String(enc)),
+            ] = entries.as_slice()
+                && k0 == "text"
+                && k1 == "value_handle"
+                && k2 == "encoding"
+                && enc == "utf8"
+            {
+                let mut out = Vec::with_capacity(1 + text.len());
+                out.push(u16::from(b'r'));
+                if text.is_ascii() {
+                    out.extend(text.as_bytes().iter().map(|&b| u16::from(b)));
+                } else {
+                    out.extend(text.encode_utf16());
+                }
+                return Some(out);
+            }
+            let mut json = String::with_capacity(128);
+            json.push('j');
+            if !write_wire_json(val, &mut json) {
+                return None;
+            }
+            Some(str_to_utf16(&json))
         }
         WireValue::BigInt(_) | WireValue::Bytes(_) | WireValue::Error(_) => None,
     }

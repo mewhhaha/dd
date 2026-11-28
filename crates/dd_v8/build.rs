@@ -66,6 +66,125 @@ fn main() {
                 )
                 .expect("foreign decl start_async_str"),
                 ForeignFunctionDeclaration::new(
+                    "call_sync_0",
+                    "dd",
+                    "call_sync_0",
+                    vec![ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl call_sync_0"),
+                ForeignFunctionDeclaration::new(
+                    "call_sync_u32",
+                    "dd",
+                    "call_sync_u32",
+                    vec![ForeignValueType::Number, ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl call_sync_u32"),
+                ForeignFunctionDeclaration::new(
+                    "call_sync_u32_str",
+                    "dd",
+                    "call_sync_u32_str",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl call_sync_u32_str"),
+                ForeignFunctionDeclaration::new(
+                    "call_sync_u32_str_str",
+                    "dd",
+                    "call_sync_u32_str_str",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl call_sync_u32_str_str"),
+                ForeignFunctionDeclaration::new(
+                    "call_sync_resp_inline",
+                    "dd",
+                    "call_sync_resp_inline",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::Number,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl call_sync_resp_inline"),
+                ForeignFunctionDeclaration::new(
+                    "start_async_u32",
+                    "dd",
+                    "start_async_u32",
+                    vec![ForeignValueType::Number, ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl start_async_u32"),
+                ForeignFunctionDeclaration::new(
+                    "start_async_u32_str2",
+                    "dd",
+                    "start_async_u32_str2",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl start_async_u32_str2"),
+                ForeignFunctionDeclaration::new(
+                    "start_async_str2",
+                    "dd",
+                    "start_async_str2",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl start_async_str2"),
+                ForeignFunctionDeclaration::new(
+                    "start_async_str3",
+                    "dd",
+                    "start_async_str3",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl start_async_str3"),
+                ForeignFunctionDeclaration::new(
+                    "start_async_u32_2_str2_u32",
+                    "dd",
+                    "start_async_u32_2_str2_u32",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::Number,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl start_async_u32_2_str2_u32"),
+                ForeignFunctionDeclaration::new(
                     "utf8_encode",
                     "dd",
                     "utf8_encode",
@@ -121,7 +240,7 @@ fn main() {
         NativeCompilationPolicy::default(),
         scriptw_engine::CompilationJobs::current(),
     );
-    config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
+    config.cranelift_opt_level(wasmtime::OptLevel::Speed);
     let engine = wasmtime::Engine::new(&config).expect("wtime build engine init");
 
     let compiler = ScriptwCompiler::new(RealmBuilder::new().build());

@@ -12,6 +12,7 @@ use crate::platform;
 use crate::serde_v8::{
     self, WireValue, decode_json_args, decode_wire_args, encode_err_envelope, encode_ok_envelope,
     encode_pending_envelope, encode_str_err, encode_str_pending, str_to_utf16, try_encode_str_ok,
+    utf16_to_string_strict,
 };
 use crate::state::OpState;
 use crate::wasm_api::WasmHostState;
@@ -172,13 +173,13 @@ fn shared_engine() -> Result<&'static wasmtime::Engine, Error> {
                 NativeCompilationPolicy::default(),
                 scriptw_engine::CompilationJobs::current(),
             );
-            // Match `scriptw-runtime-image`'s embedded Cargo `NativeHost` runtime `R`
-            // (`SizeOptimized` / `OptLevel::SpeedAndSize`) so embedded `R` and build-time
-            // precompiled `P` images load directly without runtime recompilation.
-            config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
+            // Compile user workers and precompiled bootstrap bundles at `OptLevel::Speed`;
+            // `wtime-aot-host` decouples `OptLevel` from deserialization compatibility so
+            // `scriptw-runtime-image`'s `SizeOptimized` native `R` still loads directly.
+            config.cranelift_opt_level(wasmtime::OptLevel::Speed);
             // Keep per-isolate semi-space footprint tight (grows automatically on demand
             // up to the 8 GiB virtual reservation and shrinks back after transient bursts).
-            config.gc_heap_initial_size(12 << 20);
+            config.gc_heap_initial_size(8 << 20);
             // Allow unbounded runtimes (e.g. >2 GiB typed-array views plus wire copies)
             // to use the full 8 GiB virtual semi-space reserved by wtime-aot-host.
             config.gc_heap_reservation(8u64 << 30);
@@ -225,6 +226,125 @@ fn dd_foreign_registry() -> Result<ForeignModuleRegistry, Error> {
                     ForeignResultType::StringUtf16,
                 )
                 .map_err(|e| Error::new(format!("foreign decl start_async_str: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "call_sync_0",
+                    "dd",
+                    "call_sync_0",
+                    vec![ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl call_sync_0: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "call_sync_u32",
+                    "dd",
+                    "call_sync_u32",
+                    vec![ForeignValueType::Number, ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl call_sync_u32: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "call_sync_u32_str",
+                    "dd",
+                    "call_sync_u32_str",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl call_sync_u32_str: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "call_sync_u32_str_str",
+                    "dd",
+                    "call_sync_u32_str_str",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl call_sync_u32_str_str: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "call_sync_resp_inline",
+                    "dd",
+                    "call_sync_resp_inline",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::Number,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl call_sync_resp_inline: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "start_async_u32",
+                    "dd",
+                    "start_async_u32",
+                    vec![ForeignValueType::Number, ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl start_async_u32: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "start_async_u32_str2",
+                    "dd",
+                    "start_async_u32_str2",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl start_async_u32_str2: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "start_async_str2",
+                    "dd",
+                    "start_async_str2",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl start_async_str2: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "start_async_str3",
+                    "dd",
+                    "start_async_str3",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl start_async_str3: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "start_async_u32_2_str2_u32",
+                    "dd",
+                    "start_async_u32_2_str2_u32",
+                    vec![
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::Number,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::StringUtf16,
+                        ForeignValueType::Number,
+                    ],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl start_async_u32_2_str2_u32: {e}")))?,
                 ForeignFunctionDeclaration::new(
                     "utf8_encode",
                     "dd",
@@ -829,6 +949,14 @@ impl JsRuntime {
 
     pub fn op_state(&self) -> Rc<RefCell<OpState>> {
         Rc::clone(&self.state.op_state)
+    }
+
+    /// Reclaims physical RSS pages from the inactive GC semi-space while keeping
+    /// the live heap intact. Safe to call when an isolate becomes idle.
+    pub fn reclaim_inactive_gc_space(&mut self) {
+        if let Some(ref mut vm) = self.vm {
+            vm.store.reclaim_inactive_gc_space();
+        }
     }
 
     /// A handle that terminates this runtime's JavaScript from any thread.
@@ -2036,6 +2164,436 @@ fn register_dd_foreigns(
             Ok(ForeignValue::StringUtf16(encode_str_pending(id)))
         })
         .map_err(|e| Error::new(format!("register_foreign start_async_str: {e}")))?;
+
+    // 2c-direct: Zero-JSON typed fast paths for the hottest dd sync/async ops.
+    fn dispatch_sync_direct(state: &RuntimeState, op_id: usize, decoded: &[WireValue]) -> Vec<u16> {
+        let Some(op) = state.ops.get(op_id) else {
+            return encode_str_err(&OpError::new(format!("unknown op id {op_id}")));
+        };
+        let result = match &op.kind {
+            OpKind::Sync(f) => f(&state.op_state, decoded),
+            _ => Err(OpError::new(format!("op {} is not synchronous", op.name))),
+        };
+        match result {
+            Ok(v) => match try_encode_str_ok(&v) {
+                Some(encoded) => encoded,
+                None => {
+                    *state.pending_bytes_fallback.borrow_mut() = Some(encode_ok_envelope(&v));
+                    vec![u16::from(b'B')]
+                }
+            },
+            Err(e) => encode_str_err(&e),
+        }
+    }
+
+    fn dispatch_async_direct(
+        state: &RuntimeState,
+        op_id: usize,
+        decoded: &[WireValue],
+    ) -> Vec<u16> {
+        let Some(op) = state.ops.get(op_id) else {
+            return encode_str_err(&OpError::new(format!("unknown op id {op_id}")));
+        };
+        let mut fut = match &op.kind {
+            OpKind::Async(f) => match f(&state.op_state, decoded) {
+                Ok(fut) => fut,
+                Err(e) => return encode_str_err(&e),
+            },
+            _ => {
+                return encode_str_err(&OpError::new(format!("op {} is not async", op.name)));
+            }
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(v)) => {
+                    return match try_encode_str_ok(&v) {
+                        Some(encoded) => encoded,
+                        None => {
+                            *state.pending_bytes_fallback.borrow_mut() =
+                                Some(encode_ok_envelope(&v));
+                            vec![u16::from(b'B')]
+                        }
+                    };
+                }
+                Poll::Ready(Err(e)) => return encode_str_err(&e),
+                Poll::Pending => {}
+            }
+        }
+        let id = state.alloc_pending_id();
+        state
+            .pending_ops
+            .borrow_mut()
+            .push(PendingOp { id, future: fut });
+        state.waker.wake();
+        encode_str_pending(id)
+    }
+
+    embedded
+        .register_foreign(linker, "dd", "call_sync_0", |caller, args| {
+            let [ForeignValue::Number(op_id_f)] = args.as_slice() else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            Ok(ForeignValue::StringUtf16(dispatch_sync_direct(
+                state,
+                *op_id_f as usize,
+                &[],
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign call_sync_0: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "call_sync_u32", |caller, args| {
+            let [ForeignValue::Number(op_id_f), ForeignValue::Number(a0)] = args.as_slice() else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            let decoded = [WireValue::I32(*a0 as i32)];
+            Ok(ForeignValue::StringUtf16(dispatch_sync_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign call_sync_u32: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "call_sync_u32_str", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::Number(a0),
+                ForeignValue::StringUtf16(u0),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            if u0.len().saturating_mul(2) > state.max_op_argument_bytes {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            }
+            let Some(s0) = utf16_to_string_strict(u0) else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let decoded = [WireValue::I32(*a0 as i32), WireValue::String(s0)];
+            Ok(ForeignValue::StringUtf16(dispatch_sync_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign call_sync_u32_str: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "call_sync_u32_str_str", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::Number(a0),
+                ForeignValue::StringUtf16(u0),
+                ForeignValue::StringUtf16(u1),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            if u0.len().saturating_add(u1.len()).saturating_mul(2) > state.max_op_argument_bytes {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            }
+            let (Some(s0), Some(s1)) = (utf16_to_string_strict(u0), utf16_to_string_strict(u1))
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let decoded = [
+                WireValue::I32(*a0 as i32),
+                WireValue::String(s0),
+                WireValue::String(s1),
+            ];
+            Ok(ForeignValue::StringUtf16(dispatch_sync_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign call_sync_u32_str_str: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "call_sync_resp_inline", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::Number(comp),
+                ForeignValue::Number(req_ctx),
+                ForeignValue::Number(mem_scope),
+                ForeignValue::Number(status),
+                ForeignValue::StringUtf16(headers_u16),
+                ForeignValue::StringUtf16(body_u16),
+                ForeignValue::Number(finish),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            if headers_u16
+                .len()
+                .saturating_add(body_u16.len())
+                .saturating_mul(2)
+                > state.max_op_argument_bytes
+            {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            }
+            let Some(body) = utf16_to_string_strict(body_u16) else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let headers = if headers_u16.is_empty() {
+                Vec::new()
+            } else {
+                let Some(flat) = utf16_to_string_strict(headers_u16) else {
+                    return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+                };
+                let mut pairs = Vec::new();
+                let mut it = flat.split('\0');
+                while let Some(k) = it.next() {
+                    let Some(v) = it.next() else {
+                        return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+                    };
+                    pairs.push(WireValue::Array(vec![
+                        WireValue::String(k.to_owned()),
+                        WireValue::String(v.to_owned()),
+                    ]));
+                }
+                pairs
+            };
+            let decoded = [
+                WireValue::I32(*comp as i32),
+                WireValue::I32(*req_ctx as i32),
+                WireValue::I32(*mem_scope as i32),
+                WireValue::I32(*status as i32),
+                WireValue::Array(headers),
+                WireValue::String(body),
+                WireValue::Bool(*finish != 0.0),
+            ];
+            Ok(ForeignValue::StringUtf16(dispatch_sync_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign call_sync_resp_inline: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "start_async_u32", |caller, args| {
+            let [ForeignValue::Number(op_id_f), ForeignValue::Number(a0)] = args.as_slice() else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            let decoded = [WireValue::I32(*a0 as i32)];
+            Ok(ForeignValue::StringUtf16(dispatch_async_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign start_async_u32: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "start_async_u32_str2", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::Number(a0),
+                ForeignValue::StringUtf16(u0),
+                ForeignValue::StringUtf16(u1),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            if u0.len().saturating_add(u1.len()).saturating_mul(2) > state.max_op_argument_bytes {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            }
+            let (Some(s0), Some(s1)) = (utf16_to_string_strict(u0), utf16_to_string_strict(u1))
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let decoded = [
+                WireValue::I32(*a0 as i32),
+                WireValue::String(s0),
+                WireValue::String(s1),
+            ];
+            Ok(ForeignValue::StringUtf16(dispatch_async_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign start_async_u32_str2: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "start_async_str2", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::StringUtf16(u0),
+                ForeignValue::StringUtf16(u1),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            if u0.len().saturating_add(u1.len()).saturating_mul(2) > state.max_op_argument_bytes {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            }
+            let (Some(s0), Some(s1)) = (utf16_to_string_strict(u0), utf16_to_string_strict(u1))
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let decoded = [WireValue::String(s0), WireValue::String(s1)];
+            Ok(ForeignValue::StringUtf16(dispatch_async_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign start_async_str2: {e}")))?;
+
+    embedded
+        .register_foreign(linker, "dd", "start_async_str3", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::StringUtf16(u0),
+                ForeignValue::StringUtf16(u1),
+                ForeignValue::StringUtf16(u2),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            if u0
+                .len()
+                .saturating_add(u1.len())
+                .saturating_add(u2.len())
+                .saturating_mul(2)
+                > state.max_op_argument_bytes
+            {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            }
+            let (Some(s0), Some(s1), Some(s2)) = (
+                utf16_to_string_strict(u0),
+                utf16_to_string_strict(u1),
+                utf16_to_string_strict(u2),
+            ) else {
+                return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+            };
+            let decoded = [
+                WireValue::String(s0),
+                WireValue::String(s1),
+                WireValue::String(s2),
+            ];
+            Ok(ForeignValue::StringUtf16(dispatch_async_direct(
+                state,
+                *op_id_f as usize,
+                &decoded,
+            )))
+        })
+        .map_err(|e| Error::new(format!("register_foreign start_async_str3: {e}")))?;
+
+    embedded
+        .register_foreign(
+            linker,
+            "dd",
+            "start_async_u32_2_str2_u32",
+            |caller, args| {
+                let [
+                    ForeignValue::Number(op_id_f),
+                    ForeignValue::Number(a0),
+                    ForeignValue::Number(a1),
+                    ForeignValue::StringUtf16(u0),
+                    ForeignValue::StringUtf16(u1),
+                    ForeignValue::Number(a2),
+                ] = args.as_slice()
+                else {
+                    return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+                };
+                let state_ptr = caller
+                    .data()
+                    .user_data::<StatePtr>()
+                    .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                    .0;
+                // SAFETY: Synchronous call inside `&mut JsRuntime`.
+                let state = unsafe { &*state_ptr };
+                if u0.len().saturating_add(u1.len()).saturating_mul(2) > state.max_op_argument_bytes
+                {
+                    return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+                }
+                let (Some(s0), Some(s1)) = (utf16_to_string_strict(u0), utf16_to_string_strict(u1))
+                else {
+                    return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+                };
+                let decoded = [
+                    WireValue::I32(*a0 as i32),
+                    WireValue::I32(*a1 as i32),
+                    WireValue::String(s0),
+                    WireValue::String(s1),
+                    WireValue::I32(*a2 as i32),
+                ];
+                Ok(ForeignValue::StringUtf16(dispatch_async_direct(
+                    state,
+                    *op_id_f as usize,
+                    &decoded,
+                )))
+            },
+        )
+        .map_err(|e| Error::new(format!("register_foreign start_async_u32_2_str2_u32: {e}")))?;
 
     // 2d. `dd.utf8_encode(text: StringUtf16) -> Bytes`
     embedded
