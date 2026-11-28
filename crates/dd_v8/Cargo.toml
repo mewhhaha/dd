@@ -12,7 +12,7 @@ embed-kernel = []
 
 [dependencies]
 boa_ast = { version = "0.21.1", features = ["annex-b"] }
-boa_interner = "0.21.1"
+boa_interner = "0.22.0"
 boa_parser = { version = "0.21.1", features = ["annex-b"] }
 futures-util.workspace = true
 scriptw-engine = { git = "https://github.com/mewhhaha/scriptw.git", branch = "main", features = ["native-host-only"] }
