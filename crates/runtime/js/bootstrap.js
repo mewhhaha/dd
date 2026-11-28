@@ -227,8 +227,8 @@ function applyTimeBoundary(boundary) {
   setFrozenTime(boundary.now_ms, boundary.perf_ms);
 }
 
-async function syncFrozenTimeBoundary() {
-  applyTimeBoundary(await op_time_now());
+function syncFrozenTimeBoundary() {
+  applyTimeBoundary(op_time_now());
 }
 
 function syncFrozenTimeBoundaryNow() {

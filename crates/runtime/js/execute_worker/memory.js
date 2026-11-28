@@ -1,8 +1,30 @@
-const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
-  id: createMemoryId(namespace, memoryKey),
-  binding: namespace,
-  sockets: createMemoryStubSocketApi(namespace, memoryKey),
+class MemoryStub {
+  #namespace;
+  #memoryKey;
+  #id;
+  #sockets;
+  constructor(namespace, memoryKey) {
+    this.#namespace = namespace;
+    this.#memoryKey = memoryKey;
+    this.#id = null;
+    this.#sockets = null;
+    this.binding = namespace;
+  }
+  get id() {
+    if (this.#id === null) {
+      this.#id = createMemoryId(this.#namespace, this.#memoryKey);
+    }
+    return this.#id;
+  }
+  get sockets() {
+    if (this.#sockets === null) {
+      this.#sockets = createMemoryStubSocketApi(this.#namespace, this.#memoryKey);
+    }
+    return this.#sockets;
+  }
   read(callback) {
+    const namespace = this.#namespace;
+    const memoryKey = this.#memoryKey;
     if (currentRequestContext().memoryTxnScope) {
       throw new Error("memory reads and atomic transactions cannot be nested");
     }
@@ -34,7 +56,7 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
           assertActive();
           return readSnapshotValue(key);
         },
-        list(options = {}) {
+        list(options = undefined) {
           assertActive();
           const prefix = memoryStorageKey(options?.prefix ?? "");
           const limit = memoryListLimit(options);
@@ -42,7 +64,7 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
         },
       });
       try {
-        await syncFrozenTime();
+        syncFrozenTimeNow();
         let value;
         try {
           value = withMemoryTxnScope(
@@ -61,22 +83,27 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
         op_memory_read_close(readHandle);
       }
     });
-  },
-  atomic(callback, options = {}) {
+  }
+  atomic(callback, options = undefined) {
+    const namespace = this.#namespace;
+    const memoryKey = this.#memoryKey;
     if (currentRequestContext().memoryTxnScope) {
       throw new Error("memory atomic transactions cannot be nested");
     }
     if (typeof callback !== "function" || callback.constructor?.name === "AsyncFunction") {
       throw new Error("memory atomic requires a synchronous callback");
     }
-    const idempotencyKey = options.idempotencyKey ?? "";
-    if (typeof idempotencyKey !== "string" || idempotencyKey.length > 512) {
-      throw new Error("memory atomic idempotencyKey must be a string of at most 512 characters");
-    }
-    const optionKeys = ObjectKeys(options);
-    for (let i = 0; i < optionKeys.length; i++) {
-      if (optionKeys[i] !== "idempotencyKey") {
-        throw new Error("memory atomic accepts only the idempotencyKey option");
+    let idempotencyKey = "";
+    if (options !== undefined) {
+      idempotencyKey = options.idempotencyKey ?? "";
+      if (typeof idempotencyKey !== "string" || idempotencyKey.length > 512) {
+        throw new Error("memory atomic idempotencyKey must be a string of at most 512 characters");
+      }
+      const optionKeys = ObjectKeys(options);
+      for (let i = 0; i < optionKeys.length; i++) {
+        if (optionKeys[i] !== "idempotencyKey") {
+          throw new Error("memory atomic accepts only the idempotencyKey option");
+        }
       }
     }
     const context = copyRequestContext(currentRequestContext());
@@ -85,22 +112,29 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
         activeRequestContextHandle(), namespace, memoryKey,
       );
       context.memoryRequestScopeHandle = leaseHandle;
-      let command;
+      let commandHandle = 0;
       try {
         const entry = ensureMemoryEntry(namespace, memoryKey);
         context.memoryEntry = entry;
-        command = await beginMemoryCommand(entry, idempotencyKey);
-        if (command.hit) {
-          return decodeMemoryCommandResult(command.value);
+        if (idempotencyKey.length > 0) {
+          const command = await beginMemoryCommand(entry, idempotencyKey);
+          commandHandle = command.handle;
+          if (command.hit) {
+            return decodeMemoryCommandResult(command.value);
+          }
         }
-        return await executeMemoryTransaction(entry, callback, command.handle);
+        return await executeMemoryTransaction(entry, callback, commandHandle);
       } finally {
-        closeMemoryCommand(command?.handle);
+        if (commandHandle > 0) {
+          closeMemoryCommand(commandHandle);
+        }
         op_memory_request_scope_close(leaseHandle);
       }
     });
-  },
-});
+  }
+}
+
+const createMemoryStub = (namespace, memoryKey) => ObjectFreeze(new MemoryStub(namespace, memoryKey));
 
 const memoryIdKey = (id) => {
   if (typeof id === "string") {

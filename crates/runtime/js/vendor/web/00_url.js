@@ -30,7 +30,6 @@ const {
   SymbolFor,
   SymbolIterator,
   TypeError,
-  Uint32Array,
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
@@ -110,6 +109,39 @@ function getSerialization(status, href, maybeBase) {
   }
 }
 
+function parseSimpleSearchParams(str) {
+  const len = str.length;
+  for (let i = 0; i < len; i++) {
+    const code = StringPrototypeCharCodeAt(str, i);
+    if (code === 0x25 || code === 0x2b || code >= 0x80) {
+      return null;
+    }
+  }
+  const pairs = [];
+  let start = 0;
+  let eq = -1;
+  for (let i = 0; i <= len; i++) {
+    const code = i < len ? StringPrototypeCharCodeAt(str, i) : 0x26;
+    if (code === 0x3d && eq === -1) {
+      eq = i;
+    } else if (code === 0x26) {
+      if (i > start) {
+        if (eq === -1) {
+          ArrayPrototypePush(pairs, [StringPrototypeSlice(str, start, i), ""]);
+        } else {
+          ArrayPrototypePush(pairs, [
+            StringPrototypeSlice(str, start, eq),
+            StringPrototypeSlice(str, eq + 1, i),
+          ]);
+        }
+      }
+      start = i + 1;
+      eq = -1;
+    }
+  }
+  return pairs;
+}
+
 class URLSearchParams {
   [_list];
   [_urlObject] = null;
@@ -119,6 +151,10 @@ class URLSearchParams {
    */
   constructor(init = undefined) {
     this[webidl.brand] = webidl.brand;
+    // Internal fast path from URL#searchParams (already canonical query slice without '?').
+    if (init === skipInit) {
+      return;
+    }
     // `undefined` is the default value of an optional argument, so it means
     // "not passed". `null` is a value, and per WebIDL union resolution it
     // reaches the USVString overload as "null".
@@ -229,7 +265,7 @@ class URLSearchParams {
     if (str[0] === "?") {
       str = StringPrototypeSlice(str, 1);
     }
-    this[_list] = op_url_parse_search_params(str);
+    this[_list] = parseSimpleSearchParams(str) ?? op_url_parse_search_params(str);
   }
 
   #updateUrlSearch() {
@@ -468,7 +504,7 @@ function trim(s) {
 const NO_PORT = 65536;
 
 const skipInit = Symbol();
-const componentsBuf = new Uint32Array(8);
+const componentsBuf = [0, 0, 0, 0, 0, 0, 0, 0];
 
 function isAsciiLowerAlpha(code) {
   return code >= 0x61 && code <= 0x7a;
@@ -778,16 +814,14 @@ class URL {
   }
 
   #updateComponents() {
-    ({
-      0: this.#schemeEnd,
-      1: this.#usernameEnd,
-      2: this.#hostStart,
-      3: this.#hostEnd,
-      4: this.#port,
-      5: this.#pathStart,
-      6: this.#queryStart,
-      7: this.#fragmentStart,
-    } = componentsBuf);
+    this.#schemeEnd = componentsBuf[0];
+    this.#usernameEnd = componentsBuf[1];
+    this.#hostStart = componentsBuf[2];
+    this.#hostEnd = componentsBuf[3];
+    this.#port = componentsBuf[4];
+    this.#pathStart = componentsBuf[5];
+    this.#queryStart = componentsBuf[6];
+    this.#fragmentStart = componentsBuf[7];
   }
 
   [privateCustomInspect](inspect, inspectOptions) {
@@ -826,9 +860,10 @@ class URL {
   #updateSearchParams() {
     if (this.#queryObject !== null) {
       const params = this.#queryObject[_list];
-      const newParams = op_url_parse_search_params(
-        StringPrototypeSlice(this.search, 1),
-      );
+      const query = StringPrototypeSlice(this.search, 1);
+      const newParams = query.length === 0
+        ? []
+        : (parseSimpleSearchParams(query) ?? op_url_parse_search_params(query));
       ArrayPrototypeSplice(
         params,
         0,
@@ -1184,8 +1219,21 @@ class URL {
   /** @return {URLSearchParams} */
   get searchParams() {
     if (this.#queryObject == null) {
-      this.#queryObject = new URLSearchParams(this.search);
-      this.#queryObject[_urlObject] = this;
+      const sp = new URLSearchParams(skipInit);
+      const qStart = this.#queryStart;
+      if (qStart === 0) {
+        sp[_list] = [];
+      } else {
+        const qEnd = this.#fragmentStart || this.#serialization.length;
+        const query = qStart + 1 < qEnd
+          ? StringPrototypeSlice(this.#serialization, qStart + 1, qEnd)
+          : "";
+        sp[_list] = query.length === 0
+          ? []
+          : (parseSimpleSearchParams(query) ?? op_url_parse_search_params(query));
+      }
+      sp[_urlObject] = this;
+      this.#queryObject = sp;
     }
     return this.#queryObject;
   }
@@ -1241,6 +1289,7 @@ webidl
   };
 
 return {
+  parseSimpleSpecialUrl,
   parseUrlEncoded,
   URL,
   URLSearchParams,

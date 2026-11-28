@@ -85,6 +85,28 @@ pub(crate) struct WorkerRequestPayload {
     pub(crate) input_request_id: String,
 }
 
+/// Compact positional tuple serialized for `op_request_invocation_take` so JS
+/// skips parsing 16 object key strings on every incoming request.
+#[derive(Debug, Serialize)]
+pub(crate) struct WorkerRequestTaken(
+    pub(crate) String,                      // 0: request_id
+    pub(crate) u32,                         // 1: request_context_handle
+    pub(crate) u32,                         // 2: completion_handle
+    pub(crate) u32,                         // 3: memory_request_scope_handle
+    pub(crate) Option<MemoryExecutionCall>, // 4: memory_call
+    pub(crate) u32,                         // 5: request_body_stream_handle
+    pub(crate) u32,                         // 6: request_body_handle
+    pub(crate) Vec<(String, String)>,       // 7: headers
+    pub(crate) bool,                        // 8: stream_response
+    pub(crate) usize,                       // 9: max_response_body_bytes
+    pub(crate) usize,                       // 10: max_request_body_bytes
+    pub(crate) String,                      // 11: method
+    pub(crate) String,                      // 12: url
+    pub(crate) String,                      // 13: input_request_id
+    pub(crate) u64,                         // 14: now_ms
+    pub(crate) f64,                         // 15: perf_ms
+);
+
 pub(crate) type MemoryRequestScopes = HandleTable<MemoryRequestScope>;
 
 #[derive(Clone)]

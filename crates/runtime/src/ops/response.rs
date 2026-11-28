@@ -32,6 +32,89 @@ pub(crate) fn op_response_complete(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn complete_response_inline(
+    state: &mut OpState,
+    completion_handle: u32,
+    request_context_handle: u32,
+    memory_scope_handle: u32,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    finish_wait_until: bool,
+) -> (u64, f64) {
+    if let Some(context) = active_request_context_for_completion(state, completion_handle) {
+        emit_completion_result(
+            state,
+            context.request_id,
+            context.completion_token,
+            context.request_context_handle,
+            context.wait_until_count,
+            Ok(WorkerOutput {
+                status,
+                headers,
+                body,
+            }),
+        );
+    }
+    if finish_wait_until && op_request_wait_until_finish(state, completion_handle) {
+        if memory_scope_handle > 0 {
+            clear_memory_request_scope(state, memory_scope_handle);
+        }
+        if request_context_handle > 0 {
+            clear_request_secret_context(state, request_context_handle);
+        }
+    }
+    let time = current_time_boundary();
+    (time.now_ms, time.perf_ms)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_response_complete_inline(
+    state: &mut OpState,
+    completion_handle: u32,
+    request_context_handle: u32,
+    memory_scope_handle: u32,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+    finish_wait_until: bool,
+) -> (u64, f64) {
+    complete_response_inline(
+        state,
+        completion_handle,
+        request_context_handle,
+        memory_scope_handle,
+        status,
+        headers,
+        body.into_bytes(),
+        finish_wait_until,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_response_complete_inline_bytes(
+    state: &mut OpState,
+    completion_handle: u32,
+    request_context_handle: u32,
+    memory_scope_handle: u32,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: JsBuffer,
+    finish_wait_until: bool,
+) -> (u64, f64) {
+    complete_response_inline(
+        state,
+        completion_handle,
+        request_context_handle,
+        memory_scope_handle,
+        status,
+        headers,
+        body.into_vec(),
+        finish_wait_until,
+    )
+}
+
 pub(crate) fn op_response_fail(state: &mut OpState, completion_handle: u32, error: String) {
     let Some(context) = active_request_context_for_completion(state, completion_handle) else {
         return;

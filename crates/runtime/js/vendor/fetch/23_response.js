@@ -13,8 +13,11 @@ const {
   regexMatcher,
   serializeJSValueToJSONString,
 } = core.loadExtScript("ext:vendor/web/00_infra.js");
-const { extractBody, mixinBody } = core.loadExtScript(
+const { extractBody, InnerBody, mixinBody } = core.loadExtScript(
   "ext:vendor/fetch/22_body.js",
+);
+const { ReadableStreamPrototype } = core.loadExtScript(
+  "ext:vendor/web/06_streams.js",
 );
 const { extractMimeType } = core.loadExtScript("ext:vendor/web/01_mimesniff.js");
 const { URL } = core.loadExtScript("ext:vendor/web/00_url.js");
@@ -38,7 +41,10 @@ const {
   SymbolIterator,
   TypeError,
   TypedArrayPrototypeGetSymbolToStringTag,
+  Uint8Array,
 } = primordials;
+
+const EMPTY_STATIC_BODY = new Uint8Array(0);
 
 const VCHAR = ["\x21-\x7E"];
 const OBS_TEXT = ["\x80-\xFF"];
@@ -247,7 +253,12 @@ function tryGetSingleContentTypeHeader(object) {
   if (
     contentType !== "text/plain" &&
     contentType !== "text/plain;charset=UTF-8" &&
-    contentType !== "application/json"
+    contentType !== "text/plain; charset=utf-8" &&
+    contentType !== "text/plain; charset=UTF-8" &&
+    contentType !== "application/json" &&
+    contentType !== "application/json; charset=utf-8" &&
+    contentType !== "text/html" &&
+    contentType !== "text/html; charset=utf-8"
   ) {
     return null;
   }
@@ -493,9 +504,23 @@ class Response {
 
     let bodyWithType = null;
     if (body !== null) {
-      if (defaultInit && typeof body === "string") {
-        this[_lazyStaticBody] = body;
-        return;
+      if (typeof body === "string") {
+        if (defaultInit) {
+          this[_lazyStaticBody] = body;
+          return;
+        }
+        if (init.status === 200 && init.statusText === "") {
+          if (init.headers === undefined) {
+            this[_lazyStaticBody] = body;
+            return;
+          }
+          const headerContentType = tryGetSingleContentTypeHeader(init.headers);
+          if (headerContentType !== null) {
+            this[_lazyStaticBody] = body;
+            this[_lazyStaticContentType] = headerContentType;
+            return;
+          }
+        }
       }
       bodyWithType = extractBody(body);
     }
@@ -671,10 +696,88 @@ function fromInnerResponse(inner, guard) {
   return response;
 }
 
+/**
+ * Fast path for reading a Response's combined/sorted header pairs without
+ * constructing a `Headers` wrapper or materializing a lazy static body.
+ * Returns `null` when the general `headerPairs(response.headers)` path should run.
+ */
+function getResponseHeaderPairs(response) {
+  if (response[_headers] !== null) {
+    return null;
+  }
+  const list = response[_response].headerList;
+  const len = list.length;
+  const lazyCt = response[_lazyStaticContentType];
+  const lazyBody = response[_lazyStaticBody];
+  if (len === 0) {
+    if (lazyCt !== null) {
+      return [["content-type", lazyCt]];
+    }
+    if (typeof lazyBody === "string") {
+      return [["content-type", "text/plain;charset=UTF-8"]];
+    }
+    return [];
+  }
+  if (lazyCt === null && (lazyBody === null || lazyBody === undefined)) {
+    if (len === 1) {
+      return [[byteLowerCase(list[0][0]), list[0][1]]];
+    }
+    if (len === 2) {
+      const n0 = byteLowerCase(list[0][0]);
+      const n1 = byteLowerCase(list[1][0]);
+      if (n0 !== n1 && n0 !== "set-cookie" && n1 !== "set-cookie") {
+        return n0 < n1
+          ? [[n0, list[0][1]], [n1, list[1][1]]]
+          : [[n1, list[1][1]], [n0, list[0][1]]];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Fast path for consuming a Response's static/null body without materializing
+ * a `ReadableStream`. Returns:
+ * - `null` if the response has no body
+ * - `string | Uint8Array` if the response holds an unconsumed static body
+ * - `undefined` if the body is a stream (or already consumed), signaling the
+ *   caller to use the standard `Response.prototype.body` stream reader path.
+ */
+function tryTakeStaticResponseBody(response) {
+  const lazyBody = response[_lazyStaticBody];
+  if (lazyBody !== null && lazyBody !== undefined) {
+    const lazyCt = response[_lazyStaticContentType];
+    response[_lazyStaticBody] = null;
+    if (lazyCt === null && typeof lazyBody === "string") {
+      response[_lazyStaticContentType] = "text/plain;charset=UTF-8";
+    }
+    response[_response].body = new InnerBody({
+      body: EMPTY_STATIC_BODY,
+      consumed: true,
+    });
+    return lazyBody;
+  }
+  const innerBody = response[_response].body;
+  if (innerBody === null) {
+    return null;
+  }
+  const sos = innerBody.streamOrStatic;
+  if (
+    !ObjectPrototypeIsPrototypeOf(ReadableStreamPrototype, sos) &&
+    !sos.consumed
+  ) {
+    sos.consumed = true;
+    return sos.body;
+  }
+  return undefined;
+}
+
 return {
   fromInnerResponse,
+  getResponseHeaderPairs,
   newInnerResponse,
   nullBodyStatus,
   Response,
+  tryTakeStaticResponseBody,
 };
 })();

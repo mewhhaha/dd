@@ -4,6 +4,7 @@ return (function () {
 const { core, primordials } = __bootstrap;
 const {
   ArrayPrototypeMap,
+  ArrayPrototypePush,
   ArrayPrototypeSlice,
   ArrayPrototypeSplice,
   ObjectKeys,
@@ -20,15 +21,16 @@ const {
   createFilteredInspectProxy,
   privateCustomInspect,
 } = core.loadExtScript("ext:web/console.js");
-const { HTTP_TOKEN_CODE_POINT_RE } = core.loadExtScript(
+const { byteLowerCase, HTTP_TOKEN_CODE_POINT_RE } = core.loadExtScript(
   "ext:vendor/web/00_infra.js",
 );
-const { URL } = core.loadExtScript("ext:vendor/web/00_url.js");
+const { parseSimpleSpecialUrl, URL } = core.loadExtScript("ext:vendor/web/00_url.js");
 const { extractBody, mixinBody } = core.loadExtScript(
   "ext:vendor/fetch/22_body.js",
 );
 const { extractMimeType } = core.loadExtScript("ext:vendor/web/01_mimesniff.js");
 const {
+  appendHeaderToList,
   fillHeaders,
   getDecodeSplitHeader,
   guardFromHeaders,
@@ -46,6 +48,7 @@ const _headersCache = Symbol("headers cache");
 const _headersGuard = Symbol("headers guard");
 const _signal = Symbol("signal");
 const _signalCache = Symbol("signalCache");
+const _signalSource = Symbol("signalSource");
 const _mimeType = Symbol("mime type");
 const _body = Symbol("body");
 const _brand = webidl.brand;
@@ -195,10 +198,18 @@ class Request {
   /** @type {AbortSignal} */
   get [_signal]() {
     let signal = this[_signalCache];
-    // A request made without a signal gets one that never aborts, on first
-    // use.
+    // Materialize a dependent or dummy signal only on first use.
     if (signal === undefined) {
-      signal = newSignal();
+      const source = this[_signalSource];
+      if (source !== undefined) {
+        this[_signalSource] = undefined;
+        signal = createDependentAbortSignal(
+          new SafeArrayIterator([source()]),
+          "Failed to construct 'Request'",
+        );
+      } else {
+        signal = newSignal();
+      }
       this[_signalCache] = signal;
     }
     return signal;
@@ -636,5 +647,47 @@ webidl.converters["RequestInit"] = webidl.createDictionaryConverter(
   ],
 );
 
-return { Request };
+function fromHostRequest(url, method, body, headers, signalSource) {
+  const normalizedUrl = parseSimpleSpecialUrl(url) ? url : new URL(url).href;
+  const normalizedMethod = KNOWN_METHODS[method] ??
+    validateAndNormalizeMethod(method);
+  if (
+    (normalizedMethod === "GET" || normalizedMethod === "HEAD") &&
+    body !== undefined && body !== null
+  ) {
+    throw new TypeError("Request with GET/HEAD method cannot have body");
+  }
+  const inner = newInnerRequest(normalizedMethod, normalizedUrl);
+  if (headers !== undefined && headers !== null && headers.length > 0) {
+    for (let i = 0; i < headers.length; i++) {
+      appendHeaderToList(inner.headerList, headers[i][0], headers[i][1]);
+    }
+  }
+  if (body !== undefined && body !== null) {
+    const res = extractBody(body);
+    inner.body = res.body;
+    if (res.contentType !== null) {
+      let hasCt = false;
+      const list = inner.headerList;
+      for (let i = 0; i < list.length; i++) {
+        if (byteLowerCase(list[i][0]) === "content-type") {
+          hasCt = true;
+          break;
+        }
+      }
+      if (!hasCt) {
+        ArrayPrototypePush(list, ["Content-Type", res.contentType]);
+      }
+    }
+  }
+  const request = new Request(_brand);
+  request[_request] = inner;
+  request[_headersCache] = undefined;
+  request[_headersGuard] = "request";
+  request[_signalCache] = undefined;
+  request[_signalSource] = signalSource;
+  return request;
+}
+
+return { fromHostRequest, Request };
 })();

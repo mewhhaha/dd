@@ -1,6 +1,16 @@
 // dd_v8 host kernel — runs natively on Scriptw + wtime x64 AOT.
 // Everything stays in module-private lexical scope (zero globalThis pollution).
-import { call_sync, start_async, load_module, wasm_op, inspector_op } from "dd:host";
+import {
+  call_sync,
+  start_async,
+  call_sync_str,
+  start_async_str,
+  utf8_encode,
+  utf8_decode,
+  load_module,
+  wasm_op,
+  inspector_op,
+} from "dd:host";
 
 // ---- Capture genuine primordials before any user/bootstrap code runs ----
 const _globalThis = globalThis;
@@ -62,7 +72,12 @@ const _DataView = DataView;
 const _DVGetByteLength = _ObjectGetOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
 const _DVGetByteOffset = _ObjectGetOwnPropertyDescriptor(DataView.prototype, "byteOffset").get;
 const _DVGetBuffer = _ObjectGetOwnPropertyDescriptor(DataView.prototype, "buffer").get;
+const _DVGetUint8 = DataView.prototype.getUint8;
+const _DVSetUint8 = DataView.prototype.setUint8;
+const _DVGetUint32 = DataView.prototype.getUint32;
 const _DVSetUint32 = DataView.prototype.setUint32;
+const _DVGetFloat64 = DataView.prototype.getFloat64;
+const _DVSetFloat64 = DataView.prototype.setFloat64;
 const _Uint8Array = Uint8Array;
 const _Uint32Array = Uint32Array;
 const _Float64Array = Float64Array;
@@ -81,6 +96,7 @@ const _MathMin = Math.min;
 const _StrCharCodeAt = String.prototype.charCodeAt;
 const _StrFromCharCode = String.fromCharCode;
 const _StrStartsWith = String.prototype.startsWith;
+const _StrSlice = String.prototype.slice;
 const _NumberValueOf = Number.prototype.valueOf;
 const _StringValueOf = String.prototype.valueOf;
 const _BooleanValueOf = Boolean.prototype.valueOf;
@@ -489,129 +505,28 @@ function _bufferBytes(v) {
   }
 }
 
-// ---- UTF-8 codec (handles lone surrogates -> U+FFFD cleanly, immune to sabotaged builtins) ----
+// ---- UTF-8 codec (delegates to native Rust foreigns; immune to sabotaged builtins) ----
 function _utf8Encode(str) {
-  const n = str.length;
-  const out = new _Uint8Array(n * 3);
-  let pos = 0;
-  for (let i = 0; i < n; i++) {
-    let cp = _call(_StrCharCodeAt, str, i);
-    if (cp < 0x80) {
-      out[pos++] = cp;
-    } else if (cp < 0x800) {
-      out[pos++] = 0xc0 | (cp >> 6);
-      out[pos++] = 0x80 | (cp & 0x3f);
-    } else if (cp >= 0xd800 && cp <= 0xdbff) {
-      if (i + 1 < n) {
-        const lo = _call(_StrCharCodeAt, str, i + 1);
-        if (lo >= 0xdc00 && lo <= 0xdfff) {
-          i++;
-          cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
-          out[pos++] = 0xf0 | (cp >> 18);
-          out[pos++] = 0x80 | ((cp >> 12) & 0x3f);
-          out[pos++] = 0x80 | ((cp >> 6) & 0x3f);
-          out[pos++] = 0x80 | (cp & 0x3f);
-          continue;
-        }
-      }
-      out[pos++] = 0xef; out[pos++] = 0xbf; out[pos++] = 0xbd;
-    } else if (cp >= 0xdc00 && cp <= 0xdfff) {
-      out[pos++] = 0xef; out[pos++] = 0xbf; out[pos++] = 0xbd;
-    } else {
-      out[pos++] = 0xe0 | (cp >> 12);
-      out[pos++] = 0x80 | ((cp >> 6) & 0x3f);
-      out[pos++] = 0x80 | (cp & 0x3f);
-    }
-  }
-  return _call(_TASubarray, out, 0, pos);
+  if (str.length === 0) return new _Uint8Array(0);
+  return utf8_encode(str);
 }
 
-function _utf8Decode(bytes, stripBom) {
-  let i = 0;
-  const len = bytes.length;
+function _utf8DecodeRange(bytes, start, end, stripBom) {
+  const len = end - start;
   // Match V8's maximum string length (0x1fffffe8 UTF-16 code units) so multi-GiB
   // views fail fast with RangeError instead of exhausting memory.
   if (len > 0x1fffffe8) {
     throw new _RangeError("Invalid string length");
   }
-  if (stripBom && len >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-    i = 3;
-  }
-  const chunks = [];
-  let cLen = 0;
-  const codeUnits = new _Array(1024);
-  let uLen = 0;
-  while (i < len) {
-    const b0 = bytes[i++];
-    if (b0 < 0x80) {
-      codeUnits[uLen++] = b0;
-    } else if ((b0 & 0xe0) === 0xc0 && i < len) {
-      const b1 = bytes[i];
-      if ((b1 & 0xc0) === 0x80) {
-        const cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f);
-        if (cp >= 0x80) {
-          i++;
-          codeUnits[uLen++] = cp;
-        } else {
-          codeUnits[uLen++] = 0xfffd;
-        }
-      } else {
-        codeUnits[uLen++] = 0xfffd;
-      }
-    } else if ((b0 & 0xf0) === 0xe0 && i + 1 < len) {
-      const b1 = bytes[i];
-      const b2 = bytes[i + 1];
-      if ((b1 & 0xc0) === 0x80 && (b2 & 0xc0) === 0x80) {
-        const cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
-        if (cp >= 0x800 && !(cp >= 0xd800 && cp <= 0xdfff)) {
-          i += 2;
-          codeUnits[uLen++] = cp;
-        } else {
-          codeUnits[uLen++] = 0xfffd;
-        }
-      } else {
-        codeUnits[uLen++] = 0xfffd;
-      }
-    } else if ((b0 & 0xf8) === 0xf0 && i + 2 < len) {
-      const b1 = bytes[i];
-      const b2 = bytes[i + 1];
-      const b3 = bytes[i + 2];
-      if ((b1 & 0xc0) === 0x80 && (b2 & 0xc0) === 0x80 && (b3 & 0xc0) === 0x80) {
-        const cp = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
-        if (cp >= 0x10000 && cp <= 0x10ffff) {
-          i += 3;
-          const adj = cp - 0x10000;
-          if (uLen >= 1023) {
-            codeUnits.length = uLen;
-            chunks[cLen++] = _ReflectApply(_StrFromCharCode, null, codeUnits);
-            codeUnits.length = 1024;
-            uLen = 0;
-          }
-          codeUnits[uLen++] = 0xd800 | (adj >> 10);
-          codeUnits[uLen++] = 0xdc00 | (adj & 0x3ff);
-        } else {
-          codeUnits[uLen++] = 0xfffd;
-        }
-      } else {
-        codeUnits[uLen++] = 0xfffd;
-      }
-    } else {
-      codeUnits[uLen++] = 0xfffd;
-    }
-    if (uLen >= 1024) {
-      codeUnits.length = uLen;
-      chunks[cLen++] = _ReflectApply(_StrFromCharCode, null, codeUnits);
-      codeUnits.length = 1024;
-      uLen = 0;
-    }
-  }
-  if (uLen > 0) {
-    codeUnits.length = uLen;
-    chunks[cLen++] = _ReflectApply(_StrFromCharCode, null, codeUnits);
-  }
-  if (cLen === 0) return "";
-  if (cLen === 1) return chunks[0];
-  return _call(_ArrayJoin, chunks, "");
+  if (len === 0) return "";
+  const slice = (start === 0 && end === bytes.length)
+    ? bytes
+    : _call(_TASubarray, bytes, start, end);
+  return utf8_decode(slice, stripBom ? 1 : 0);
+}
+
+function _utf8Decode(bytes, stripBom) {
+  return _utf8DecodeRange(bytes, 0, bytes.length, stripBom);
 }
 
 function _utf8EncodeInto(source, dest) {
@@ -699,7 +614,9 @@ const _f64Bytes = new _Uint8Array(_f64Tmp);
 
 class _WireBuf {
   constructor(budget) {
-    this.buf = new _Uint8Array(256);
+    this.ab = new _ArrayBuffer(256);
+    this.buf = new _Uint8Array(this.ab);
+    this.dv = new _DataView(this.ab);
     this.pos = 0;
     this.budget = budget;
   }
@@ -717,28 +634,26 @@ class _WireBuf {
         while (cap < needed) cap *= 2;
         if (cap > this.budget) cap = this.budget;
       }
-      const next = new _Uint8Array(cap);
+      const nextAb = new _ArrayBuffer(cap);
+      const next = new _Uint8Array(nextAb);
       _call(_TASet, next, _call(_TASubarray, this.buf, 0, this.pos));
+      this.ab = nextAb;
       this.buf = next;
+      this.dv = new _DataView(nextAb);
     }
   }
   u8(v) {
     this.ensure(1);
-    this.buf[this.pos++] = v & 0xff;
+    _call(_DVSetUint8, this.dv, this.pos++, v & 0xff);
   }
   u32(v) {
     this.ensure(4);
-    const p = this.pos;
-    this.buf[p] = v & 0xff;
-    this.buf[p + 1] = (v >>> 8) & 0xff;
-    this.buf[p + 2] = (v >>> 16) & 0xff;
-    this.buf[p + 3] = (v >>> 24) & 0xff;
-    this.pos = p + 4;
+    _call(_DVSetUint32, this.dv, this.pos, v >>> 0, true);
+    this.pos += 4;
   }
   f64(v) {
     this.ensure(8);
-    _f64View[0] = v;
-    for (let i = 0; i < 8; i++) this.buf[this.pos + i] = _f64Bytes[i];
+    _call(_DVSetFloat64, this.dv, this.pos, v, true);
     this.pos += 8;
   }
   bytes(arr) {
@@ -748,24 +663,14 @@ class _WireBuf {
   }
   str(s) {
     const n = s.length;
+    if (n === 0) {
+      this.u32(0);
+      return;
+    }
     if (this.pos + 4 + n > this.budget) {
       throw new _TypeError("op argument is too large");
     }
-    // Fast-path ASCII directly into this.buf without temporary allocations.
-    let ascii = true;
-    for (let i = 0; i < n; i++) {
-      if (_call(_StrCharCodeAt, s, i) >= 0x80) { ascii = false; break; }
-    }
-    if (ascii) {
-      this.u32(n);
-      this.ensure(n);
-      let p = this.pos;
-      const buf = this.buf;
-      for (let i = 0; i < n; i++) buf[p + i] = _call(_StrCharCodeAt, s, i);
-      this.pos = p + n;
-      return;
-    }
-    const b = _utf8Encode(s);
+    const b = utf8_encode(s);
     this.u32(b.length);
     this.bytes(b);
   }
@@ -775,10 +680,7 @@ class _WireBuf {
 }
 
 function _patchU32(w, pos, v) {
-  w.buf[pos] = v & 0xff;
-  w.buf[pos + 1] = (v >>> 8) & 0xff;
-  w.buf[pos + 2] = (v >>> 16) & 0xff;
-  w.buf[pos + 3] = (v >>> 24) & 0xff;
+  _call(_DVSetUint32, w.dv, pos, v >>> 0, true);
 }
 
 function _encodeWireLeaf(w, val) {
@@ -1080,86 +982,239 @@ function _encodeWireVal(w, rootVal, startDepth) {
   }
 }
 
+const _emptyArgsWire = new _Uint8Array([0, 0, 0, 0]);
+const _wireScratchAB = new _ArrayBuffer(4096);
+const _wireScratch = new _Uint8Array(_wireScratchAB);
+const _wireScratchDV = new _DataView(_wireScratchAB);
+const _sharedWireBuf = new _WireBuf(256 * 1024 * 1024);
+let _sharedWireBufBusy = false;
+
+function _tryFastEncodeLeaf(buf, dv, pos, val, limit) {
+  if (val === undefined) {
+    if (pos + 1 > limit) return -1;
+    _call(_DVSetUint8, dv, pos, TAG_UNDEFINED);
+    return pos + 1;
+  }
+  if (val === null) {
+    if (pos + 1 > limit) return -1;
+    _call(_DVSetUint8, dv, pos, TAG_NULL);
+    return pos + 1;
+  }
+  const t = typeof val;
+  if (t === "boolean") {
+    if (pos + 1 > limit) return -1;
+    _call(_DVSetUint8, dv, pos, val ? TAG_TRUE : TAG_FALSE);
+    return pos + 1;
+  }
+  if (t === "number") {
+    if ((val | 0) === val && (val !== 0 || 1 / val > 0)) {
+      if (pos + 5 > limit) return -1;
+      _call(_DVSetUint8, dv, pos, TAG_I32);
+      _call(_DVSetUint32, dv, pos + 1, (val | 0) >>> 0, true);
+      return pos + 5;
+    }
+    if (pos + 9 > limit) return -1;
+    _call(_DVSetUint8, dv, pos, TAG_F64);
+    _call(_DVSetFloat64, dv, pos + 1, val, true);
+    return pos + 9;
+  }
+  if (t === "string") {
+    const n = val.length;
+    if (n === 0) {
+      if (pos + 5 > limit) return -1;
+      _call(_DVSetUint8, dv, pos, TAG_STRING);
+      _call(_DVSetUint32, dv, pos + 1, 0, true);
+      return pos + 5;
+    }
+    if (pos + 5 + n > limit) return -1;
+    const b = utf8_encode(val);
+    const blen = b.length;
+    if (pos + 5 + blen > limit) return -1;
+    _call(_DVSetUint8, dv, pos, TAG_STRING);
+    _call(_DVSetUint32, dv, pos + 1, blen >>> 0, true);
+    _call(_TASet, buf, b, pos + 5);
+    return pos + 5 + blen;
+  }
+  if (t === "object") {
+    // Fast path for non-proxy Uint8Array (e.g. op_http_body_store).
+    if (!_isProxy(val) && _isTypedArray(val) && _call(_TAGetToStringTag, val) === "Uint8Array") {
+      try {
+        const len = _call(_TAGetByteLength, val);
+        if (pos + 5 + len > limit) return -1;
+        _call(_DVSetUint8, dv, pos, TAG_BYTES);
+        _call(_DVSetUint32, dv, pos + 1, len >>> 0, true);
+        if (len > 0) _call(_TASet, buf, val, pos + 5);
+        return pos + 5 + len;
+      } catch {
+        return -1;
+      }
+    }
+    // Fast path for shallow header pair arrays `[[k, v], ...]` (e.g. op_http_headers_store).
+    if (!_isProxy(val) && _ArrayIsArray(val)) {
+      try {
+        const alen = val.length;
+        if (alen > 64 || pos + 5 > limit) return -1;
+        _call(_DVSetUint8, dv, pos, TAG_ARRAY);
+        _call(_DVSetUint32, dv, pos + 1, alen >>> 0, true);
+        let p = pos + 5;
+        for (let i = 0; i < alen; i++) {
+          const desc = _ObjectGetOwnPropertyDescriptor(val, i);
+          if (!desc || desc.get || desc.set) return -1;
+          const item = desc.value;
+          if (typeof item === "string" || typeof item === "number" || typeof item === "boolean" || item === null || item === undefined) {
+            p = _tryFastEncodeLeaf(buf, dv, p, item, limit);
+            if (p < 0) return -1;
+          } else if (item && !_isProxy(item) && _ArrayIsArray(item) && item.length === 2) {
+            const d0 = _ObjectGetOwnPropertyDescriptor(item, 0);
+            const d1 = _ObjectGetOwnPropertyDescriptor(item, 1);
+            if (!d0 || d0.get || d0.set || typeof d0.value !== "string") return -1;
+            if (!d1 || d1.get || d1.set || typeof d1.value !== "string") return -1;
+            if (p + 5 > limit) return -1;
+            _call(_DVSetUint8, dv, p, TAG_ARRAY);
+            _call(_DVSetUint32, dv, p + 1, 2, true);
+            p = _tryFastEncodeLeaf(buf, dv, p + 5, d0.value, limit);
+            if (p < 0) return -1;
+            p = _tryFastEncodeLeaf(buf, dv, p, d1.value, limit);
+            if (p < 0) return -1;
+          } else {
+            return -1;
+          }
+        }
+        return p;
+      } catch {
+        return -1;
+      }
+    }
+  }
+  return -1;
+}
+
 function _encodeWireArgs(args) {
+  const n = args.length;
+  if (n === 0) return _emptyArgsWire;
+  const limit = _MathMin(4096, _maxOpArgBytes);
+  const buf = _wireScratch;
+  const dv = _wireScratchDV;
+  _call(_DVSetUint32, dv, 0, n >>> 0, true);
+  let p = 4;
+  for (let i = 0; i < n; i++) {
+    p = _tryFastEncodeLeaf(buf, dv, p, args[i], limit);
+    if (p < 0) break;
+  }
+  if (p >= 0) {
+    return _call(_TASubarray, buf, 0, p);
+  }
   _checkWireBudget(args, _maxOpArgBytes);
+  if (!_sharedWireBufBusy) {
+    _sharedWireBufBusy = true;
+    _sharedWireBuf.pos = 0;
+    _sharedWireBuf.budget = _maxOpArgBytes;
+    try {
+      _sharedWireBuf.u32(n);
+      for (let i = 0; i < n; i++) {
+        if (!_encodeWireLeaf(_sharedWireBuf, args[i])) {
+          _encodeWireVal(_sharedWireBuf, args[i], 0);
+        }
+      }
+      const res = _sharedWireBuf.finish();
+      // Copy out if buffer grew huge so scratch doesn't retain giant allocations.
+      if (_sharedWireBuf.buf.length > 65536) {
+        const copy = new _Uint8Array(res.length);
+        _call(_TASet, copy, res);
+        const freshAb = new _ArrayBuffer(4096);
+        _sharedWireBuf.ab = freshAb;
+        _sharedWireBuf.buf = new _Uint8Array(freshAb);
+        _sharedWireBuf.dv = new _DataView(freshAb);
+        return copy;
+      }
+      return res;
+    } finally {
+      _sharedWireBufBusy = false;
+    }
+  }
   const w = new _WireBuf(_maxOpArgBytes);
-  w.u32(args.length);
-  for (let i = 0; i < args.length; i++) {
-    _encodeWireVal(w, args[i], 0);
+  w.u32(n);
+  for (let i = 0; i < n; i++) {
+    if (!_encodeWireLeaf(w, args[i])) {
+      _encodeWireVal(w, args[i], 0);
+    }
   }
   return w.finish();
 }
 
-class _WireReader {
-  constructor(bytes) {
-    this.b = bytes;
-    this.p = 0;
+let _rBuf = null;
+let _rDV = null;
+let _rPos = 0;
+function _rInit(bytes) {
+  _rBuf = bytes;
+  _rDV = new _DataView(
+    _call(_TAGetBuffer, bytes),
+    _call(_TAGetByteOffset, bytes),
+    _call(_TAGetByteLength, bytes),
+  );
+  _rPos = 0;
+}
+function _rU8() { return _call(_DVGetUint8, _rDV, _rPos++); }
+function _rU32() {
+  const v = _call(_DVGetUint32, _rDV, _rPos, true);
+  _rPos += 4;
+  return v;
+}
+function _rF64() {
+  const v = _call(_DVGetFloat64, _rDV, _rPos, true);
+  _rPos += 8;
+  return v;
+}
+function _rStr() {
+  const len = _rU32();
+  const start = _rPos;
+  _rPos = start + len;
+  if (len === 0) return "";
+  return utf8_decode(_call(_TASubarray, _rBuf, start, start + len), 0);
+}
+function _rBytesVal() {
+  const len = _rU32();
+  const out = new _Uint8Array(len);
+  if (len > 0) {
+    _call(_TASet, out, _call(_TASubarray, _rBuf, _rPos, _rPos + len));
+    _rPos += len;
   }
-  u8() { return this.b[this.p++]; }
-  u32() {
-    const p = this.p;
-    const v = (this.b[p] | (this.b[p + 1] << 8) | (this.b[p + 2] << 16) | (this.b[p + 3] << 24)) >>> 0;
-    this.p = p + 4;
-    return v;
-  }
-  i32() { return this.u32() | 0; }
-  f64() {
-    for (let i = 0; i < 8; i++) _f64Bytes[i] = this.b[this.p + i];
-    this.p += 8;
-    return _f64View[0];
-  }
-  str() {
-    const len = this.u32();
-    const s = _utf8Decode(_call(_TASubarray, this.b, this.p, this.p + len), false);
-    this.p += len;
-    return s;
-  }
-  bytes() {
-    const len = this.u32();
-    const out = new _Uint8Array(len);
-    _call(_TASet, out, _call(_TASubarray, this.b, this.p, this.p + len));
-    this.p += len;
-    return out;
-  }
-  value() {
-    const tag = this.u8();
-    switch (tag) {
-      case TAG_UNDEFINED: return undefined;
-      case TAG_NULL: return null;
-      case TAG_FALSE: return false;
-      case TAG_TRUE: return true;
-      case TAG_I32: return this.i32();
-      case TAG_F64: return this.f64();
-      case TAG_BIGINT: return _BigInt(this.str());
-      case TAG_STRING: return this.str();
-      case TAG_BYTES: return this.bytes();
-      case TAG_ARRAY: {
-        const len = this.u32();
-        const arr = new _Array(len);
-        for (let i = 0; i < len; i++) arr[i] = this.value();
-        return arr;
-      }
-      case TAG_OBJECT: {
-        const len = this.u32();
-        const obj = {};
-        for (let i = 0; i < len; i++) {
-          const k = this.str();
-          obj[k] = this.value();
-        }
-        return obj;
-      }
-      default:
-        throw new _Error(`unknown wire tag ${tag}`);
+  return out;
+}
+function _rValue() {
+  const tag = _call(_DVGetUint8, _rDV, _rPos++);
+  switch (tag) {
+    case TAG_UNDEFINED: return undefined;
+    case TAG_NULL: return null;
+    case TAG_FALSE: return false;
+    case TAG_TRUE: return true;
+    case TAG_I32: return _rU32() | 0;
+    case TAG_F64: return _rF64();
+    case TAG_BIGINT: return _BigInt(_rStr());
+    case TAG_STRING: return _rStr();
+    case TAG_BYTES: return _rBytesVal();
+    case TAG_ARRAY: {
+      const len = _rU32();
+      const arr = new _Array(len);
+      for (let i = 0; i < len; i++) arr[i] = _rValue();
+      return arr;
     }
+    case TAG_OBJECT: {
+      const len = _rU32();
+      const obj = {};
+      for (let i = 0; i < len; i++) {
+        const k = _rStr();
+        obj[k] = _rValue();
+      }
+      return obj;
+    }
+    default:
+      throw new _Error(`unknown wire tag ${tag}`);
   }
 }
 
 const _errorBuilders = _ObjectCreate(null);
-function _buildErrorFromReader(r) {
-  const cls = r.u8();
-  let customName = null;
-  if (cls === 3) customName = r.str();
-  const msg = r.str();
+function _buildErrorParts(cls, customName, msg) {
   if (cls === 1) return new _TypeError(msg);
   if (cls === 2) return new _RangeError(msg);
   if (cls === 3) {
@@ -1173,14 +1228,127 @@ function _buildErrorFromReader(r) {
   }
   return new _Error(msg);
 }
+function _rBuildError() {
+  const cls = _rU8();
+  let customName = "";
+  if (cls === 3) customName = _rStr();
+  const msg = _rStr();
+  return _buildErrorParts(cls, customName, msg);
+}
 
 function _decodeEnvelope(bytes) {
-  const r = new _WireReader(bytes);
-  const status = r.u8();
-  if (status === ENV_OK) return { ok: true, value: r.value() };
-  if (status === ENV_ERR) return { ok: false, error: _buildErrorFromReader(r) };
-  if (status === ENV_PENDING) return { pending: true, id: r.u32() };
+  _rInit(bytes);
+  const status = _rU8();
+  if (status === ENV_OK) return { ok: true, value: _rValue() };
+  if (status === ENV_ERR) return { ok: false, error: _rBuildError() };
+  if (status === ENV_PENDING) return { pending: true, id: _rU32() };
   throw new _Error(`unknown wire envelope status ${status}`);
+}
+
+function _decodeSyncResult(bytes) {
+  _rInit(bytes);
+  const status = _rU8();
+  if (status === ENV_OK) return _rValue();
+  if (status === ENV_ERR) throw _rBuildError();
+  throw new _Error(`unknown wire envelope status ${status}`);
+}
+
+// ---- Fast UTF-16 JSON/primitive op channel (zero Uint8Array indexing) ----
+function _isStrFastPrim(v) {
+  if (v === null) return true;
+  const t = typeof v;
+  if (t === "string" || t === "boolean") return true;
+  if (t === "number") return v === v && v !== Infinity && v !== -Infinity && (v !== 0 || 1 / v > 0);
+  return false;
+}
+
+function _tryCopyStrArray(v) {
+  if (typeof v !== "object" || v === null || _isProxy(v) || !_ArrayIsArray(v)) return null;
+  let len;
+  try { len = v.length; } catch { return null; }
+  if (len === 0) return [];
+  if (len > 64) return null;
+  const out = new _Array(len);
+  for (let i = 0; i < len; i++) {
+    let desc;
+    try { desc = _ObjectGetOwnPropertyDescriptor(v, i); } catch { return null; }
+    if (!desc || desc.get || desc.set) return null;
+    const item = desc.value;
+    if (_isStrFastPrim(item)) {
+      out[i] = item;
+      continue;
+    }
+    if (item && typeof item === "object" && !_isProxy(item) && _ArrayIsArray(item)) {
+      let ilen;
+      try { ilen = item.length; } catch { return null; }
+      if (ilen !== 2) return null;
+      let d0, d1;
+      try {
+        d0 = _ObjectGetOwnPropertyDescriptor(item, 0);
+        d1 = _ObjectGetOwnPropertyDescriptor(item, 1);
+      } catch {
+        return null;
+      }
+      if (!d0 || d0.get || d0.set || typeof d0.value !== "string") return null;
+      if (!d1 || d1.get || d1.set || typeof d1.value !== "string") return null;
+      out[i] = [d0.value, d1.value];
+      continue;
+    }
+    return null;
+  }
+  return out;
+}
+
+function _tryEncodeStrArgs(args, n) {
+  if (n === 0) return "[]";
+  if (n === 1) {
+    const a0 = args[0];
+    if (typeof a0 === "number" && (a0 | 0) === a0 && (a0 !== 0 || 1 / a0 > 0)) {
+      return `[${a0}]`;
+    }
+    if (_isStrFastPrim(a0)) {
+      const s = _JSONStringify([a0]);
+      return s.length * 2 <= _maxOpArgBytes ? s : null;
+    }
+    const c0 = _tryCopyStrArray(a0);
+    if (c0 !== null) {
+      const s = _JSONStringify([c0]);
+      return s.length * 2 <= _maxOpArgBytes ? s : null;
+    }
+    return null;
+  }
+  const arr = new _Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = args[i];
+    if (_isStrFastPrim(v)) {
+      arr[i] = v;
+    } else {
+      const cv = _tryCopyStrArray(v);
+      if (cv === null) return null;
+      arr[i] = cv;
+    }
+  }
+  const s = _JSONStringify(arr);
+  return s.length * 2 <= _maxOpArgBytes ? s : null;
+}
+
+function _decodeStrErr(resp) {
+  const parts = _JSONParse(_call(_StrSlice, resp, 1));
+  return _buildErrorParts(parts[0], parts[1], parts[2]);
+}
+
+function _decodeStrValue(resp) {
+  const tag = _call(_StrCharCodeAt, resp, 0);
+  if (tag === 117) return undefined; // 'u'
+  if (tag === 110) return null;      // 'n'
+  if (tag === 116) return true;      // 't'
+  if (tag === 102) return false;     // 'f'
+  if (tag === 105) return _Number(_call(_StrSlice, resp, 1)) | 0; // 'i'
+  if (tag === 100) return _Number(_call(_StrSlice, resp, 1));     // 'd'
+  if (tag === 115) return _call(_StrSlice, resp, 1);              // 's'
+  if (tag === 106) return _JSONParse(_call(_StrSlice, resp, 1));  // 'j'
+  if (tag === 101) throw _decodeStrErr(resp);                     // 'e'
+  throw new _Error(`unknown str envelope tag ${tag}`);
 }
 
 // ---- Structured Clone / Serialize / Deserialize (header [0xff, 0x0f]) ----
@@ -1940,12 +2108,25 @@ export function __dd_register_ext_factory(specifier, fn) {
 const _BUILTIN_OPS = {
   op_encode(text) {
     if (typeof text !== "string") throw new _TypeError("Invalid argument");
-    const enc = _utf8Encode(text);
-    const out = new _Uint8Array(enc.length);
-    _call(_TASet, out, enc);
-    return out;
+    if (text.length === 0) return new _Uint8Array(0);
+    return utf8_encode(text);
   },
   op_decode(buf) {
+    if (!_isProxy(buf) && _isTypedArray(buf) && _call(_TAGetToStringTag, buf) === "Uint8Array") {
+      let len = 0;
+      try {
+        len = _call(_TAGetByteLength, buf);
+      } catch {
+        return "";
+      }
+      if (len > 0x1fffffe8) throw new _RangeError("Invalid string length");
+      if (len === 0) return "";
+      try {
+        return utf8_decode(buf, 1);
+      } catch {
+        return "";
+      }
+    }
     const bytes = _bufferBytes(buf);
     if (bytes === null) throw new _TypeError("expected an ArrayBuffer or ArrayBufferView");
     return _utf8Decode(bytes, true);
@@ -2090,6 +2271,11 @@ const _BUILTIN_OPS = {
 };
 
 function _writeU32Buf(buf, values) {
+  if (_ArrayIsArray(buf)) {
+    const count = _MathMin(values.length, buf.length);
+    for (let i = 0; i < count; i++) buf[i] = values[i] >>> 0;
+    return;
+  }
   if (!_isArrayBufferView(buf)) return;
   const isDv = _isDataView(buf);
   const ab = _call(isDv ? _DVGetBuffer : _TAGetBuffer, buf);
@@ -2106,28 +2292,25 @@ function _makeSyncOp(opId, name) {
   let fn;
   if (name === "op_url_parse") {
     fn = function op_url_parse(href, componentsBuf) {
-      const env = _decodeEnvelope(call_sync(opId, _encodeWireArgs([_String(href)])));
-      if (!env.ok) throw env.error;
-      const status = env.value[0];
-      const comps = env.value[1];
+      const val = _decodeStrValue(call_sync_str(opId, _JSONStringify([_String(href)])));
+      const status = val[0];
+      const comps = val[1];
       if (comps) _writeU32Buf(componentsBuf, comps);
       return status;
     };
   } else if (name === "op_url_parse_with_base") {
     fn = function op_url_parse_with_base(href, baseHref, componentsBuf) {
-      const env = _decodeEnvelope(call_sync(opId, _encodeWireArgs([_String(href), _String(baseHref)])));
-      if (!env.ok) throw env.error;
-      const status = env.value[0];
-      const comps = env.value[1];
+      const val = _decodeStrValue(call_sync_str(opId, _JSONStringify([_String(href), _String(baseHref)])));
+      const status = val[0];
+      const comps = val[1];
       if (comps) _writeU32Buf(componentsBuf, comps);
       return status;
     };
   } else if (name === "op_url_reparse") {
     fn = function op_url_reparse(href, setter, value, componentsBuf) {
-      const env = _decodeEnvelope(call_sync(opId, _encodeWireArgs([_String(href), setter >>> 0, _String(value)])));
-      if (!env.ok) throw env.error;
-      const status = env.value[0];
-      const comps = env.value[1];
+      const val = _decodeStrValue(call_sync_str(opId, _JSONStringify([_String(href), setter >>> 0, _String(value)])));
+      const status = val[0];
+      const comps = val[1];
       if (comps) _writeU32Buf(componentsBuf, comps);
       return status;
     };
@@ -2155,10 +2338,41 @@ function _makeSyncOp(opId, name) {
       _call(_TASet, new _Uint8Array(ab, off, len), env.value);
     };
   } else {
-    fn = function (...args) {
-      const env = _decodeEnvelope(call_sync(opId, _encodeWireArgs(args)));
-      if (!env.ok) throw env.error;
-      return env.value;
+    let useBinary = false;
+    fn = function () {
+      const n = arguments.length;
+      if (!useBinary) {
+        const jsonArgs = _tryEncodeStrArgs(arguments, n);
+        if (jsonArgs !== null) {
+          const resp = call_sync_str(opId, jsonArgs);
+          const tag = _call(_StrCharCodeAt, resp, 0);
+          if (tag === 66) { // 'B' binary fallback (op returned Bytes/BigInt/etc.)
+            useBinary = true;
+            return _decodeSyncResult(call_sync(0x7fffffff, _emptyArgsWire));
+          }
+          if (tag !== 70) { // 'F' retry via binary (e.g. lone surrogate in string arg)
+            return _decodeStrValue(resp);
+          }
+        }
+      }
+      if (n === 0) {
+        return _decodeSyncResult(call_sync(opId, _emptyArgsWire));
+      }
+      const limit = _MathMin(4096, _maxOpArgBytes);
+      const buf = _wireScratch;
+      const dv = _wireScratchDV;
+      _call(_DVSetUint32, dv, 0, n >>> 0, true);
+      let p = 4;
+      for (let i = 0; i < n; i++) {
+        p = _tryFastEncodeLeaf(buf, dv, p, arguments[i], limit);
+        if (p < 0) break;
+      }
+      if (p >= 0) {
+        return _decodeSyncResult(call_sync(opId, _call(_TASubarray, buf, 0, p)));
+      }
+      const args = new _Array(n);
+      for (let i = 0; i < n; i++) args[i] = arguments[i];
+      return _decodeSyncResult(call_sync(opId, _encodeWireArgs(args)));
     };
   }
   _ObjectDefineProperty(fn, "name", { value: name, configurable: true });
@@ -2166,24 +2380,91 @@ function _makeSyncOp(opId, name) {
 }
 
 function _makeAsyncOp(opId, name) {
-  const fn = function (...args) {
+  let useBinary = false;
+  const fn = function () {
+    const n = arguments.length;
+    if (!useBinary) {
+      let resp;
+      try {
+        const jsonArgs = _tryEncodeStrArgs(arguments, n);
+        if (jsonArgs !== null) {
+          resp = start_async_str(opId, jsonArgs);
+        }
+      } catch (e) {
+        return _PromiseReject(e);
+      }
+      if (resp !== undefined) {
+        const tag = _call(_StrCharCodeAt, resp, 0);
+        if (tag === 112) { // 'p' pending
+          const id = _Number(_call(_StrSlice, resp, 1)) >>> 0;
+          let resolveFn, rejectFn;
+          const p = new _Promise((res, rej) => { resolveFn = res; rejectFn = rej; });
+          _call(_MapSet, _pendingAsyncOps, id, { resolve: resolveFn, reject: rejectFn, promise: p });
+          return p;
+        }
+        if (tag === 66) { // 'B' binary fallback
+          useBinary = true;
+          try {
+            return _PromiseResolve(_decodeSyncResult(call_sync(0x7fffffff, _emptyArgsWire)));
+          } catch (e) {
+            return _PromiseReject(e);
+          }
+        }
+        if (tag === 101) { // 'e'
+          return _PromiseReject(_decodeStrErr(resp));
+        }
+        if (tag !== 70) { // 'F' retry via binary (e.g. lone surrogate in string arg)
+          try {
+            return _PromiseResolve(_decodeStrValue(resp));
+          } catch (e) {
+            return _PromiseReject(e);
+          }
+        }
+      }
+    }
     let envBytes;
     try {
-      envBytes = start_async(opId, _encodeWireArgs(args));
+      let wire = null;
+      if (n === 0) {
+        wire = _emptyArgsWire;
+      } else {
+        const limit = _MathMin(4096, _maxOpArgBytes);
+        const buf = _wireScratch;
+        const dv = _wireScratchDV;
+        _call(_DVSetUint32, dv, 0, n >>> 0, true);
+        let p = 4;
+        for (let i = 0; i < n; i++) {
+          p = _tryFastEncodeLeaf(buf, dv, p, arguments[i], limit);
+          if (p < 0) break;
+        }
+        if (p >= 0) {
+          wire = _call(_TASubarray, buf, 0, p);
+        } else {
+          const args = new _Array(n);
+          for (let i = 0; i < n; i++) args[i] = arguments[i];
+          wire = _encodeWireArgs(args);
+        }
+      }
+      envBytes = start_async(opId, wire);
     } catch (e) {
       return _PromiseReject(e);
     }
-    const env = _decodeEnvelope(envBytes);
-    if (env.pending) {
+    _rInit(envBytes);
+    const status = _rU8();
+    if (status === ENV_PENDING) {
+      const id = _rU32();
       let resolveFn, rejectFn;
       const p = new _Promise((res, rej) => { resolveFn = res; rejectFn = rej; });
-      _call(_MapSet, _pendingAsyncOps, env.id, { resolve: resolveFn, reject: rejectFn, promise: p });
+      _call(_MapSet, _pendingAsyncOps, id, { resolve: resolveFn, reject: rejectFn, promise: p });
       return p;
     }
-    if (env.ok) {
-      return _PromiseResolve(env.value);
+    if (status === ENV_OK) {
+      return _PromiseResolve(_rValue());
     }
-    return _PromiseReject(env.error);
+    if (status === ENV_ERR) {
+      return _PromiseReject(_rBuildError());
+    }
+    return _PromiseReject(new _Error(`unknown wire envelope status ${status}`));
   };
   _ObjectDefineProperty(fn, "name", { value: name, configurable: true });
   return fn;
@@ -2301,6 +2582,21 @@ export function __dd_settle_async(pendingId, envBytes) {
     rec.resolve(env.value);
   } else {
     rec.reject(env.error);
+  }
+}
+
+export function __dd_settle_async_str(pendingId, resp) {
+  const rec = _call(_MapGet, _pendingAsyncOps, pendingId);
+  if (!rec) return;
+  _call(_MapDelete, _pendingAsyncOps, pendingId);
+  if (_call(_StrCharCodeAt, resp, 0) === 101) { // 'e'
+    rec.reject(_decodeStrErr(resp));
+    return;
+  }
+  try {
+    rec.resolve(_decodeStrValue(resp));
+  } catch (e) {
+    rec.reject(e);
   }
 }
 

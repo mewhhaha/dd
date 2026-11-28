@@ -118,18 +118,30 @@ pub struct TimeBoundary {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct MemoryReadValue {
-    pub(crate) value: dd_v8::ToJsBuffer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) value: Option<dd_v8::ToJsBuffer>,
     pub(crate) encoding: String,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryBatchApplied {
-    /// Whether the batch committed; one with nothing to commit is read-only.
-    pub(crate) applied: bool,
-    pub(crate) mutation_count: usize,
-    /// Whether the entry's later output waits for this commit's own (an
-    /// accepted socket, or effects) to go out first.
-    pub(crate) output_gate_required: bool,
+impl MemoryReadValue {
+    pub(crate) fn from_bytes(bytes: &[u8], encoding: String) -> Self {
+        if encoding == "utf8"
+            && let Ok(text) = std::str::from_utf8(bytes)
+        {
+            return Self {
+                text: Some(text.to_owned()),
+                value: None,
+                encoding,
+            };
+        }
+        Self {
+            text: None,
+            value: Some(bytes.to_vec().into()),
+            encoding,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

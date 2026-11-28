@@ -701,6 +701,7 @@ function guardFromHeaders(headers) {
 }
 
 return {
+  appendHeaderToList,
   fillHeaderList,
   fillHeaders,
   getDecodeSplitHeader,

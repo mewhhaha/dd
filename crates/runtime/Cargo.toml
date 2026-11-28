@@ -10,7 +10,7 @@ build = "build.rs"
 arc-swap.workspace = true
 common = { path = "../common" }
 storage = { path = "../storage" }
-dd_v8 = { path = "../dd_v8" }
+dd_v8 = { path = "../dd_v8", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true
@@ -63,7 +63,7 @@ default = []
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry"]
 
 [build-dependencies]
-dd_v8 = { path = "../dd_v8" }
+dd_v8 = { path = "../dd_v8", default-features = false }
 
 [dev-dependencies]
 serial_test.workspace = true

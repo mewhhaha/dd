@@ -98,6 +98,9 @@ const decodeMemoryStorageValue = (record) => {
   if (!record) {
     return null;
   }
+  if (record.text !== undefined && record.text !== null) {
+    return record.text;
+  }
   const encoding = String(record.encoding ?? "utf8");
   const bytes = takeMemoryBytes(record);
   if (encoding === "utf8") {
@@ -236,32 +239,6 @@ const closeMemoryCommand = (handle) => {
   }
 };
 
-const createMemoryTxn = async (entry, commandHandle) => {
-  const started = frozenPerfNow();
-  const pending = op_memory_batch_begin(
-    activeRequestContextHandle(),
-    memoryScopedScopeHandle(entry),
-    entry.binding,
-    entry.memoryKey,
-    commandHandle,
-  );
-  let batchHandle;
-  try {
-    try {
-      batchHandle = await pending;
-    } finally {
-      await syncFrozenTime();
-    }
-  } catch (error) {
-    if (isMemoryStorageFailure(error)) {
-      return await failMemoryEntry(entry, error);
-    }
-    throw error;
-  }
-  recordMemoryProfile("js_txn_begin", frozenPerfNow() - started, 1);
-  return new MemoryTxn(entry, batchHandle);
-};
-
 const closeMemoryBatch = (handle) => {
   const normalizedHandle = toHandle(handle);
   if (normalizedHandle > 0) {
@@ -299,32 +276,6 @@ const addMemoryBatchMutation = (txn, key, value, encoding, deleted) => {
   );
 };
 
-const finishMemoryTxn = async (txn) => {
-  if (!txn) {
-    return;
-  }
-  const started = frozenPerfNow();
-  let result;
-  try {
-    result = await op_memory_batch_apply(txn.batchHandle);
-  } finally {
-    await syncFrozenTime();
-  }
-  if (result.applied !== true) {
-    recordMemoryProfile("js_read_only_commit", frozenPerfNow() - started, 1);
-    return;
-  }
-  if (result.output_gate_required === true) {
-    await gateMemoryOutput(txn.entry, async () => undefined);
-  }
-  recordMemoryProfile(
-    "js_txn_commit",
-    frozenPerfNow() - started,
-    result.mutation_count + 1,
-  );
-};
-
-
 const memoryStorageKey = (key) => StringPrototypeToWellFormed(String(key));
 
 const compareMemoryKeys = (left, right) => {
@@ -359,61 +310,12 @@ const memoryListLimit = (options) => {
     : 100;
 };
 
-const createMemoryStorageBinding = (entry, txn) => {
-  const rejectStorageOptions = (operation, options) => {
-    if (
-      options
-      && typeof options === "object"
-      && ObjectKeys(options).length > 0
-    ) {
-      throw new Error(`memory atomic ${operation} options are unsupported`);
-    }
-  };
-  return {
-    __proto__: null,
-    get(key, options = {}) {
-      rejectStorageOptions("get", options);
-      const storageState = ensureMemoryStorageState(entry);
-      if (storageState.failedError) {
-        throw storageState.failedError;
-      }
-      const normalizedKey = memoryStorageKey(key);
-      const record = memoryTxnReadRecord(txn, normalizedKey);
-      if (!record) {
-        return null;
-      }
-      return new MemoryGetResult(decodeMemoryStorageValue(record));
-    },
-    put(key, value, options = {}) {
-      rejectStorageOptions("set", options);
-      const storageState = ensureMemoryStorageState(entry);
-      if (storageState.failedError) {
-        throw storageState.failedError;
-      }
-      const normalizedKey = memoryStorageKey(key);
-      const encoded = encodeMemoryStorageValue(value);
-      addMemoryBatchMutation(txn, normalizedKey, encoded.value, encoded.encoding, false);
-    },
-    delete(key, options = {}) {
-      rejectStorageOptions("delete", options);
-      const storageState = ensureMemoryStorageState(entry);
-      if (storageState.failedError) {
-        throw storageState.failedError;
-      }
-      const normalizedKey = memoryStorageKey(key);
-      addMemoryBatchMutation(txn, normalizedKey, new Uint8Array(), "utf8", true);
-    },
-    list(options = {}) {
-      const storageState = ensureMemoryStorageState(entry);
-      if (storageState.failedError) {
-        throw storageState.failedError;
-      }
-      const prefix = memoryStorageKey(options?.prefix ?? "");
-      return listMemoryEntries(
-        memoryTxnKeys(txn, prefix),
-        memoryListLimit(options),
-        (key) => decodeMemoryStorageValue(memoryTxnReadRecord(txn, key)),
-      );
-    },
-  };
+const rejectMemoryStorageOptions = (operation, options) => {
+  if (
+    options
+    && typeof options === "object"
+    && ObjectKeys(options).length > 0
+  ) {
+    throw new Error(`memory atomic ${operation} options are unsupported`);
+  }
 };

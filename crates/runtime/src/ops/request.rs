@@ -4,10 +4,37 @@ use dd_v8::ToJsBuffer;
 pub(super) fn op_request_invocation_take(
     state: &mut OpState,
     request_handle: u32,
-) -> Option<WorkerRequestPayload> {
-    state
+) -> Option<WorkerRequestTaken> {
+    let payload = state
         .borrow_mut::<RequestInvocationHandles>()
-        .remove(request_handle)
+        .remove(request_handle)?;
+    let headers = if payload.request_headers_handle > 0 {
+        state
+            .borrow_mut::<HttpPreparedHeaders>()
+            .take(payload.request_headers_handle)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let time = current_time_boundary();
+    Some(WorkerRequestTaken(
+        payload.request_id,
+        payload.request_context_handle,
+        payload.completion_handle,
+        payload.memory_request_scope_handle,
+        payload.memory_call,
+        payload.request_body_stream_handle,
+        payload.request_body_handle,
+        headers,
+        payload.stream_response,
+        payload.max_response_body_bytes,
+        payload.max_request_body_bytes,
+        payload.method,
+        payload.url,
+        payload.input_request_id,
+        time.now_ms,
+        time.perf_ms,
+    ))
 }
 
 pub(super) fn op_worker_deployment_take(

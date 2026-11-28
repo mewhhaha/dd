@@ -20,7 +20,10 @@ fn main() {
 
     let host = env::var("HOST").unwrap_or_default();
     let target = env::var("TARGET").unwrap_or_default();
-    if host != target || env::var_os("DD_SKIP_PRECOMPILE_KERNEL").is_some() {
+    if host != target
+        || env::var_os("DD_SKIP_PRECOMPILE_KERNEL").is_some()
+        || env::var_os("CARGO_FEATURE_EMBED_KERNEL").is_none()
+    {
         fs::write(&out_path, []).expect("write empty precompiled kernel placeholder");
         return;
     }
@@ -46,6 +49,38 @@ fn main() {
                     ForeignResultType::Bytes,
                 )
                 .expect("foreign decl start_async"),
+                ForeignFunctionDeclaration::new(
+                    "call_sync_str",
+                    "dd",
+                    "call_sync_str",
+                    vec![ForeignValueType::Number, ForeignValueType::StringUtf16],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl call_sync_str"),
+                ForeignFunctionDeclaration::new(
+                    "start_async_str",
+                    "dd",
+                    "start_async_str",
+                    vec![ForeignValueType::Number, ForeignValueType::StringUtf16],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl start_async_str"),
+                ForeignFunctionDeclaration::new(
+                    "utf8_encode",
+                    "dd",
+                    "utf8_encode",
+                    vec![ForeignValueType::StringUtf16],
+                    ForeignResultType::Bytes,
+                )
+                .expect("foreign decl utf8_encode"),
+                ForeignFunctionDeclaration::new(
+                    "utf8_decode",
+                    "dd",
+                    "utf8_decode",
+                    vec![ForeignValueType::Bytes, ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .expect("foreign decl utf8_decode"),
                 ForeignFunctionDeclaration::new(
                     "load_module",
                     "dd",

@@ -1,8 +1,10 @@
 use super::*;
 
-/// A stored value, its bytes waiting behind a handle.
+/// A stored value, its bytes waiting behind a handle or inlined for UTF-8 strings.
 #[derive(Debug, Serialize)]
 pub(crate) struct KvValue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     value_handle: u32,
     encoding: String,
 }
@@ -24,12 +26,24 @@ pub(crate) async fn op_kv_get(
     let started = Instant::now();
     let store = state.borrow().borrow::<KvStore>().clone();
     let result = match store.get(&worker_name, &binding, &key).await {
-        Ok(value) => Ok(value.map(|value| KvValue {
-            value_handle: state
-                .borrow_mut()
-                .borrow_mut::<HttpPreparedBodies>()
-                .insert(value.value),
-            encoding: value.encoding,
+        Ok(value) => Ok(value.map(|value| {
+            if value.encoding == "utf8"
+                && let Ok(text) = std::str::from_utf8(&value.value)
+            {
+                return KvValue {
+                    text: Some(text.to_owned()),
+                    value_handle: 0,
+                    encoding: value.encoding,
+                };
+            }
+            KvValue {
+                text: None,
+                value_handle: state
+                    .borrow_mut()
+                    .borrow_mut::<HttpPreparedBodies>()
+                    .insert(value.value),
+                encoding: value.encoding,
+            }
         })),
         Err(error) => Err(OpError::new(format!("kv get {key}: {error}"))),
     };

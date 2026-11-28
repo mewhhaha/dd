@@ -90,10 +90,9 @@ pub(super) fn memory_snapshot_record(
         .binary_search_by(|entry| entry.key.as_str().cmp(key))
         .ok()?;
     let entry = &snapshot.entries[index];
-    (!entry.deleted).then(|| MemoryReadValue {
-        // JavaScript receives its own mutable buffer, never the shared snapshot's storage.
-        value: entry.value.to_vec().into(),
-        encoding: entry.encoding.clone(),
+    (!entry.deleted).then(|| {
+        // JavaScript receives its own value, never the shared snapshot's storage.
+        MemoryReadValue::from_bytes(&entry.value, entry.encoding.clone())
     })
 }
 

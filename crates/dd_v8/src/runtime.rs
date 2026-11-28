@@ -10,8 +10,8 @@ use crate::modules::{
 use crate::ops::{OpDecl, OpError, OpKind, RawBuffer};
 use crate::platform;
 use crate::serde_v8::{
-    self, WireValue, decode_wire_args, encode_err_envelope, encode_ok_envelope,
-    encode_pending_envelope,
+    self, WireValue, decode_json_args, decode_wire_args, encode_err_envelope, encode_ok_envelope,
+    encode_pending_envelope, encode_str_err, encode_str_pending, str_to_utf16, try_encode_str_ok,
 };
 use crate::state::OpState;
 use crate::wasm_api::WasmHostState;
@@ -37,9 +37,17 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 
 const MAX_OPS_PER_TICK: usize = 1024;
+
+#[repr(C, align(65536))]
+struct PageAligned<T: ?Sized>(T);
+
 const KERNEL_MJS: &str = include_str!("kernel.mjs");
-const PRECOMPILED_KERNEL_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/dd_v8_kernel.wtmn"));
+static PRECOMPILED_KERNEL_STORAGE: PageAligned<
+    [u8; include_bytes!(concat!(env!("OUT_DIR"), "/dd_v8_kernel.wtmn")).len()],
+> = PageAligned(*include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/dd_v8_kernel.wtmn"
+)));
 const SNAPSHOT_MAGIC: &[u8; 8] = b"DDSW0001";
 
 #[derive(Default)]
@@ -168,6 +176,9 @@ fn shared_engine() -> Result<&'static wasmtime::Engine, Error> {
             // (`SizeOptimized` / `OptLevel::SpeedAndSize`) so embedded `R` and build-time
             // precompiled `P` images load directly without runtime recompilation.
             config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
+            // Keep per-isolate semi-space footprint tight (grows automatically on demand
+            // up to the 8 GiB virtual reservation and shrinks back after transient bursts).
+            config.gc_heap_initial_size(12 << 20);
             // Allow unbounded runtimes (e.g. >2 GiB typed-array views plus wire copies)
             // to use the full 8 GiB virtual semi-space reserved by wtime-aot-host.
             config.gc_heap_reservation(8u64 << 30);
@@ -198,6 +209,38 @@ fn dd_foreign_registry() -> Result<ForeignModuleRegistry, Error> {
                     ForeignResultType::Bytes,
                 )
                 .map_err(|e| Error::new(format!("foreign decl start_async: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "call_sync_str",
+                    "dd",
+                    "call_sync_str",
+                    vec![ForeignValueType::Number, ForeignValueType::StringUtf16],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl call_sync_str: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "start_async_str",
+                    "dd",
+                    "start_async_str",
+                    vec![ForeignValueType::Number, ForeignValueType::StringUtf16],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl start_async_str: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "utf8_encode",
+                    "dd",
+                    "utf8_encode",
+                    vec![ForeignValueType::StringUtf16],
+                    ForeignResultType::Bytes,
+                )
+                .map_err(|e| Error::new(format!("foreign decl utf8_encode: {e}")))?,
+                ForeignFunctionDeclaration::new(
+                    "utf8_decode",
+                    "dd",
+                    "utf8_decode",
+                    vec![ForeignValueType::Bytes, ForeignValueType::Number],
+                    ForeignResultType::StringUtf16,
+                )
+                .map_err(|e| Error::new(format!("foreign decl utf8_decode: {e}")))?,
                 ForeignFunctionDeclaration::new(
                     "load_module",
                     "dd",
@@ -236,8 +279,9 @@ fn dd_foreign_registry() -> Result<ForeignModuleRegistry, Error> {
 static PRECOMPILED_BUNDLES: LazyLock<Mutex<HashMap<[u8; 32], &'static [u8]>>> =
     LazyLock::new(|| {
         let mut map = HashMap::new();
-        if !PRECOMPILED_KERNEL_BYTES.is_empty() {
-            map.insert(bundle_source_sha256(KERNEL_MJS), PRECOMPILED_KERNEL_BYTES);
+        let kernel_bytes: &'static [u8] = &PRECOMPILED_KERNEL_STORAGE.0;
+        if !kernel_bytes.is_empty() {
+            map.insert(bundle_source_sha256(KERNEL_MJS), kernel_bytes);
         }
         Mutex::new(map)
     });
@@ -442,6 +486,7 @@ struct RuntimeState {
     wasm: RefCell<WasmHostState>,
     inspector: Arc<OnceLock<InspectorHandle>>,
     last_wire_out: RefCell<Vec<u8>>,
+    pending_bytes_fallback: RefCell<Option<Vec<u8>>>,
 }
 
 impl RuntimeState {
@@ -484,7 +529,7 @@ struct KernelExports {
     wire_to_js: ScriptwJsValue,
     js_to_wire: ScriptwJsValue,
     settle_async: ScriptwJsValue,
-    take_unhandled_rejection: ScriptwJsValue,
+    settle_async_str: ScriptwJsValue,
     register_module: ScriptwJsValue,
     eval_module: ScriptwJsValue,
     module_namespace: ScriptwJsValue,
@@ -727,6 +772,7 @@ impl JsRuntime {
             wasm: RefCell::new(WasmHostState::new()),
             inspector: Arc::clone(&inspector_handle),
             last_wire_out: RefCell::new(Vec::new()),
+            pending_bytes_fallback: RefCell::new(None),
         });
 
         if will_snapshot {
@@ -1393,10 +1439,11 @@ impl JsRuntime {
         }
 
         // 3. Deliver settled async results back to JS Promises.
+        let settled_any = !settled.is_empty();
         for (id, result) in settled {
-            let env_bytes = match result {
-                Ok(val) => encode_ok_envelope(&val),
-                Err(err) => encode_err_envelope(&err),
+            let str_opt = match &result {
+                Ok(val) => try_encode_str_ok(val),
+                Err(err) => Some(encode_str_err(err)),
             };
             let vm = self.vm.as_mut().expect("live vm");
             let id_v = match vm
@@ -1406,30 +1453,47 @@ impl JsRuntime {
                 Ok(v) => v,
                 Err(e) => return Poll::Ready(Err(map_engine_err(&self.terminated, e))),
             };
-            let bytes_v = match vm
-                .instance
-                .value(&mut vm.store, ForeignValue::Bytes(env_bytes))
-            {
-                Ok(v) => v,
-                Err(e) => return Poll::Ready(Err(map_engine_err(&self.terminated, e))),
-            };
-            if let Err(err) = call_js(
-                vm,
-                &self.terminated,
-                &vm.exports.settle_async.clone(),
-                &[id_v, bytes_v],
-            ) {
-                return Poll::Ready(Err(err));
+            if let Some(str_u16) = str_opt {
+                let str_v = match vm
+                    .instance
+                    .value(&mut vm.store, ForeignValue::StringUtf16(str_u16))
+                {
+                    Ok(v) => v,
+                    Err(e) => return Poll::Ready(Err(map_engine_err(&self.terminated, e))),
+                };
+                if let Err(err) = call_js(
+                    vm,
+                    &self.terminated,
+                    &vm.exports.settle_async_str.clone(),
+                    &[id_v, str_v],
+                ) {
+                    return Poll::Ready(Err(err));
+                }
+            } else {
+                let env_bytes = match result {
+                    Ok(val) => encode_ok_envelope(&val),
+                    Err(err) => encode_err_envelope(&err),
+                };
+                let bytes_v = match vm
+                    .instance
+                    .value(&mut vm.store, ForeignValue::Bytes(env_bytes))
+                {
+                    Ok(v) => v,
+                    Err(e) => return Poll::Ready(Err(map_engine_err(&self.terminated, e))),
+                };
+                if let Err(err) = call_js(
+                    vm,
+                    &self.terminated,
+                    &vm.exports.settle_async.clone(),
+                    &[id_v, bytes_v],
+                ) {
+                    return Poll::Ready(Err(err));
+                }
             }
         }
 
         // 4. Drain microtasks queued by settled Promises.
-        if let Err(err) = self.pump_microtasks() {
-            return Poll::Ready(Err(err));
-        }
-
-        // 5. Check for unhandled promise rejections.
-        if let Some(err) = self.take_unhandled_rejection() {
+        if settled_any && let Err(err) = self.pump_microtasks() {
             return Poll::Ready(Err(err));
         }
 
@@ -1489,23 +1553,6 @@ impl JsRuntime {
         }
     }
 
-    fn take_unhandled_rejection(&mut self) -> Option<Error> {
-        let vm = self.vm.as_mut()?;
-        let val = call_js(
-            vm,
-            &self.terminated,
-            &vm.exports.take_unhandled_rejection.clone(),
-            &[],
-        )
-        .ok()?;
-        let text = js_value_to_rust_string(&mut vm.store, &val).ok()?;
-        if text.is_empty() {
-            None
-        } else {
-            Some(Error::new(format!("Uncaught (in promise) {text}")))
-        }
-    }
-
     /// Returns the generated ES module source for all recorded snapshot steps
     /// without compiling or executing it (used by `build.rs` to precompile the
     /// exact same bundle that [`Self::snapshot`] will load).
@@ -1531,12 +1578,17 @@ impl JsRuntime {
             .take()
             .ok_or_else(|| Error::new("runtime was not created with new_for_snapshot"))?;
         let bundle_src = recorder.generate_bundle_mjs();
+        let is_precompiled = has_precompiled_bundle(bundle_source_sha256(&bundle_src));
         let runtime = compile_embedded_module(&bundle_src)?;
 
-        // Validate the compiled snapshot immediately by running `__dd_run_snapshot`
-        // once inside a throwaway Store (catches any JS bootstrap error eagerly).
-        let (test_vm, _) = instantiate_vm(&runtime, &self.state, self.max_heap_bytes, true)?;
-        drop(test_vm);
+        // Validate dynamically-compiled snapshots immediately inside a throwaway Store
+        // (catches JS bootstrap errors eagerly). Build-time precompiled bundles skip this
+        // eager instantiation so idle servers avoid faulting bootstrap code pages until a
+        // worker actually starts.
+        if !is_precompiled {
+            let (test_vm, _) = instantiate_vm(&runtime, &self.state, self.max_heap_bytes, true)?;
+            drop(test_vm);
+        }
 
         let op_names: Vec<String> = self
             .state
@@ -1678,7 +1730,7 @@ fn instantiate_vm(
         wire_to_js: get_exp(&mut store, "__dd_wire_to_js")?,
         js_to_wire: get_exp(&mut store, "__dd_js_to_wire")?,
         settle_async: get_exp(&mut store, "__dd_settle_async")?,
-        take_unhandled_rejection: get_exp(&mut store, "__dd_take_unhandled_rejection")?,
+        settle_async_str: get_exp(&mut store, "__dd_settle_async_str")?,
         register_module: get_exp(&mut store, "__dd_register_module")?,
         eval_module: get_exp(&mut store, "__dd_eval_module")?,
         module_namespace: get_exp(&mut store, "__dd_module_namespace")?,
@@ -1718,6 +1770,11 @@ fn instantiate_vm(
         &init_fn,
         &[specs_v, budget_v, async_ctx_v],
     )?;
+    // Compact one-time bootstrap garbage immediately so fresh isolates do not pin dead
+    // initialization pages in RSS.
+    if run_snapshot_export {
+        let _ = vm.store.gc(None);
+    }
 
     Ok((vm, interrupt))
 }
@@ -1746,6 +1803,16 @@ fn register_dd_foreigns(
             // SAFETY: Synchronous call inside `&mut JsRuntime`.
             let state = unsafe { &*state_ptr };
             let op_id = *op_id_f as usize;
+            if op_id == 0x7fff_ffff {
+                let bytes = state
+                    .pending_bytes_fallback
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(|| {
+                        encode_err_envelope(&OpError::new("missing bytes fallback"))
+                    });
+                return Ok(ForeignValue::Bytes(bytes));
+            }
             let Some(op) = state.ops.get(op_id) else {
                 return Ok(ForeignValue::Bytes(encode_err_envelope(&OpError::new(
                     format!("unknown op id {op_id}"),
@@ -1849,6 +1916,177 @@ fn register_dd_foreigns(
             Ok(ForeignValue::Bytes(encode_pending_envelope(id)))
         })
         .map_err(|e| Error::new(format!("register_foreign start_async: {e}")))?;
+
+    // 2b. `dd.call_sync_str(op_id: f64, args_json: StringUtf16) -> StringUtf16`
+    embedded
+        .register_foreign(linker, "dd", "call_sync_str", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::StringUtf16(arg_units),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(encode_str_err(
+                    &OpError::type_error("invalid call_sync_str arguments"),
+                )));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            let op_id = *op_id_f as usize;
+            let Some(op) = state.ops.get(op_id) else {
+                return Ok(ForeignValue::StringUtf16(encode_str_err(&OpError::new(
+                    format!("unknown op id {op_id}"),
+                ))));
+            };
+            let decoded = match decode_json_args(arg_units, state.max_op_argument_bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+                }
+            };
+            let result = match &op.kind {
+                OpKind::Sync(f) => f(&state.op_state, &decoded),
+                _ => Err(OpError::new(format!("op {} is not synchronous", op.name))),
+            };
+            let out = match result {
+                Ok(v) => match try_encode_str_ok(&v) {
+                    Some(encoded) => encoded,
+                    None => {
+                        *state.pending_bytes_fallback.borrow_mut() = Some(encode_ok_envelope(&v));
+                        vec![u16::from(b'B')]
+                    }
+                },
+                Err(e) => encode_str_err(&e),
+            };
+            Ok(ForeignValue::StringUtf16(out))
+        })
+        .map_err(|e| Error::new(format!("register_foreign call_sync_str: {e}")))?;
+
+    // 2c. `dd.start_async_str(op_id: f64, args_json: StringUtf16) -> StringUtf16`
+    embedded
+        .register_foreign(linker, "dd", "start_async_str", |caller, args| {
+            let [
+                ForeignValue::Number(op_id_f),
+                ForeignValue::StringUtf16(arg_units),
+            ] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(encode_str_err(
+                    &OpError::type_error("invalid start_async_str arguments"),
+                )));
+            };
+            let state_ptr = caller
+                .data()
+                .user_data::<StatePtr>()
+                .ok_or_else(|| wasmtime::Error::msg("missing RuntimeState"))?
+                .0;
+            // SAFETY: Synchronous call inside `&mut JsRuntime`.
+            let state = unsafe { &*state_ptr };
+            let op_id = *op_id_f as usize;
+            let Some(op) = state.ops.get(op_id) else {
+                return Ok(ForeignValue::StringUtf16(encode_str_err(&OpError::new(
+                    format!("unknown op id {op_id}"),
+                ))));
+            };
+            let decoded = match decode_json_args(arg_units, state.max_op_argument_bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(ForeignValue::StringUtf16(vec![u16::from(b'F')]));
+                }
+            };
+            let mut fut = match &op.kind {
+                OpKind::Async(f) => match f(&state.op_state, &decoded) {
+                    Ok(fut) => fut,
+                    Err(e) => return Ok(ForeignValue::StringUtf16(encode_str_err(&e))),
+                },
+                _ => {
+                    return Ok(ForeignValue::StringUtf16(encode_str_err(&OpError::new(
+                        format!("op {} is not async", op.name),
+                    ))));
+                }
+            };
+            if tokio::runtime::Handle::try_current().is_ok() {
+                match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                    Poll::Ready(Ok(v)) => {
+                        let out = match try_encode_str_ok(&v) {
+                            Some(encoded) => encoded,
+                            None => {
+                                *state.pending_bytes_fallback.borrow_mut() =
+                                    Some(encode_ok_envelope(&v));
+                                vec![u16::from(b'B')]
+                            }
+                        };
+                        return Ok(ForeignValue::StringUtf16(out));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        return Ok(ForeignValue::StringUtf16(encode_str_err(&e)));
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            let id = state.alloc_pending_id();
+            state
+                .pending_ops
+                .borrow_mut()
+                .push(PendingOp { id, future: fut });
+            state.waker.wake();
+            Ok(ForeignValue::StringUtf16(encode_str_pending(id)))
+        })
+        .map_err(|e| Error::new(format!("register_foreign start_async_str: {e}")))?;
+
+    // 2d. `dd.utf8_encode(text: StringUtf16) -> Bytes`
+    embedded
+        .register_foreign(linker, "dd", "utf8_encode", |_caller, args| {
+            let [ForeignValue::StringUtf16(units)] = args.as_slice() else {
+                return Ok(ForeignValue::Bytes(Vec::new()));
+            };
+            if units.iter().all(|&u| u < 0x80) {
+                return Ok(ForeignValue::Bytes(
+                    units.iter().map(|&u| u as u8).collect(),
+                ));
+            }
+            let mut out = Vec::with_capacity(units.len() * 3);
+            let mut buf = [0u8; 4];
+            for ch in std::char::decode_utf16(units.iter().copied()) {
+                let c = ch.unwrap_or('\u{FFFD}');
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Ok(ForeignValue::Bytes(out))
+        })
+        .map_err(|e| Error::new(format!("register_foreign utf8_encode: {e}")))?;
+
+    // 2e. `dd.utf8_decode(bytes: Bytes, strip_bom: f64) -> StringUtf16`
+    embedded
+        .register_foreign(linker, "dd", "utf8_decode", |_caller, args| {
+            let [ForeignValue::Bytes(bytes), ForeignValue::Number(strip_bom)] = args.as_slice()
+            else {
+                return Ok(ForeignValue::StringUtf16(Vec::new()));
+            };
+            let slice = if *strip_bom != 0.0
+                && bytes.len() >= 3
+                && bytes[0] == 0xEF
+                && bytes[1] == 0xBB
+                && bytes[2] == 0xBF
+            {
+                &bytes[3..]
+            } else {
+                bytes.as_slice()
+            };
+            if slice.is_empty() {
+                return Ok(ForeignValue::StringUtf16(Vec::new()));
+            }
+            if slice.is_ascii() {
+                return Ok(ForeignValue::StringUtf16(
+                    slice.iter().map(|&b| u16::from(b)).collect(),
+                ));
+            }
+            let s = String::from_utf8_lossy(slice);
+            Ok(ForeignValue::StringUtf16(str_to_utf16(&s)))
+        })
+        .map_err(|e| Error::new(format!("register_foreign utf8_decode: {e}")))?;
 
     // 3. `dd.load_module(specifier: StringUtf16, referrer: StringUtf16, kind: StringUtf16) -> Bytes`
     embedded

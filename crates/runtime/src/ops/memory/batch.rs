@@ -183,7 +183,7 @@ pub(in crate::ops) async fn op_memory_batch_begin(
     binding: String,
     key: String,
     command_handle: u32,
-) -> std::result::Result<u32, OpError> {
+) -> std::result::Result<(u32, u64, f64), OpError> {
     #[cfg(test)]
     if let Some(failure) = state.borrow_mut().try_take::<MemoryBatchBeginFailure>() {
         return Err(if failure.storage {
@@ -210,11 +210,9 @@ pub(in crate::ops) async fn op_memory_batch_begin(
         .snapshot(&scope.namespace, &scope.memory_key)
         .await
         .map_err(|error| OpError::custom(MEMORY_STORAGE_FAILURE, error.to_string()))?;
-    store.record_profile(
-        MemoryProfileMetricKind::OpSnapshot,
-        started.elapsed().as_micros() as u64,
-        1,
-    );
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    store.record_profile(MemoryProfileMetricKind::OpSnapshot, elapsed_us, 1);
+    store.record_profile(MemoryProfileMetricKind::JsTxnBegin, elapsed_us, 1);
     // Existing oversized entities must remain writable so a callback can delete
     // or shrink their values. Storage checks the projected size before commit.
     if state
@@ -239,11 +237,13 @@ pub(in crate::ops) async fn op_memory_batch_begin(
         mutations: Vec::new(),
         effects: Vec::new(),
     };
-    state
+    let handle = state
         .borrow_mut()
         .borrow_mut::<MemoryBatchHandles>()
         .insert(batch, MEMORY_MAX_BATCH_HANDLES_PER_REQUEST)
-        .map_err(js_error)
+        .map_err(js_error)?;
+    let time = current_time_boundary();
+    Ok((handle, time.now_ms, time.perf_ms))
 }
 
 pub(in crate::ops) fn op_memory_batch_close(state: &mut OpState, batch_handle: u32) {
@@ -300,6 +300,22 @@ pub(in crate::ops) fn op_memory_batch_write(
     stage_memory_batch_mutation(batch, next).map_err(js_error)
 }
 
+pub(in crate::ops) fn op_memory_batch_write_utf8(
+    state: &mut OpState,
+    batch_handle: u32,
+    key: String,
+    value: String,
+) -> std::result::Result<(), OpError> {
+    let batch = memory_batch_handle_mut(state, batch_handle)?;
+    let next = MemoryBatchMutation {
+        key,
+        value: Bytes::from(value.into_bytes()),
+        encoding: "utf8".to_string(),
+        deleted: false,
+    };
+    stage_memory_batch_mutation(batch, next).map_err(js_error)
+}
+
 /// The value the batch holds for `key`, its own writes over its snapshot, or
 /// `null` when it holds none.
 pub(in crate::ops) fn op_memory_batch_get(
@@ -310,10 +326,8 @@ pub(in crate::ops) fn op_memory_batch_get(
     let batch = memory_batch_handle(state, batch_handle)?;
     Ok(
         if let Some(mutation) = batch.mutations.iter().find(|mutation| mutation.key == key) {
-            (!mutation.deleted).then(|| MemoryReadValue {
-                value: mutation.value.to_vec().into(),
-                encoding: mutation.encoding.clone(),
-            })
+            (!mutation.deleted)
+                .then(|| MemoryReadValue::from_bytes(&mutation.value, mutation.encoding.clone()))
         } else {
             memory_snapshot_record(&batch.snapshot, &key)
         },
@@ -435,7 +449,7 @@ pub(super) fn close_memory_command_for_committed_batch(
 pub(in crate::ops) async fn op_memory_batch_apply(
     state: Rc<RefCell<OpState>>,
     batch_handle: u32,
-) -> std::result::Result<MemoryBatchApplied, OpError> {
+) -> std::result::Result<(bool, usize, bool, u64, f64), OpError> {
     let started = std::time::Instant::now();
     let mut batch = state
         .borrow_mut()
@@ -445,11 +459,14 @@ pub(in crate::ops) async fn op_memory_batch_apply(
     let mutation_count = batch.mutations.len();
     let effect_count = batch.effects.len();
     if !memory_batch_requires_commit(&batch) {
-        return Ok(MemoryBatchApplied {
-            applied: false,
-            mutation_count,
-            output_gate_required: false,
-        });
+        let store = state.borrow().borrow::<MemoryStore>().clone();
+        store.record_profile(
+            MemoryProfileMetricKind::JsReadOnlyCommit,
+            started.elapsed().as_micros() as u64,
+            1,
+        );
+        let time = current_time_boundary();
+        return Ok((false, mutation_count, false, time.now_ms, time.perf_ms));
     }
     let owner_epoch = memory_batch_commit_owner_epoch(&batch).map_err(js_error)?;
     let command_result = memory_command_result_for_batch(&state, &batch).map_err(js_error)?;
@@ -469,14 +486,16 @@ pub(in crate::ops) async fn op_memory_batch_apply(
         .await
         .map_err(js_error)?;
     close_memory_command_for_committed_batch(&state, &batch);
-    store.record_profile(
-        MemoryProfileMetricKind::OpApplyBatch,
-        started.elapsed().as_micros() as u64,
-        mutation_count as u64 + 1,
-    );
-    Ok(MemoryBatchApplied {
-        applied: true,
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    let items = mutation_count as u64 + 1;
+    store.record_profile(MemoryProfileMetricKind::OpApplyBatch, elapsed_us, items);
+    store.record_profile(MemoryProfileMetricKind::JsTxnCommit, elapsed_us, items);
+    let time = current_time_boundary();
+    Ok((
+        true,
         mutation_count,
-        output_gate_required: batch.accepted || effect_count > 0,
-    })
+        batch.accepted || effect_count > 0,
+        time.now_ms,
+        time.perf_ms,
+    ))
 }

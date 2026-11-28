@@ -62,7 +62,7 @@ const normalizeFetchInput = async (inputValue, initValue, service = false) => {
   const current = currentRequestContext();
   const signal = AbortSignalAny(new SafeArrayIterator([
     RequestPrototypeGetSignal(request),
-    AbortControllerPrototypeGetSignal(current.controller),
+    requestSignalOf(current),
   ]));
   const body = await readFetchBody(
     request,

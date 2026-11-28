@@ -102,90 +102,158 @@ const createMemorySocketRuntime = (entry, allowSocketAccept, handles) => {
   };
 };
 
+class MemoryAtomicState {
+  #entry;
+  #txn;
+  #ensureSocketRuntime;
+  #id;
+  #sockets;
+  constructor(entry, txn, ensureSocketRuntime) {
+    this.#entry = entry;
+    this.#txn = txn;
+    this.#ensureSocketRuntime = ensureSocketRuntime;
+    this.#id = null;
+    this.#sockets = null;
+  }
+  #assertActive() {
+    if (!this.#txn.callbackActive) {
+      throw new Error("memory transaction is outside its synchronous callback");
+    }
+  }
+  get id() {
+    if (this.#id === null) {
+      this.#id = createMemoryId(this.#entry.binding, this.#entry.memoryKey);
+    }
+    return this.#id;
+  }
+  get sockets() {
+    if (this.#sockets === null) {
+      const self = this;
+      this.#sockets = ObjectFreeze({
+        values() {
+          self.#assertActive();
+          return self.#ensureSocketRuntime().sockets.values();
+        },
+        send(handle, payload) {
+          self.#assertActive();
+          stageMemoryTxnEffect(
+            self.#txn,
+            "socket.send",
+            encodeMemorySocketSendEffect(String(handle), encodeSocketSendPayload(payload)),
+          );
+        },
+        close(handle, code = 1000, reason = "") {
+          self.#assertActive();
+          stageMemoryTxnEffect(
+            self.#txn,
+            "socket.close",
+            encodeMemoryCloseEffect(String(handle), code, reason),
+          );
+        },
+      });
+    }
+    return this.#sockets;
+  }
+  get(key, options = undefined) {
+    this.#assertActive();
+    if (options !== undefined) rejectMemoryStorageOptions("get", options);
+    const storageState = this.#entry.storageState;
+    if (storageState?.failedError) {
+      throw storageState.failedError;
+    }
+    const normalizedKey = memoryStorageKey(key);
+    const record = memoryTxnReadRecord(this.#txn, normalizedKey);
+    return record ? decodeMemoryStorageValue(record) : null;
+  }
+  put(key, value, options = undefined) {
+    this.#assertActive();
+    if (options !== undefined) rejectMemoryStorageOptions("set", options);
+    const storageState = this.#entry.storageState;
+    if (storageState?.failedError) {
+      throw storageState.failedError;
+    }
+    const normalizedKey = memoryStorageKey(key);
+    if (typeof value === "string") {
+      op_memory_batch_write_utf8(this.#txn.batchHandle, normalizedKey, value);
+      return;
+    }
+    const encoded = encodeMemoryStorageValue(value);
+    addMemoryBatchMutation(this.#txn, normalizedKey, encoded.value, encoded.encoding, false);
+  }
+  delete(key, options = undefined) {
+    this.#assertActive();
+    if (options !== undefined) rejectMemoryStorageOptions("delete", options);
+    const storageState = this.#entry.storageState;
+    if (storageState?.failedError) {
+      throw storageState.failedError;
+    }
+    const normalizedKey = memoryStorageKey(key);
+    const existed = memoryTxnReadRecord(this.#txn, normalizedKey) !== null;
+    addMemoryBatchMutation(this.#txn, normalizedKey, EMPTY_BYTES, "utf8", true);
+    return existed;
+  }
+  list(options = undefined) {
+    this.#assertActive();
+    const storageState = this.#entry.storageState;
+    if (storageState?.failedError) {
+      throw storageState.failedError;
+    }
+    const prefix = memoryStorageKey(options?.prefix ?? "");
+    const txn = this.#txn;
+    return listMemoryEntries(
+      memoryTxnKeys(txn, prefix),
+      memoryListLimit(options),
+      (k) => decodeMemoryStorageValue(memoryTxnReadRecord(txn, k)),
+    );
+  }
+  emit(kind, payload = null) {
+    this.#assertActive();
+    const normalizedKind = StringPrototypeTrim(String(kind ?? ""));
+    if (!normalizedKind) {
+      throw new Error("state.emit(kind, payload) requires a non-empty kind");
+    }
+    stageMemoryTxnEffect(
+      this.#txn,
+      normalizedKind,
+      toBytes(JSONStringify(payload ?? null)),
+    );
+  }
+  accept(request) {
+    this.#assertActive();
+    const accepted = this.#ensureSocketRuntime().sockets.accept(request);
+    markMemoryBatchAccepted(this.#txn);
+    const response = new Response(
+      accepted.response.body ?? null,
+      new ResponseInit(accepted.response.status ?? 101, undefined),
+    );
+    appendHeaderPairs(
+      ResponsePrototypeGetHeaders(response),
+      headerPairs(accepted.response.headers),
+    );
+    return {
+      handle: accepted.handle,
+      response,
+    };
+  }
+}
+
 const createMemoryAtomicState = (
   entry,
   txn,
-  socketRuntime,
-) => {
-  const storage = createMemoryStorageBinding(entry, txn);
-  const assertActive = () => {
-    if (!txn.callbackActive) {
-      throw new Error("memory transaction is outside its synchronous callback");
-    }
-  };
-  return ObjectFreeze({
-    id: createMemoryId(entry.binding, entry.memoryKey),
-    get(key, options) {
-      assertActive();
-      return storage.get(key, options)?.value ?? null;
-    },
-    put(key, value, options) {
-      assertActive();
-      storage.put(key, value, options);
-    },
-    delete(key, options) {
-      assertActive();
-      const existed = storage.get(key) !== null;
-      storage.delete(key, options);
-      return existed;
-    },
-    list(options) {
-      assertActive();
-      return storage.list(options);
-    },
-    sockets: ObjectFreeze({
-      values() {
-        assertActive();
-        return socketRuntime.sockets.values();
-      },
-      send(handle, payload) {
-        assertActive();
-        stageMemoryTxnEffect(txn, "socket.send", encodeMemorySocketSendEffect(String(handle), encodeSocketSendPayload(payload)));
-      },
-      close(handle, code = 1000, reason = "") {
-        assertActive();
-        stageMemoryTxnEffect(txn, "socket.close", encodeMemoryCloseEffect(String(handle), code, reason));
-      },
-    }),
-    emit(kind, payload = null) {
-      assertActive();
-      const normalizedKind = StringPrototypeTrim(String(kind ?? ""));
-      if (!normalizedKind) {
-        throw new Error("state.emit(kind, payload) requires a non-empty kind");
-      }
-      stageMemoryTxnEffect(
-        txn,
-        normalizedKind,
-        toBytes(JSONStringify(payload ?? null)),
-      );
-    },
-    accept(request) {
-      assertActive();
-      const accepted = socketRuntime.sockets.accept(request);
-      markMemoryBatchAccepted(txn);
-      const response = new Response(
-        accepted.response.body ?? null,
-        new ResponseInit(accepted.response.status ?? 101, undefined),
-      );
-      appendHeaderPairs(
-        ResponsePrototypeGetHeaders(response),
-        headerPairs(accepted.response.headers),
-      );
-      return {
-        handle: accepted.handle,
-        response,
-      };
-    },
-  });
-};
+  ensureSocketRuntime,
+) => ObjectFreeze(new MemoryAtomicState(entry, txn, ensureSocketRuntime));
 
-const createMemoryId = (bindingName, memoryKey) => ({
-  __dd_memory_key: memoryKey,
-  __dd_memory_binding: bindingName,
+class MemoryId {
+  constructor(bindingName, memoryKey) {
+    this.__dd_memory_key = memoryKey;
+    this.__dd_memory_binding = bindingName;
+  }
   toString() {
-    return memoryKey;
-  },
-});
+    return this.__dd_memory_key;
+  }
+}
+
+const createMemoryId = (bindingName, memoryKey) => new MemoryId(bindingName, memoryKey);
 
 const ensureMemoryEntry = (binding, memoryKey) => {
   const current = currentRequestContext(false)?.memoryEntry;

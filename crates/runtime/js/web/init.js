@@ -76,13 +76,14 @@ const { URLPattern } = core.loadExtScript("ext:vendor/web/01_urlpattern.js");
 const { performance } = core.loadExtScript("ext:vendor/web/15_performance.js");
 const { Headers } = core.loadExtScript("ext:vendor/fetch/20_headers.js");
 const { FormData } = core.loadExtScript("ext:vendor/fetch/21_formdata.js");
-const { Request } = core.loadExtScript("ext:vendor/fetch/23_request.js");
-const { Response } = core.loadExtScript("ext:vendor/fetch/23_response.js");
-
+const { fromHostRequest, Request } = core.loadExtScript("ext:vendor/fetch/23_request.js");
 const {
   fromInnerResponse,
+  getResponseHeaderPairs,
   newInnerResponse,
   nullBodyStatus,
+  Response,
+  tryTakeStaticResponseBody,
 } = core.loadExtScript("ext:vendor/fetch/23_response.js");
 const { InnerBody } = core.loadExtScript("ext:vendor/fetch/22_body.js");
 const {
@@ -353,6 +354,9 @@ ObjectDefineProperty(ddRuntime, "crypto", {
 
 dd.web = ddRuntime;
 dd.webPrimordials = webPrimordials;
+dd.fromHostRequest = fromHostRequest;
+dd.getResponseHeaderPairs = getResponseHeaderPairs;
+dd.tryTakeStaticResponseBody = tryTakeStaticResponseBody;
 dd.headerPairs = headerPairs;
 dd.appendHeaderPairs = appendHeaderPairs;
 dd.hostFetchResponse = hostFetchResponse;

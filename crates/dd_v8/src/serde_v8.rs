@@ -234,6 +234,170 @@ pub fn encode_pending_envelope(pending_id: u32) -> Vec<u8> {
     out
 }
 
+/// Fast UTF-16 conversion with an ASCII fast path (auto-vectorizable).
+#[inline]
+pub fn str_to_utf16(s: &str) -> Vec<u16> {
+    if s.is_ascii() {
+        s.as_bytes().iter().map(|&b| u16::from(b)).collect()
+    } else {
+        s.encode_utf16().collect()
+    }
+}
+
+/// Decodes a JSON array encoded as UTF-16 code units into `Vec<WireValue>`.
+pub fn decode_json_args(units: &[u16], max_bytes: usize) -> Result<Vec<WireValue>> {
+    if units.len().saturating_mul(2) > max_bytes {
+        return Err(Error::new("op argument exceeds maximum size"));
+    }
+    let text = if units.iter().all(|&u| u < 0x80) {
+        let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+        // SAFETY: all bytes are < 0x80 (valid UTF-8).
+        unsafe { String::from_utf8_unchecked(bytes) }
+    } else {
+        String::from_utf16_lossy(units)
+    };
+    let val: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| Error::new(format!("invalid json args: {e}")))?;
+    let serde_json::Value::Array(items) = val else {
+        return Err(Error::new("json args must be an array"));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(json_to_wire(item));
+    }
+    Ok(out)
+}
+
+fn json_to_wire(v: serde_json::Value) -> WireValue {
+    match v {
+        serde_json::Value::Null => WireValue::Null,
+        serde_json::Value::Bool(b) => WireValue::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64()
+                && (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&i)
+            {
+                WireValue::I32(i as i32)
+            } else {
+                WireValue::F64(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => WireValue::String(s),
+        serde_json::Value::Array(arr) => {
+            WireValue::Array(arr.into_iter().map(json_to_wire).collect())
+        }
+        serde_json::Value::Object(map) => WireValue::Object(
+            map.into_iter()
+                .map(|(k, val)| (k, json_to_wire(val)))
+                .collect(),
+        ),
+    }
+}
+
+fn wire_to_json(val: &WireValue) -> Option<serde_json::Value> {
+    match val {
+        WireValue::Null => Some(serde_json::Value::Null),
+        WireValue::Bool(b) => Some(serde_json::Value::Bool(*b)),
+        WireValue::I32(n) => Some(serde_json::Value::Number(serde_json::Number::from(*n))),
+        WireValue::F64(x) => {
+            if !x.is_finite() || (*x == 0.0 && x.is_sign_negative()) {
+                return None;
+            }
+            serde_json::Number::from_f64(*x).map(serde_json::Value::Number)
+        }
+        WireValue::String(s) => Some(serde_json::Value::String(s.clone())),
+        WireValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(wire_to_json(item)?);
+            }
+            Some(serde_json::Value::Array(out))
+        }
+        WireValue::Object(entries) => {
+            let mut map = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                map.insert(k.clone(), wire_to_json(v)?);
+            }
+            Some(serde_json::Value::Object(map))
+        }
+        WireValue::Undefined | WireValue::BigInt(_) | WireValue::Bytes(_) | WireValue::Error(_) => {
+            None
+        }
+    }
+}
+
+/// Encodes an `Ok(WireValue)` into a tagged UTF-16 response string when it is
+/// JSON/primitive-safe (zero `Uint8Array` indexing on the JS side). Returns
+/// `None` if the value contains `Bytes`, `BigInt`, nested `Undefined`, or
+/// non-finite/`-0` floats so the caller falls back to binary wire.
+pub fn try_encode_str_ok(val: &WireValue) -> Option<Vec<u16>> {
+    match val {
+        WireValue::Undefined => Some(vec![u16::from(b'u')]),
+        WireValue::Null => Some(vec![u16::from(b'n')]),
+        WireValue::Bool(true) => Some(vec![u16::from(b't')]),
+        WireValue::Bool(false) => Some(vec![u16::from(b'f')]),
+        WireValue::I32(n) => {
+            let s = format!("i{n}");
+            Some(str_to_utf16(&s))
+        }
+        WireValue::F64(x) => {
+            if !x.is_finite() || (*x == 0.0 && x.is_sign_negative()) {
+                return None;
+            }
+            let num = serde_json::Number::from_f64(*x)?;
+            let s = format!("d{num}");
+            Some(str_to_utf16(&s))
+        }
+        WireValue::String(s) => {
+            let mut out = Vec::with_capacity(1 + s.len());
+            out.push(u16::from(b's'));
+            if s.is_ascii() {
+                out.extend(s.as_bytes().iter().map(|&b| u16::from(b)));
+            } else {
+                out.extend(s.encode_utf16());
+            }
+            Some(out)
+        }
+        WireValue::Array(_) | WireValue::Object(_) => {
+            let jv = wire_to_json(val)?;
+            let json = serde_json::to_string(&jv).ok()?;
+            let mut out = Vec::with_capacity(1 + json.len());
+            out.push(u16::from(b'j'));
+            if json.is_ascii() {
+                out.extend(json.as_bytes().iter().map(|&b| u16::from(b)));
+            } else {
+                out.extend(json.encode_utf16());
+            }
+            Some(out)
+        }
+        WireValue::BigInt(_) | WireValue::Bytes(_) | WireValue::Error(_) => None,
+    }
+}
+
+pub fn encode_str_err(error: &crate::ops::OpError) -> Vec<u16> {
+    use crate::ops::OpErrorClass;
+    let (cls, custom): (u8, &str) = match error.class() {
+        OpErrorClass::Error => (0, ""),
+        OpErrorClass::TypeError => (1, ""),
+        OpErrorClass::RangeError => (2, ""),
+        OpErrorClass::Custom(c) => (3, c),
+    };
+    let json = serde_json::to_string(&(cls, custom, error.message()))
+        .unwrap_or_else(|_| "[0,\"\",\"op error\"]".to_string());
+    let mut out = Vec::with_capacity(1 + json.len());
+    out.push(u16::from(b'e'));
+    if json.is_ascii() {
+        out.extend(json.as_bytes().iter().map(|&b| u16::from(b)));
+    } else {
+        out.extend(json.encode_utf16());
+    }
+    out
+}
+
+pub fn encode_str_pending(pending_id: u32) -> Vec<u16> {
+    let s = format!("p{pending_id}");
+    str_to_utf16(&s)
+}
+
 struct WireReader<'a> {
     buf: &'a [u8],
     pos: usize,

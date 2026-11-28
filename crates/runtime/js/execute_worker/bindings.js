@@ -250,10 +250,19 @@ const defineLazyValue = (target, propertyName, factory) => {
 // Each worker's env, built from the deployment's bindings on the worker's
 // first request; a binding is made the first time the worker reads it.
 const workerEnvs = new SafeWeakMap();
+let cachedEnvWorker = null;
+let cachedEnvDeployment = null;
+let cachedEnvValue = null;
 
 const workerEnv = (worker, deployment) => {
+  if (worker === cachedEnvWorker && deployment === cachedEnvDeployment) {
+    return cachedEnvValue;
+  }
   const cached = workerEnvs.get(worker);
   if (cached) {
+    cachedEnvWorker = worker;
+    cachedEnvDeployment = deployment;
+    cachedEnvValue = cached;
     return cached;
   }
   const env = {};
@@ -282,6 +291,9 @@ const workerEnv = (worker, deployment) => {
 
   ObjectFreeze(env);
   workerEnvs.set(worker, env);
+  cachedEnvWorker = worker;
+  cachedEnvDeployment = deployment;
+  cachedEnvValue = env;
   return env;
 };
 
@@ -295,11 +307,35 @@ const executeMemoryTransaction = async (
   const previousMemoryEntry = current.memoryEntry;
   const previousSocketRuntimeProvider = current.socketRuntimeProvider;
   try {
-    txn = await createMemoryTxn(entry, commandHandle);
-    const socketRuntime = createMemorySocketRuntime(entry, true, undefined);
-    const scopedState = createMemoryAtomicState(entry, txn, socketRuntime);
+    const beginPending = op_memory_batch_begin(
+      activeRequestContextHandle(),
+      memoryScopedScopeHandle(entry),
+      entry.binding,
+      entry.memoryKey,
+      commandHandle,
+    );
+    let beginRes;
+    try {
+      beginRes = await beginPending;
+    } catch (error) {
+      syncFrozenTimeNow();
+      if (isMemoryStorageFailure(error)) {
+        return await failMemoryEntry(entry, error);
+      }
+      throw error;
+    }
+    setTime(beginRes[1], beginRes[2]);
+    txn = new MemoryTxn(entry, beginRes[0]);
+    let socketRuntime = null;
+    const ensureSocketRuntime = () => {
+      if (socketRuntime === null) {
+        socketRuntime = createMemorySocketRuntime(entry, true, undefined);
+      }
+      return socketRuntime;
+    };
+    const scopedState = createMemoryAtomicState(entry, txn, ensureSocketRuntime);
     current.memoryEntry = entry;
-    current.socketRuntimeProvider = () => socketRuntime;
+    current.socketRuntimeProvider = ensureSocketRuntime;
     txn.callbackActive = true;
     let value;
     try {
@@ -316,7 +352,19 @@ const executeMemoryTransaction = async (
     if (commandHandle > 0) {
       setMemoryBatchCommandResult(txn, await encodeMemoryCommandResult(value));
     }
-    await finishMemoryTxn(txn);
+    const batchHandle = txn.batchHandle;
+    txn.batchHandle = 0;
+    let applyRes;
+    try {
+      applyRes = await op_memory_batch_apply(batchHandle);
+    } catch (error) {
+      syncFrozenTimeNow();
+      throw error;
+    }
+    setTime(applyRes[3], applyRes[4]);
+    if (applyRes[0] === true && applyRes[2] === true) {
+      await gateMemoryOutput(entry, async () => undefined);
+    }
     return value;
   } finally {
     closeMemoryTxnBatch(txn);
@@ -402,8 +450,8 @@ const invokeMemoryCall = async (memoryCall, env, worker) => {
   }
 };
 
-const emitWaitUntilDone = async (requestContext) => {
-  await syncFrozenTime();
+const emitWaitUntilDone = (requestContext) => {
+  syncFrozenTimeNow();
   const emitted = op_request_wait_until_finish(
     requestContext.completionHandle,
   );
@@ -424,8 +472,8 @@ const storeResponseHeaders = (headers) => toHandle(op_http_headers_store(
   ArrayIsArray(headers) ? headers : [],
 ));
 
-const emitResponseStart = async (requestContext, status, headersHandle) => {
-  await syncFrozenTime();
+const emitResponseStart = (requestContext, status, headersHandle) => {
+  syncFrozenTimeNow();
   op_response_start(
     requestContext.completionHandle,
     status,
@@ -434,7 +482,7 @@ const emitResponseStart = async (requestContext, status, headersHandle) => {
 };
 
 const emitResponseChunk = async (requestContext, chunk) => {
-  await syncFrozenTime();
+  syncFrozenTimeNow();
   const bytes = toBytes(chunk);
   await op_response_write(requestContext.completionHandle, bytes);
   return bytes;
@@ -492,113 +540,126 @@ let workerDeployment = null;
 // dd.abortWorkerRequestHandle.
 const inflightRequests = new SafeMap();
 
-// Runs the worker on one request, under its context, and settles with what
-// it responded, as stored host handles.
-const respond = async (requestContext, invocation, worker, deployment) => {
+const cleanupRequestResources = (requestContext, invocation) => {
+  if (requestContext.requestBodyStreamHandle > 0) {
+    const streamHandle = requestContext.requestBodyStreamHandle;
+    requestContext.requestBodyStreamHandle = 0;
+    try {
+      op_request_body_close(streamHandle);
+    } catch {
+    }
+  }
+  if (invocation.request_context_handle > 0) {
+    inflightRequests.delete(invocation.request_context_handle);
+  }
+};
+
+const finishWaitUntilWork = (requestContext) => {
+  if (requestContext.waitUntilPromises.length === 0) {
+    emitWaitUntilDone(requestContext);
+    return;
+  }
+  PromisePrototypeThen(waitForWaitUntils(requestContext), () => {
+    emitWaitUntilDone(requestContext);
+  });
+};
+
+const failRequestOutcome = (requestContext, invocation, error) => {
+  cleanupRequestResources(requestContext, invocation);
+  op_response_fail(
+    requestContext.completionHandle,
+    errorText(error),
+  );
+  finishWaitUntilWork(requestContext);
+};
+
+// Consumes a streamed or ReadableStream response body and completes the request.
+const completeStreamOrAsyncResponse = async (
+  requestContext,
+  invocation,
+  response,
+  isWebSocketAcceptResponse,
+  status,
+  headers,
+  staticBody,
+) => {
   try {
-    await syncFrozenTime();
-    const requestSignal = AbortControllerPrototypeGetSignal(requestContext.controller);
-    const requestBody = invocation.request_body_stream_handle > 0
-      ? createRequestBodyStream(invocation.request_body_stream_handle)
-      : byteLength(invocation.body) > 0
-        ? new Uint8Array(invocation.body)
-        : undefined;
-    const request = new Request(
-      invocation.url,
-      new RequestInit(String(invocation.method || "GET"), requestBody, requestSignal),
-    );
-    appendHeaderPairs(RequestPrototypeGetHeaders(request), invocation.headers);
-    const env = workerEnv(worker, deployment);
-    const ctx = {
-      requestId: invocation.input_request_id,
-      signal: requestSignal,
-      waitUntil(promise) {
-        return trackWaitUntil(requestContext, promise);
-      },
-      sleep,
-    };
-
-    const response = invocation.memory_call
-        ? await invokeMemoryCall(invocation.memory_call, env, worker)
-        : await worker.fetch(request, env, ctx);
-    await syncFrozenTime();
-
-    const isResponse = ObjectPrototypeIsPrototypeOf(ResponsePrototype, response);
-    const isWebSocketAcceptResponse = !isResponse
-      && response !== null
-      && typeof response === "object"
-      && response.__dd_websocket_accept === true;
-    if (!isResponse && !isWebSocketAcceptResponse) {
-      throw new Error("Worker fetch() must return a Response");
-    }
-
-    let responseHeaders;
-    if (!isWebSocketAcceptResponse) {
-      responseHeaders = ResponsePrototypeGetHeaders(response);
-    } else if (ObjectPrototypeIsPrototypeOf(HeadersPrototype, response.headers)) {
-      responseHeaders = response.headers;
-    } else {
-      responseHeaders = new Headers(response.headers ?? undefined);
-    }
-    const status = isWebSocketAcceptResponse
-      ? Number(response.status ?? 101)
-      : ResponsePrototypeGetStatus(response);
-    const headers = headerPairs(responseHeaders);
     const streamResponse = invocation.stream_response;
     const maxResponseBodyBytes = invocation.max_response_body_bytes;
     const bodyChunks = streamResponse ? null : [];
     let bodyLength = 0;
     if (streamResponse) {
-      await emitResponseStart(requestContext, status, storeResponseHeaders(headers));
+      emitResponseStart(requestContext, status, storeResponseHeaders(headers));
     }
-    const responseBody = isWebSocketAcceptResponse ? null : ResponsePrototypeGetBody(response);
-    if (responseBody !== null && invocation.method === "HEAD") {
-      // A HEAD reply exposes the same headers but must not consume a producer.
-      ignoreRejection(ReadableStreamPrototypeCancel(responseBody));
-    } else if (responseBody !== null) {
-      const reader = ReadableStreamPrototypeGetReader(responseBody);
-      // An aborted request stops reading its body, so a producer waiting
-      // for more data cannot keep it, or its isolate, alive.
-      const signal = requestSignal;
-      const cancelOnAbort = () => {
-        ignoreRejection(ReadableStreamDefaultReaderPrototypeCancel(
-          reader,
-          AbortSignalPrototypeGetReason(signal),
-        ));
-      };
-      AbortSignalPrototypeAddEventListener(signal, "abort", cancelOnAbort, ONCE);
-      try {
-        if (AbortSignalPrototypeGetAborted(signal)) {
-          throw AbortSignalPrototypeGetReason(signal);
+    if (staticBody !== undefined) {
+      if (staticBody !== null && invocation.method !== "HEAD") {
+        if (isRequestAborted(requestContext)) {
+          throw AbortSignalPrototypeGetReason(requestSignalOf(requestContext));
         }
-        while (true) {
-          const { done, value } = await ReadableStreamDefaultReaderPrototypeRead(reader);
-          if (done) {
-            break;
-          }
-          const chunk = toBytes(value);
-          const chunkLength = byteLength(chunk);
-          if (chunkLength === 0) {
-            continue;
-          }
+        const chunk = toBytes(staticBody);
+        const chunkLength = byteLength(chunk);
+        if (chunkLength > 0) {
           if (streamResponse) {
             await emitResponseChunk(requestContext, chunk);
           } else {
-            if (bodyLength + chunkLength > maxResponseBodyBytes) {
+            if (chunkLength > maxResponseBodyBytes) {
               throw new Error(`response body exceeded max_response_body_bytes (${maxResponseBodyBytes} bytes)`);
             }
             ArrayPrototypePush(bodyChunks, chunk);
-            bodyLength += chunkLength;
+            bodyLength = chunkLength;
           }
         }
-      } catch (error) {
-        // Start cancellation without letting an uncooperative cancel callback
-        // delay the size-limit failure delivered to the caller.
-        ignoreRejection(ReadableStreamDefaultReaderPrototypeCancel(reader, error));
-        throw error;
-      } finally {
-        AbortSignalPrototypeRemoveEventListener(signal, "abort", cancelOnAbort);
-        ReadableStreamDefaultReaderPrototypeReleaseLock(reader);
+      }
+    } else {
+      const responseBody = isWebSocketAcceptResponse ? null : ResponsePrototypeGetBody(response);
+      if (responseBody !== null && invocation.method === "HEAD") {
+        // A HEAD reply exposes the same headers but must not consume a producer.
+        ignoreRejection(ReadableStreamPrototypeCancel(responseBody));
+      } else if (responseBody !== null) {
+        const reader = ReadableStreamPrototypeGetReader(responseBody);
+        // An aborted request stops reading its body, so a producer waiting
+        // for more data cannot keep it, or its isolate, alive.
+        const signal = requestSignalOf(requestContext);
+        const cancelOnAbort = () => {
+          ignoreRejection(ReadableStreamDefaultReaderPrototypeCancel(
+            reader,
+            AbortSignalPrototypeGetReason(signal),
+          ));
+        };
+        AbortSignalPrototypeAddEventListener(signal, "abort", cancelOnAbort, ONCE);
+        try {
+          if (AbortSignalPrototypeGetAborted(signal)) {
+            throw AbortSignalPrototypeGetReason(signal);
+          }
+          while (true) {
+            const { done, value } = await ReadableStreamDefaultReaderPrototypeRead(reader);
+            if (done) {
+              break;
+            }
+            const chunk = toBytes(value);
+            const chunkLength = byteLength(chunk);
+            if (chunkLength === 0) {
+              continue;
+            }
+            if (streamResponse) {
+              await emitResponseChunk(requestContext, chunk);
+            } else {
+              if (bodyLength + chunkLength > maxResponseBodyBytes) {
+                throw new Error(`response body exceeded max_response_body_bytes (${maxResponseBodyBytes} bytes)`);
+              }
+              ArrayPrototypePush(bodyChunks, chunk);
+              bodyLength += chunkLength;
+            }
+          }
+        } catch (error) {
+          // Start cancellation without letting an uncooperative cancel callback
+          // delay the size-limit failure delivered to the caller.
+          ignoreRejection(ReadableStreamDefaultReaderPrototypeCancel(reader, error));
+          throw error;
+        } finally {
+          AbortSignalPrototypeRemoveEventListener(signal, "abort", cancelOnAbort);
+          ReadableStreamDefaultReaderPrototypeReleaseLock(reader);
+        }
       }
     }
 
@@ -612,47 +673,145 @@ const respond = async (requestContext, invocation, worker, deployment) => {
         concatByteChunks(bodyChunks, bodyLength),
       );
     }
-    return result;
-  } finally {
-    if (requestContext.requestBodyStreamHandle > 0) {
-      try {
-        await op_request_body_close(requestContext.requestBodyStreamHandle);
-      } catch {
-      }
-    }
-    if (invocation.request_context_handle > 0) {
-      inflightRequests.delete(invocation.request_context_handle);
-    }
-  }
-};
-
-// Reports how the request went, then waits out its waitUntil work. A
-// failure while reporting success is reported as the request's error.
-const reportOutcome = async (requestContext, handled) => {
-  try {
-    const result = await handled;
+    cleanupRequestResources(requestContext, invocation);
     op_response_complete(
       requestContext.completionHandle,
       Number(result.status ?? 200),
       toHandle(result.headersHandle),
       toHandle(result.bodyHandle),
     );
-
-    await waitForWaitUntils(requestContext);
-    await emitWaitUntilDone(requestContext);
+    finishWaitUntilWork(requestContext);
   } catch (error) {
-    op_response_fail(
-      requestContext.completionHandle,
-      errorText(error),
-    );
-
-    await waitForWaitUntils(requestContext);
-    await emitWaitUntilDone(requestContext);
+    failRequestOutcome(requestContext, invocation, error);
   }
 };
 
+// Completes a settled worker response, using the zero-stream inline path for
+// buffered static responses and falling back to the async reader otherwise.
+const completeSettledResponse = (requestContext, invocation, response) => {
+  try {
+    const isResponse = ObjectPrototypeIsPrototypeOf(ResponsePrototype, response);
+    const isWebSocketAcceptResponse = !isResponse
+      && response !== null
+      && typeof response === "object"
+      && response.__dd_websocket_accept === true;
+    if (!isResponse && !isWebSocketAcceptResponse) {
+      throw new Error("Worker fetch() must return a Response");
+    }
+
+    let headers;
+    if (!isWebSocketAcceptResponse) {
+      headers = getResponseHeaderPairs(response);
+      if (headers === null) {
+        headers = headerPairs(ResponsePrototypeGetHeaders(response));
+      }
+    } else if (ObjectPrototypeIsPrototypeOf(HeadersPrototype, response.headers)) {
+      headers = headerPairs(response.headers);
+    } else {
+      headers = headerPairs(new Headers(response.headers ?? undefined));
+    }
+    const status = isWebSocketAcceptResponse
+      ? Number(response.status ?? 101)
+      : ResponsePrototypeGetStatus(response);
+    const staticBody = isWebSocketAcceptResponse
+      ? null
+      : tryTakeStaticResponseBody(response);
+
+    if (!invocation.stream_response && staticBody !== undefined) {
+      const maxResponseBodyBytes = invocation.max_response_body_bytes;
+      const finishWaitUntil = requestContext.waitUntilPromises.length === 0;
+      let bodyStr = null;
+      let bodyBytes = null;
+      if (staticBody === null || invocation.method === "HEAD") {
+        bodyStr = "";
+      } else {
+        if (isRequestAborted(requestContext)) {
+          throw AbortSignalPrototypeGetReason(requestSignalOf(requestContext));
+        }
+        if (typeof staticBody === "string") {
+          if (staticBody.length * 3 <= maxResponseBodyBytes) {
+            bodyStr = staticBody;
+          } else {
+            const encoded = core.encode(staticBody);
+            if (byteLength(encoded) > maxResponseBodyBytes) {
+              throw new Error(`response body exceeded max_response_body_bytes (${maxResponseBodyBytes} bytes)`);
+            }
+            bodyBytes = encoded;
+          }
+        } else {
+          if (byteLength(staticBody) > maxResponseBodyBytes) {
+            throw new Error(`response body exceeded max_response_body_bytes (${maxResponseBodyBytes} bytes)`);
+          }
+          bodyBytes = staticBody;
+        }
+      }
+
+      cleanupRequestResources(requestContext, invocation);
+      const time = bodyStr !== null
+        ? op_response_complete_inline(
+          requestContext.completionHandle,
+          requestContext.requestContextHandle,
+          requestContext.memoryRequestScopeHandle,
+          status,
+          headers,
+          bodyStr,
+          finishWaitUntil,
+        )
+        : op_response_complete_inline_bytes(
+          requestContext.completionHandle,
+          requestContext.requestContextHandle,
+          requestContext.memoryRequestScopeHandle,
+          status,
+          headers,
+          bodyBytes,
+          finishWaitUntil,
+        );
+      setTime(time[0], time[1]);
+      if (finishWaitUntil) {
+        requestContext.memoryRequestScopeHandle = 0;
+        requestContext.requestContextHandle = 0;
+      } else {
+        finishWaitUntilWork(requestContext);
+      }
+      return;
+    }
+
+    syncFrozenTimeNow();
+    completeStreamOrAsyncResponse(
+      requestContext,
+      invocation,
+      response,
+      isWebSocketAcceptResponse,
+      status,
+      headers,
+      staticBody,
+    );
+  } catch (error) {
+    failRequestOutcome(requestContext, invocation, error);
+  }
+};
+
+class ExecutionContext {
+  #requestContext;
+  constructor(requestId, requestContext) {
+    this.requestId = requestId;
+    this.#requestContext = requestContext;
+  }
+  get signal() {
+    return requestSignalOf(this.#requestContext);
+  }
+  waitUntil(promise) {
+    const ctx = ObjectPrototypeIsPrototypeOf(ExecutionContextPrototype, this)
+      ? this.#requestContext
+      : currentRequestContext();
+    return trackWaitUntil(ctx, promise);
+  }
+}
+const ExecutionContextPrototype = ExecutionContext.prototype;
+ExecutionContextPrototype.sleep = sleep;
+
 // One request: its context, the worker run under it, and the report of how
-// it went, which runs outside the request's scope.
+// it went.
 const executeWorker = (invocation) => {
   const deployment = workerDeployment;
   if (deployment === null) {
@@ -664,21 +823,57 @@ const executeWorker = (invocation) => {
   }
   const requestContext = new RequestContext(
     invocation.request_id,
-    new AbortController(),
+    null,
     invocation.request_context_handle,
     invocation.completion_handle,
     invocation.memory_request_scope_handle,
     invocation.request_body_stream_handle,
     invocation.max_request_body_bytes,
-    hasCacheBypassStaleHeader(invocation.headers),
+    invocation.headers.length > 0 && hasCacheBypassStaleHeader(invocation.headers),
   );
   if (invocation.request_context_handle > 0) {
     inflightRequests.set(invocation.request_context_handle, requestContext);
   }
-  reportOutcome(
-    requestContext,
-    asyncContext.run(requestContext, respond, requestContext, invocation, worker, deployment),
-  );
+  asyncContext.run(requestContext, () => {
+    try {
+      const env = workerEnv(worker, deployment);
+      let outcome;
+      if (invocation.memory_call) {
+        outcome = invokeMemoryCall(invocation.memory_call, env, worker);
+      } else {
+        const requestBody = invocation.request_body_stream_handle > 0
+          ? createRequestBodyStream(invocation.request_body_stream_handle)
+          : byteLength(invocation.body) > 0
+            ? new Uint8Array(invocation.body)
+            : undefined;
+        const request = fromHostRequest(
+          invocation.url,
+          String(invocation.method || "GET"),
+          requestBody,
+          invocation.headers,
+          () => requestSignalOf(requestContext),
+        );
+        const ctx = new ExecutionContext(invocation.input_request_id, requestContext);
+        outcome = worker.fetch(request, env, ctx);
+      }
+      if (
+        outcome !== null
+        && (typeof outcome === "object" || typeof outcome === "function")
+        && typeof outcome.then === "function"
+      ) {
+        const promise = core.isPromise(outcome) ? outcome : PromiseResolve(outcome);
+        PromisePrototypeThen(
+          promise,
+          (response) => completeSettledResponse(requestContext, invocation, response),
+          (error) => failRequestOutcome(requestContext, invocation, error),
+        );
+      } else {
+        completeSettledResponse(requestContext, invocation, outcome);
+      }
+    } catch (error) {
+      failRequestOutcome(requestContext, invocation, error);
+    }
+  });
 };
 
 // Takes the worker module's namespace once it has evaluated.
@@ -702,11 +897,10 @@ dd.executeWorkerHandle = (requestHandle) => {
   if (descriptor === null || descriptor === undefined) {
     throw new Error(`Request handle ${requestHandle} is unavailable`);
   }
-  const headers = op_http_headers_take(
-    toHandle(descriptor.request_headers_handle),
-  );
-  const body = op_http_body_take(toHandle(descriptor.request_body_handle));
-  executeWorker(new WorkerInvocation(descriptor, headers, body));
+  setTime(descriptor[14], descriptor[15]);
+  const bodyHandle = descriptor[6];
+  const body = bodyHandle > 0 ? op_http_body_take(bodyHandle) : EMPTY_BYTES;
+  executeWorker(new WorkerInvocation(descriptor, body));
 };
 
 const listOf = (input) => (ArrayIsArray(input) ? input : []);
@@ -785,6 +979,11 @@ dd.abortWorkerRequestHandle = (requestContextHandle) => {
     } catch {
     }
   }
-  AbortControllerPrototypeAbort(inflight.controller, new Error("Request aborted by caller"));
+  const abortReason = new Error("Request aborted by caller");
+  inflight.aborted = true;
+  inflight.abortReason = abortReason;
+  if (inflight.controller !== null) {
+    AbortControllerPrototypeAbort(inflight.controller, abortReason);
+  }
   return true;
 };

@@ -36,10 +36,18 @@ const CORE_JS: &str = include_str!("../js/core/core.js");
 const WEB_INIT_JS: &str = include_str!("../js/web/init.js");
 const NODE_ASYNC_HOOKS_SOURCE: &str =
     include_str!("../../../packages/dd-vite/src/shims/node_async_hooks.js");
+#[repr(C, align(65536))]
+struct PageAligned<T: ?Sized>(T);
+
 const PRECOMPILED_BOOTSTRAP_SHA256: &[u8; 32] =
     include_bytes!(concat!(env!("OUT_DIR"), "/dd_bootstrap.sha256"));
-const PRECOMPILED_BOOTSTRAP_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/dd_bootstrap.wtmn"));
+static PRECOMPILED_BOOTSTRAP_STORAGE: PageAligned<
+    [u8; include_bytes!(concat!(env!("OUT_DIR"), "/dd_bootstrap.wtmn")).len()],
+> = PageAligned(*include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/dd_bootstrap.wtmn"
+)));
+const PRECOMPILED_BOOTSTRAP_BYTES: &[u8] = &PRECOMPILED_BOOTSTRAP_STORAGE.0;
 
 static BOOTSTRAP_SNAPSHOT: OnceLock<Result<Box<[u8]>>> = OnceLock::new();
 

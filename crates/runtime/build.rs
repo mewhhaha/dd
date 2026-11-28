@@ -144,7 +144,6 @@ fn precompile_bootstrap_bundle(execute_worker_js: &str) {
     let bundle_src = runtime
         .snapshot_bundle_source()
         .expect("render bootstrap bundle source");
-
     let (sha256, bytes) = dd_v8::precompile_snapshot_bundle(&bundle_src)
         .expect("precompile dd runtime bootstrap snapshot bundle");
     fs::write(&wtmn_path, bytes).expect("write precompiled dd bootstrap image");

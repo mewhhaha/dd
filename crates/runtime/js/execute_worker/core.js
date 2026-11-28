@@ -63,7 +63,6 @@ const {
   MapPrototypeSet,
   MathMax,
   MathMin,
-  MathRound,
   MathTrunc,
   Number,
   NumberIsFinite,
@@ -159,7 +158,9 @@ const {
   asyncContext,
   clearTimeout,
   consoleWarn,
+  fromHostRequest,
   frozenPerfNow,
+  getResponseHeaderPairs,
   headerPairs,
   hostFetchResponse,
   record,
@@ -167,6 +168,7 @@ const {
   setTimeout,
   syncTimeBoundary: syncFrozenTime,
   syncTimeBoundaryNow: syncFrozenTimeNow,
+  tryTakeStaticResponseBody,
 } = dd;
 const {
   op_http_body_store,
@@ -191,11 +193,11 @@ const {
   op_memory_batch_get,
   op_memory_batch_list,
   op_memory_batch_write,
+  op_memory_batch_write_utf8,
   op_memory_bytes_take,
   op_memory_command_begin,
   op_memory_command_close,
   op_memory_lease_acquire,
-  op_memory_profile_record,
   op_memory_read_begin,
   op_memory_read_close,
   op_memory_read_get,
@@ -214,6 +216,8 @@ const {
   op_request_wait_until_finish,
   op_request_wait_until_register,
   op_response_complete,
+  op_response_complete_inline,
+  op_response_complete_inline_bytes,
   op_response_fail,
   op_response_start,
   op_response_write,
@@ -228,6 +232,7 @@ const ignoreRejection = (promise) => {
 };
 const ONCE = ObjectFreeze({ __proto__: null, once: true });
 const FOR_STORAGE = ObjectFreeze({ __proto__: null, forStorage: true });
+const EMPTY_BYTES = new Uint8Array(0);
 
 /** A handle number from an op result or descriptor: a non-negative integer. */
 const toHandle = (value) => MathMax(0, MathTrunc(Number(value ?? 0) || 0));
@@ -236,22 +241,22 @@ const toHandle = (value) => MathMax(0, MathTrunc(Number(value ?? 0) || 0));
 // RECORD in bootstrap.js), so that every request shares one constructor, and
 // so one shape, per kind of record.
 
-// What dd.executeWorkerHandle reads from a request's invocation descriptor.
-const WorkerInvocation = record(function WorkerInvocation(descriptor, headers, body) {
-  this.request_id = String(descriptor.request_id ?? "");
-  this.request_context_handle = toHandle(descriptor.request_context_handle);
-  this.completion_handle = toHandle(descriptor.completion_handle);
-  this.memory_request_scope_handle = toHandle(descriptor.memory_request_scope_handle);
-  this.memory_call = descriptor.memory_call ?? null;
-  this.request_body_stream_handle = toHandle(descriptor.request_body_stream_handle);
-  this.stream_response = descriptor.stream_response === true;
-  this.max_response_body_bytes = Number(descriptor.max_response_body_bytes ?? 0);
-  this.max_request_body_bytes = Number(descriptor.max_request_body_bytes ?? 0);
-  this.method = String(descriptor.method ?? "GET");
-  this.url = String(descriptor.url ?? "");
-  this.headers = ArrayIsArray(headers) ? headers : [];
-  this.input_request_id = String(descriptor.input_request_id ?? "");
-  this.body = isUint8Array(body) ? body : new Uint8Array();
+// What dd.executeWorkerHandle reads from a request's invocation tuple.
+const WorkerInvocation = record(function WorkerInvocation(d, body) {
+  this.request_id = d[0];
+  this.request_context_handle = d[1];
+  this.completion_handle = d[2];
+  this.memory_request_scope_handle = d[3];
+  this.memory_call = d[4];
+  this.request_body_stream_handle = d[5];
+  this.headers = d[7];
+  this.stream_response = d[8];
+  this.max_response_body_bytes = d[9];
+  this.max_request_body_bytes = d[10];
+  this.method = d[11];
+  this.url = d[12];
+  this.input_request_id = d[13];
+  this.body = body;
 });
 // The store asyncContext carries for a request. memory.js runs each memory
 // call under a copy with its own memory scope. The request's handles here
@@ -268,6 +273,9 @@ const RequestContext = record(function RequestContext(
 ) {
   this.requestId = requestId;
   this.controller = controller;
+  this.aborted = false;
+  this.abortReason = undefined;
+  this.rootContext = this;
   this.waitUntilPromises = [];
   this.requestContextHandle = requestContextHandle;
   this.completionHandle = completionHandle;
@@ -279,6 +287,26 @@ const RequestContext = record(function RequestContext(
   this.socketRuntimeProvider = null;
   this.cacheBypassStale = cacheBypassStale;
 });
+const requestController = (context) => {
+  const root = context.rootContext;
+  let controller = root.controller;
+  if (controller === null) {
+    controller = new AbortController();
+    if (root.aborted) {
+      AbortControllerPrototypeAbort(controller, root.abortReason);
+    }
+    root.controller = controller;
+  }
+  return controller;
+};
+const requestSignalOf = (context) => AbortControllerPrototypeGetSignal(requestController(context));
+const isRequestAborted = (context) => {
+  const root = context.rootContext;
+  return root.aborted || (
+    root.controller !== null
+    && AbortSignalPrototypeGetAborted(AbortControllerPrototypeGetSignal(root.controller))
+  );
+};
 const copyRequestContext = (context) => {
   const copy = new RequestContext(
     context.requestId,
@@ -290,6 +318,7 @@ const copyRequestContext = (context) => {
     context.maxRequestBodyBytes,
     context.cacheBypassStale,
   );
+  copy.rootContext = context.rootContext;
   copy.waitUntilPromises = context.waitUntilPromises;
   copy.memoryEntry = context.memoryEntry;
   copy.memoryTxnScope = context.memoryTxnScope;
@@ -360,10 +389,6 @@ const EncodedValue = record(function EncodedValue(encoding, value) {
   this.encoding = encoding;
   this.value = value;
 });
-// What storage.get returns to the worker for a key that is present.
-const MemoryGetResult = record(function MemoryGetResult(value) {
-  this.value = value;
-});
 const SocketPayload = record(function SocketPayload(kind, value) {
   this.kind = kind;
   this.value = value;
@@ -374,14 +399,6 @@ const DataProperty = record(function DataProperty(value) {
   this.writable = true;
   this.configurable = true;
 });
-
-const recordMemoryProfile = (metric, durationMs, items = 1) => {
-  op_memory_profile_record(
-    String(metric),
-    MathMax(0, MathRound(Number(durationMs ?? 0) * 1000)),
-    MathMax(1, MathTrunc(Number(items ?? 1) || 1)),
-  );
-};
 
 /** The current request's context, or null (an error when `required`) outside one. */
 const currentRequestContext = (required = true) => {
@@ -531,7 +548,11 @@ const createKvBinding = (bindingName) => ObjectFreeze({
     } finally {
       syncFrozenTimeNow();
     }
-    return value === null ? null : decodeStoredValue(value.encoding, value.value_handle, "kv get");
+    return value === null
+      ? null
+      : value.text !== undefined
+        ? value.text
+        : decodeStoredValue(value.encoding, value.value_handle, "kv get");
   },
   async put(key, value) {
     const normalizedKey = String(key);
