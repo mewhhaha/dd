@@ -60,7 +60,7 @@ dependencies = [
 [[package]]
 name = "boa_ast"
 version = "0.21.1"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "bitflags",
  "boa_interner",
@@ -114,7 +114,7 @@ dependencies = [
 [[package]]
 name = "boa_parser"
 version = "0.21.1"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "bitflags",
  "boa_ast",
@@ -310,6 +310,7 @@ dependencies = [
  "tokio",
  "wtime-aot-host",
  "wtime-runtime",
+ "zstd",
 ]
 
 [[package]]
@@ -967,6 +968,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
 name = "postcard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1058,7 +1065,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "regress"
 version = "0.10.5"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "hashbrown 0.16.1",
  "memchr",
@@ -1098,7 +1105,7 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 [[package]]
 name = "scriptw-aot-wasm"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "icu_calendar",
  "icu_normalizer",
@@ -1116,7 +1123,7 @@ dependencies = [
 [[package]]
 name = "scriptw-engine"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "blake3",
  "rayon",
@@ -1135,7 +1142,7 @@ dependencies = [
 [[package]]
 name = "scriptw-front"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "boa_ast",
  "boa_interner",
@@ -1145,7 +1152,7 @@ dependencies = [
 [[package]]
 name = "scriptw-intl"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "icu_calendar",
  "icu_calendar_data",
@@ -1177,12 +1184,12 @@ dependencies = [
 [[package]]
 name = "scriptw-intl-build-data"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 
 [[package]]
 name = "scriptw-intl-collator-data"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "icu_collator",
  "icu_collator_data",
@@ -1198,7 +1205,7 @@ dependencies = [
 [[package]]
 name = "scriptw-ir"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "boa_ast",
  "boa_interner",
@@ -1214,7 +1221,7 @@ dependencies = [
 [[package]]
 name = "scriptw-runtime"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "getrandom 0.3.4",
  "scriptw-intl",
@@ -1225,7 +1232,7 @@ dependencies = [
 [[package]]
 name = "scriptw-runtime-image"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "cc",
  "scriptw-aot-wasm",
@@ -1428,7 +1435,7 @@ dependencies = [
 [[package]]
 name = "timezone_provider"
 version = "0.1.2"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#b9f98d5791843bd32948a7bac6f1407bdac876f9"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=main#d8083e4c9a2b2e9638173053b47ef1fa1837bf17"
 dependencies = [
  "combine",
  "jiff-tzdb",
@@ -1610,8 +1617,8 @@ dependencies = [
 
 [[package]]
 name = "wtime-aot"
-version = "0.1.12"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.12#73ccd99bd030b26ac63aab1aa163c7929af6a05c"
+version = "0.1.17"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.17#8a330974d4eef25795eb8404464fd2c596302176"
 dependencies = [
  "wtime-types",
  "wtime-validate",
@@ -1619,8 +1626,8 @@ dependencies = [
 
 [[package]]
 name = "wtime-aot-host"
-version = "0.1.12"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.12#73ccd99bd030b26ac63aab1aa163c7929af6a05c"
+version = "0.1.17"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.17#8a330974d4eef25795eb8404464fd2c596302176"
 dependencies = [
  "libc",
  "wtime-aot",
@@ -1630,16 +1637,16 @@ dependencies = [
 
 [[package]]
 name = "wtime-decode"
-version = "0.1.12"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.12#73ccd99bd030b26ac63aab1aa163c7929af6a05c"
+version = "0.1.17"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.17#8a330974d4eef25795eb8404464fd2c596302176"
 dependencies = [
  "wtime-types",
 ]
 
 [[package]]
 name = "wtime-runtime"
-version = "0.1.12"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.12#73ccd99bd030b26ac63aab1aa163c7929af6a05c"
+version = "0.1.17"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.17#8a330974d4eef25795eb8404464fd2c596302176"
 dependencies = [
  "wtime-types",
  "wtime-validate",
@@ -1647,13 +1654,13 @@ dependencies = [
 
 [[package]]
 name = "wtime-types"
-version = "0.1.12"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.12#73ccd99bd030b26ac63aab1aa163c7929af6a05c"
+version = "0.1.17"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.17#8a330974d4eef25795eb8404464fd2c596302176"
 
 [[package]]
 name = "wtime-validate"
-version = "0.1.12"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.12#73ccd99bd030b26ac63aab1aa163c7929af6a05c"
+version = "0.1.17"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.17#8a330974d4eef25795eb8404464fd2c596302176"
 dependencies = [
  "wtime-decode",
  "wtime-types",
@@ -1747,3 +1754,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b04655dc7bf4abd8ebe23dac6bef20fceea52a29ad19e37a4101b3951d7e8b45"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df2575690b2a3eccad509fe7898cdde32a5afca06a06449ff4dcfb318c7b7281"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.2.0+zstd.1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f4089cda6dda4dc43c43dd9f8964140064fd2f752f3da46c3a483c3c175160"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
