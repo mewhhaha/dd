@@ -580,7 +580,7 @@ dependencies = [
 [[package]]
 name = "boa_ast"
 version = "0.21.1"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#70a57413bdcf2285007d991b56c4aa4d73624220"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "bitflags",
  "boa_interner",
@@ -634,7 +634,7 @@ dependencies = [
 [[package]]
 name = "boa_parser"
 version = "0.21.1"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#70a57413bdcf2285007d991b56c4aa4d73624220"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "bitflags",
  "boa_ast",
@@ -1514,7 +1514,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3412,7 +3412,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3626,7 +3626,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "regress"
 version = "0.10.5"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#70a57413bdcf2285007d991b56c4aa4d73624220"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "hashbrown 0.16.1",
  "memchr",
@@ -3852,7 +3852,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3910,7 +3910,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3982,7 +3982,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scriptw-aot-wasm"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "icu_calendar",
  "icu_normalizer",
@@ -4000,7 +4000,7 @@ dependencies = [
 [[package]]
 name = "scriptw-engine"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "blake3",
  "rayon",
@@ -4019,7 +4019,7 @@ dependencies = [
 [[package]]
 name = "scriptw-front"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "boa_ast",
  "boa_interner",
@@ -4029,7 +4029,7 @@ dependencies = [
 [[package]]
 name = "scriptw-intl"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "icu_calendar",
  "icu_calendar_data",
@@ -4061,12 +4061,12 @@ dependencies = [
 [[package]]
 name = "scriptw-intl-build-data"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 
 [[package]]
 name = "scriptw-intl-collator-data"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "icu_collator",
  "icu_collator_data",
@@ -4082,7 +4082,7 @@ dependencies = [
 [[package]]
 name = "scriptw-ir"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "boa_ast",
  "boa_interner",
@@ -4098,7 +4098,7 @@ dependencies = [
 [[package]]
 name = "scriptw-runtime"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "getrandom 0.3.4",
  "scriptw-intl",
@@ -4109,7 +4109,7 @@ dependencies = [
 [[package]]
 name = "scriptw-runtime-image"
 version = "0.1.0"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#188fb00bf4780fd85e010f4064eda677cbb2f154"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "cc",
  "scriptw-aot-wasm",
@@ -4634,7 +4634,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4699,7 +4699,7 @@ dependencies = [
 [[package]]
 name = "timezone_provider"
 version = "0.1.2"
-source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#70a57413bdcf2285007d991b56c4aa4d73624220"
+source = "git+https://github.com/mewhhaha/scriptw.git?branch=feat%2Fwtime-aot#6423497abdbe5edce4742645e4cc4755ee925f47"
 dependencies = [
  "combine",
  "jiff-tzdb",
@@ -5517,7 +5517,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5718,8 +5718,8 @@ dependencies = [
 
 [[package]]
 name = "wtime-aot"
-version = "0.1.15"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.15#bf126ad4c3fb5f7d53c60b5bcac965ae8b9a974c"
+version = "0.1.16"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.16#db24f7f643796b5643ae0d493689cd39a477e029"
 dependencies = [
  "wtime-types",
  "wtime-validate",
@@ -5727,8 +5727,8 @@ dependencies = [
 
 [[package]]
 name = "wtime-aot-host"
-version = "0.1.15"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.15#bf126ad4c3fb5f7d53c60b5bcac965ae8b9a974c"
+version = "0.1.16"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.16#db24f7f643796b5643ae0d493689cd39a477e029"
 dependencies = [
  "libc",
  "wtime-aot",
@@ -5738,16 +5738,16 @@ dependencies = [
 
 [[package]]
 name = "wtime-decode"
-version = "0.1.15"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.15#bf126ad4c3fb5f7d53c60b5bcac965ae8b9a974c"
+version = "0.1.16"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.16#db24f7f643796b5643ae0d493689cd39a477e029"
 dependencies = [
  "wtime-types",
 ]
 
 [[package]]
 name = "wtime-runtime"
-version = "0.1.15"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.15#bf126ad4c3fb5f7d53c60b5bcac965ae8b9a974c"
+version = "0.1.16"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.16#db24f7f643796b5643ae0d493689cd39a477e029"
 dependencies = [
  "wtime-types",
  "wtime-validate",
@@ -5755,13 +5755,13 @@ dependencies = [
 
 [[package]]
 name = "wtime-types"
-version = "0.1.15"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.15#bf126ad4c3fb5f7d53c60b5bcac965ae8b9a974c"
+version = "0.1.16"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.16#db24f7f643796b5643ae0d493689cd39a477e029"
 
 [[package]]
 name = "wtime-validate"
-version = "0.1.15"
-source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.15#bf126ad4c3fb5f7d53c60b5bcac965ae8b9a974c"
+version = "0.1.16"
+source = "git+https://github.com/mewhhaha/wtime.git?tag=v0.1.16#db24f7f643796b5643ae0d493689cd39a477e029"
 dependencies = [
  "wtime-decode",
  "wtime-types",
